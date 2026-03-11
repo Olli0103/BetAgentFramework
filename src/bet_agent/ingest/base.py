@@ -16,7 +16,7 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from bet_agent.db.models import HistoricalMatch, Sport
+from bet_agent.db.models import HistoricalMatch, Sport, TeamDailyStats
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +137,39 @@ class BaseIngester(ABC):
                 existing.source_file = model.source_file
         else:
             session.add(model)
+
+    def _upsert_daily_stat(
+        self,
+        session: Session,
+        team: str,
+        stat_date: date,
+        stats: dict,
+        league: str = "unknown",
+    ) -> None:
+        """Insert or merge a TeamDailyStats row for this sport.
+
+        Used by subclass ingesters that build point-in-time profiles
+        during ingestion (Tennis, NHL).
+        """
+        existing = session.execute(
+            select(TeamDailyStats).where(
+                TeamDailyStats.sport == self.sport,
+                TeamDailyStats.team_name == team,
+                TeamDailyStats.stat_date == stat_date,
+            )
+        ).scalar_one_or_none()
+
+        if existing:
+            existing.stats = {**existing.stats, **stats}
+        else:
+            session.add(TeamDailyStats(
+                sport=self.sport,
+                team_name=team,
+                league=league,
+                stat_date=stat_date,
+                stats=stats,
+                source_url="ingester_profile",
+            ))
 
     def ingest_directory(self, session: Session, dir_path: Path, glob: str = "*.csv") -> int:
         """Ingest all matching files from a directory.
