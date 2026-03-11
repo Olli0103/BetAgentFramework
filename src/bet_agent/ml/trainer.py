@@ -342,8 +342,21 @@ def run_training_pipeline(
     season: str | None = None,
     model_dir: Path | None = None,
     min_games: int = 5,
-) -> dict[str, ModelArtifact]:
-    """Full training pipeline: extract features → train models → save.
+    n_splits: int = 5,
+) -> dict[str, ModelArtifact | dict]:
+    """Full training pipeline with Walk-Forward Validation.
+
+    PHASE 3: Replaces naive fit() with strict chronological TimeSeriesSplit.
+    The dataset is already sorted by date (from build_training_dataset),
+    so TimeSeriesSplit respects temporal ordering — no future leakage.
+
+    Steps:
+      1. Build dataset (chronologically sorted)
+      2. Extract dynamic feature names from the dataset
+      3. Walk-Forward Validation: n_splits folds, each fold trains on past,
+         validates on future. Reports per-fold Brier Score + accuracy.
+      4. Train final model on ALL data (for production use)
+      5. Save artifacts with validation metrics
 
     Args:
         session: SQLAlchemy session.
@@ -351,10 +364,13 @@ def run_training_pipeline(
         season: Optional season filter.
         model_dir: Model storage directory.
         min_games: Minimum games before including a team.
+        n_splits: Number of Walk-Forward folds.
 
     Returns:
-        {"match_winner": artifact, "over_under": artifact}
+        {"match_winner": artifact, "over_under": artifact, "validation": {...}}
     """
+    from sklearn.model_selection import TimeSeriesSplit
+
     from bet_agent.tools.feature_factory import build_training_dataset, get_feature_names
 
     dataset = build_training_dataset(session, sport, season, min_games_played=min_games)
@@ -362,7 +378,8 @@ def run_training_pipeline(
         logger.warning("Insufficient data for %s: only %d samples", sport.value, len(dataset))
         return {}
 
-    feature_names = get_feature_names(sport)
+    # Dynamic feature names from the actual dataset
+    feature_names = get_feature_names(sport, dataset=dataset)
 
     # Build numpy arrays
     X = np.zeros((len(dataset), len(feature_names)))
@@ -377,11 +394,175 @@ def run_training_pipeline(
         y_result[i] = result_map.get(fv.target_result or "D", 1)
         y_total[i] = float(fv.target_total_goals or 0)
 
-    results = {}
-    results["match_winner"] = train_match_winner(X, y_result, feature_names, sport, model_dir)
-    results["over_under"] = train_over_under(X, y_total, feature_names, sport, model_dir)
+    # ── Walk-Forward Validation ──────────────────────────────────────
+    validation = _walk_forward_validate(
+        X, y_result, y_total, feature_names, sport, n_splits=n_splits,
+    )
+
+    logger.info(
+        "Walk-Forward Validation for %s: mean_brier=%.4f, mean_acc=%.4f, mean_rmse=%.4f",
+        sport.value,
+        validation["mean_brier"],
+        validation["mean_accuracy"],
+        validation["mean_rmse"],
+    )
+
+    # ── Train final models on ALL data ───────────────────────────────
+    results: dict[str, ModelArtifact | dict] = {}
+
+    # Conservative hyperparams (Phase 3: reduce overfitting)
+    conservative_params = {
+        "max_depth": 4,
+        "min_child_weight": 3,
+        "n_estimators": 200,
+        "learning_rate": 0.05,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 0.1,
+        "reg_lambda": 1.0,
+    }
+
+    results["match_winner"] = train_match_winner(
+        X, y_result, feature_names, sport, model_dir,
+        hyperparams=conservative_params,
+    )
+    results["over_under"] = train_over_under(
+        X, y_total, feature_names, sport, model_dir,
+        hyperparams=conservative_params,
+    )
+    results["validation"] = validation
 
     return results
+
+
+def _walk_forward_validate(
+    X: np.ndarray,
+    y_result: np.ndarray,
+    y_total: np.ndarray,
+    feature_names: list[str],
+    sport: Sport,
+    n_splits: int = 5,
+) -> dict:
+    """Walk-Forward Validation with TimeSeriesSplit.
+
+    For each fold:
+      - Train on chronologically earlier data
+      - Validate on chronologically later data
+      - Compute multiclass Brier Score and accuracy for classifier
+      - Compute RMSE for regressor
+
+    Returns:
+        Dict with per-fold and aggregate metrics.
+    """
+    from sklearn.model_selection import TimeSeriesSplit
+    from xgboost import XGBClassifier, XGBRegressor
+
+    tss = TimeSeriesSplit(n_splits=n_splits)
+
+    fold_briers: list[float] = []
+    fold_accuracies: list[float] = []
+    fold_rmses: list[float] = []
+    fold_details: list[dict] = []
+
+    conservative_params = {
+        "max_depth": 4,
+        "min_child_weight": 3,
+        "n_estimators": 200,
+        "learning_rate": 0.05,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 0.1,
+        "reg_lambda": 1.0,
+        "random_state": 42,
+        "n_jobs": _TRAINING_JOBS,
+    }
+
+    for fold_idx, (train_idx, val_idx) in enumerate(tss.split(X)):
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train_r, y_val_r = y_result[train_idx], y_result[val_idx]
+        y_train_t, y_val_t = y_total[train_idx], y_total[val_idx]
+
+        # ── Classifier (1X2) ──
+        clf = XGBClassifier(
+            objective="multi:softprob",
+            num_class=3,
+            eval_metric="mlogloss",
+            **conservative_params,
+        )
+        clf.fit(X_train, y_train_r)
+
+        # Multiclass Brier Score
+        probs = clf.predict_proba(X_val)  # (n_val, 3)
+        brier = _multiclass_brier_score(y_val_r, probs, n_classes=3)
+
+        # Accuracy
+        preds = clf.predict(X_val)
+        accuracy = float(np.mean(preds == y_val_r))
+
+        # ── Regressor (totals) ──
+        reg = XGBRegressor(
+            objective="reg:squarederror",
+            eval_metric="rmse",
+            **conservative_params,
+        )
+        reg.fit(X_train, y_train_t)
+        pred_total = reg.predict(X_val)
+        rmse = float(np.sqrt(np.mean((pred_total - y_val_t) ** 2)))
+
+        fold_briers.append(brier)
+        fold_accuracies.append(accuracy)
+        fold_rmses.append(rmse)
+
+        fold_detail = {
+            "fold": fold_idx + 1,
+            "train_size": len(train_idx),
+            "val_size": len(val_idx),
+            "brier_score": round(brier, 4),
+            "accuracy": round(accuracy, 4),
+            "rmse": round(rmse, 4),
+        }
+        fold_details.append(fold_detail)
+        logger.info(
+            "Fold %d/%d: train=%d, val=%d, brier=%.4f, acc=%.4f, rmse=%.4f",
+            fold_idx + 1, n_splits, len(train_idx), len(val_idx),
+            brier, accuracy, rmse,
+        )
+
+    return {
+        "sport": sport.value,
+        "n_splits": n_splits,
+        "total_samples": len(X),
+        "folds": fold_details,
+        "mean_brier": round(float(np.mean(fold_briers)), 4),
+        "std_brier": round(float(np.std(fold_briers)), 4),
+        "mean_accuracy": round(float(np.mean(fold_accuracies)), 4),
+        "std_accuracy": round(float(np.std(fold_accuracies)), 4),
+        "mean_rmse": round(float(np.mean(fold_rmses)), 4),
+        "std_rmse": round(float(np.std(fold_rmses)), 4),
+    }
+
+
+def _multiclass_brier_score(y_true: np.ndarray, probs: np.ndarray, n_classes: int = 3) -> float:
+    """Compute multiclass Brier Score.
+
+    Brier = (1/N) * sum_i sum_c (p_ic - y_ic)^2
+
+    Where y_ic is 1 if sample i belongs to class c, else 0,
+    and p_ic is the predicted probability for class c.
+
+    Lower is better. Perfect = 0.0, coin-flip baseline ≈ 0.667 for 3 classes.
+    """
+    n = len(y_true)
+    if n == 0:
+        return 1.0
+
+    # One-hot encode true labels
+    y_onehot = np.zeros((n, n_classes))
+    for i, label in enumerate(y_true):
+        if 0 <= label < n_classes:
+            y_onehot[i, label] = 1.0
+
+    return float(np.mean(np.sum((probs - y_onehot) ** 2, axis=1)))
 
 
 # ── Auditor Hook: Model Performance Evaluation ──────────────────────

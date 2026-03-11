@@ -4,6 +4,15 @@ Generates feature vectors for any match using ONLY data available BEFORE
 that match started (no future leakage). Features come from team_daily_stats
 and historical_matches tables.
 
+PHASE 3 ENHANCEMENT:
+  Dynamic feature extraction — reads ALL keys from TeamDailyStats JSONB
+  profiles instead of relying on hardcoded sport-specific lists. This means
+  new features added by ingesters (roll_3_shots, opp_season_win_pct, etc.)
+  are automatically consumed without code changes here.
+
+  Metadata features for tennis: age_diff, height_diff, hand encoding,
+  hand_matchup interaction feature.
+
 Golden Rule #1: NO LLM MATH.  All feature engineering is deterministic Python.
 Golden Rule #2: STATEFUL MEMORY.  All data sourced from PostgreSQL.
 
@@ -31,6 +40,20 @@ from bet_agent.db.models import (
 logger = logging.getLogger(__name__)
 
 
+# ── Hand Encoding for Tennis ────────────────────────────────────────
+
+def _encode_hand(hand: str | None) -> float:
+    """Encode playing hand: R=1.0, L=-1.0, U/unknown=0.0."""
+    if not hand:
+        return 0.0
+    h = str(hand).strip().upper()
+    if h == "R":
+        return 1.0
+    elif h == "L":
+        return -1.0
+    return 0.0
+
+
 @dataclass
 class FeatureVector:
     """A complete feature vector for a single match."""
@@ -45,10 +68,7 @@ class FeatureVector:
     target_total_goals: int | None = None  # total score
 
 
-# ── Feature Definitions per Sport ────────────────────────────────────
-
-# Each sport has a list of (feature_name, extractor_key) pairs.
-# The extractor_key refers to a key in the TeamDailyStats.stats JSONB.
+# ── Static Feature Definitions (fallback when no JSONB profiles exist) ──
 
 _UNIVERSAL_FEATURES = [
     "roll_5_goals_for", "roll_5_goals_against", "roll_5_total_goals", "roll_5_win_pct",
@@ -57,39 +77,12 @@ _UNIVERSAL_FEATURES = [
     "season_wins", "season_losses", "season_draws", "win_pct", "games_played",
 ]
 
-_FOOTBALL_FEATURES = [
-    "roll_5_shots", "roll_5_shots_target", "roll_5_corners", "roll_5_fouls",
-    "roll_10_shots", "roll_10_shots_target", "roll_10_corners", "roll_10_fouls",
-    "roll_20_shots", "roll_20_shots_target",
-]
+# Keys that are metadata, NOT numeric features — never feed to XGBoost
+_METADATA_KEYS = {"hand", "height_cm", "age", "country", "surface", "name"}
 
-_TENNIS_FEATURES = [
-    "ace_pct", "first_serve_pct", "first_serve_won_pct", "second_serve_won_pct",
-    "bp_saved_pct", "return_points_won_pct", "elo_rating",
-]
-
-_ICE_HOCKEY_FEATURES = [
-    "roll_5_shots", "roll_5_power_play_goals", "roll_5_hits", "roll_5_blocked_shots",
-    "roll_10_shots", "roll_10_power_play_goals", "roll_10_hits", "roll_10_blocked_shots",
-    "corsi_for_pct", "fenwick_for_pct", "pp_pct", "pk_pct", "sv_pct",
-]
-
-_BASKETBALL_FEATURES = [
-    "pace", "off_rtg", "def_rtg", "net_rtg",
-]
-
-_AMERICAN_FOOTBALL_FEATURES = [
-    "off_epa", "def_epa", "yards_per_play",
-]
-
-SPORT_FEATURES: dict[Sport, list[str]] = {
-    Sport.FOOTBALL: _UNIVERSAL_FEATURES + _FOOTBALL_FEATURES,
-    Sport.TENNIS: _UNIVERSAL_FEATURES + _TENNIS_FEATURES,
-    Sport.ICE_HOCKEY: _UNIVERSAL_FEATURES + _ICE_HOCKEY_FEATURES,
-    Sport.BASKETBALL: _UNIVERSAL_FEATURES + _BASKETBALL_FEATURES,
-    Sport.AMERICAN_FOOTBALL: _UNIVERSAL_FEATURES + _AMERICAN_FOOTBALL_FEATURES,
-    Sport.DARTS: _UNIVERSAL_FEATURES,
-}
+# Keys from JSONB profiles to skip during dynamic feature extraction
+# (they are used for metadata features, not directly as model features)
+_SKIP_PROFILE_KEYS = _METADATA_KEYS | {"elo_rating"}
 
 
 # ── Point-in-Time Feature Extraction ────────────────────────────────
@@ -134,39 +127,13 @@ def build_feature_vector(
     """Build a complete feature vector for a match.
 
     Uses Point-in-Time data only (stats before match_date).
-    Prefixes home features with 'h_' and away features with 'a_'.
-    Also computes differential features (home - away).
+    Dynamically extracts ALL numeric keys from JSONB profiles,
+    plus metadata features (tennis: age_diff, height_diff, hand).
     """
     home_stats = get_team_features_at_date(session, sport, home_team, match_date)
     away_stats = get_team_features_at_date(session, sport, away_team, match_date)
 
-    feature_keys = SPORT_FEATURES.get(sport, _UNIVERSAL_FEATURES)
-    features: dict[str, float] = {}
-
-    # Home features
-    for key in feature_keys:
-        val = home_stats.get(key)
-        if val is not None:
-            features[f"h_{key}"] = float(val)
-        else:
-            features[f"h_{key}"] = 0.0
-
-    # Away features
-    for key in feature_keys:
-        val = away_stats.get(key)
-        if val is not None:
-            features[f"a_{key}"] = float(val)
-        else:
-            features[f"a_{key}"] = 0.0
-
-    # Differential features (home - away) for key rolling stats
-    for window in [5, 10, 20]:
-        for stat in ["goals_for", "goals_against", "win_pct"]:
-            h_key = f"roll_{window}_{stat}"
-            h_val = home_stats.get(h_key, 0.0)
-            a_val = away_stats.get(h_key, 0.0)
-            if h_val is not None and a_val is not None:
-                features[f"diff_{h_key}"] = float(h_val) - float(a_val)
+    features = _extract_dynamic_features(home_stats, away_stats, sport)
 
     # Head-to-head record (last 5 meetings)
     h2h = _head_to_head_stats(session, sport, home_team, away_team, match_date, n=5)
@@ -209,11 +176,15 @@ def build_training_dataset(
     we load ALL TeamDailyStats and HistoricalMatches for the sport in ~3 queries
     and resolve features in-memory.
 
+    PHASE 3: Dynamic feature extraction from JSONB profiles. All roll_*,
+    season_*, opp_* keys are automatically consumed. Tennis metadata
+    (age_diff, height_diff, hand) is extracted as interaction features.
+
     Only includes matches where both teams have at least `min_games_played`
     games of history (to avoid cold-start noise).
 
     Returns:
-        List of FeatureVector with targets populated.
+        List of FeatureVector with targets populated, sorted chronologically.
     """
     query = (
         select(HistoricalMatch)
@@ -235,27 +206,13 @@ def build_training_dataset(
     # ── Bulk-load all historical matches for H2H and rest-day lookups ──
     all_hist = _bulk_load_historical(session, sport)
 
-    feature_keys = SPORT_FEATURES.get(sport, _UNIVERSAL_FEATURES)
-
     dataset: list[FeatureVector] = []
     for hm in matches:
         home_stats = _lookup_stats_at_date(stats_cache, hm.home_team, hm.match_date)
         away_stats = _lookup_stats_at_date(stats_cache, hm.away_team, hm.match_date)
 
-        features: dict[str, float] = {}
-
-        # Home + Away features
-        for key in feature_keys:
-            features[f"h_{key}"] = float(home_stats.get(key, 0.0) or 0.0)
-            features[f"a_{key}"] = float(away_stats.get(key, 0.0) or 0.0)
-
-        # Differential features
-        for window in [5, 10, 20]:
-            for stat in ["goals_for", "goals_against", "win_pct"]:
-                h_key = f"roll_{window}_{stat}"
-                h_val = float(home_stats.get(h_key, 0.0) or 0.0)
-                a_val = float(away_stats.get(h_key, 0.0) or 0.0)
-                features[f"diff_{h_key}"] = h_val - a_val
+        # Dynamic feature extraction from JSONB profiles
+        features = _extract_dynamic_features(home_stats, away_stats, sport)
 
         # H2H (in-memory)
         h2h = _h2h_from_cache(all_hist, hm.home_team, hm.away_team, hm.match_date, n=5)
@@ -531,31 +488,125 @@ def _get_match_target(
     }
 
 
+# ── Dynamic Feature Extraction ───────────────────────────────────────
+
+
+def _extract_dynamic_features(
+    home_stats: dict,
+    away_stats: dict,
+    sport: Sport,
+) -> dict[str, float]:
+    """Extract features dynamically from JSONB profiles.
+
+    Instead of hardcoded feature lists, reads ALL numeric keys from
+    the profiles. This means new features added by ingesters (roll_3_shots,
+    opp_season_win_pct, etc.) flow through automatically.
+
+    Also computes:
+      - Differential features for all shared roll_* keys
+      - Tennis metadata: age_diff, height_diff, hand encoding, hand_matchup
+    """
+    features: dict[str, float] = {}
+
+    # Collect all numeric keys from both profiles (union)
+    all_keys: set[str] = set()
+    for stats in (home_stats, away_stats):
+        for k, v in stats.items():
+            if k in _SKIP_PROFILE_KEYS:
+                continue
+            # Only include numeric values
+            if isinstance(v, (int, float)):
+                all_keys.add(k)
+            elif isinstance(v, str):
+                try:
+                    float(v)
+                    all_keys.add(k)
+                except (ValueError, TypeError):
+                    pass
+
+    # Sorted for deterministic ordering
+    sorted_keys = sorted(all_keys)
+
+    # Home + Away features
+    for key in sorted_keys:
+        h_val = home_stats.get(key)
+        a_val = away_stats.get(key)
+        features[f"h_{key}"] = float(h_val) if h_val is not None else 0.0
+        features[f"a_{key}"] = float(a_val) if a_val is not None else 0.0
+
+    # Differential features for all roll_* keys (automatic)
+    for key in sorted_keys:
+        if key.startswith("roll_") or key in ("win_pct", "season_win_pct"):
+            h_val = float(home_stats.get(key, 0.0) or 0.0)
+            a_val = float(away_stats.get(key, 0.0) or 0.0)
+            features[f"diff_{key}"] = h_val - a_val
+
+    # ── Tennis Metadata Features ────────────────────────────────────
+    if sport == Sport.TENNIS:
+        # Age difference (home - away)
+        h_age = home_stats.get("age")
+        a_age = away_stats.get("age")
+        if h_age is not None and a_age is not None:
+            features["age_diff"] = float(h_age) - float(a_age)
+
+        # Height difference (home - away)
+        h_height = home_stats.get("height_cm")
+        a_height = away_stats.get("height_cm")
+        if h_height is not None and a_height is not None:
+            features["height_diff"] = float(h_height) - float(a_height)
+
+        # Hand encoding
+        h_hand = _encode_hand(home_stats.get("hand"))
+        a_hand = _encode_hand(away_stats.get("hand"))
+        features["h_hand"] = h_hand
+        features["a_hand"] = a_hand
+        # Interaction: same-hand matchup (1.0) vs cross-hand (-1.0)
+        features["hand_matchup"] = h_hand * a_hand
+
+        # ELO rating (special — kept as direct feature, not skipped)
+        h_elo = home_stats.get("elo_rating")
+        a_elo = away_stats.get("elo_rating")
+        if h_elo is not None:
+            features["h_elo_rating"] = float(h_elo)
+        if a_elo is not None:
+            features["a_elo_rating"] = float(a_elo)
+        if h_elo is not None and a_elo is not None:
+            features["elo_diff"] = float(h_elo) - float(a_elo)
+
+    return features
+
+
 # ── Feature Name Registry ────────────────────────────────────────────
 
 
-def get_feature_names(sport: Sport) -> list[str]:
+def get_feature_names(sport: Sport, dataset: list[FeatureVector] | None = None) -> list[str]:
     """Return ordered list of feature names for a sport.
 
-    Useful for ensuring consistent column ordering in training/inference.
-    """
-    feature_keys = SPORT_FEATURES.get(sport, _UNIVERSAL_FEATURES)
-    names: list[str] = []
+    PHASE 3: If a dataset is provided, dynamically extracts feature names
+    from the union of all FeatureVector.features keys. This handles
+    variable-width JSONB profiles correctly.
 
-    # Home + Away features
+    If no dataset is given, falls back to _UNIVERSAL_FEATURES for backward
+    compatibility (inference without a training set).
+    """
+    if dataset:
+        # Dynamic: union of all feature keys across the dataset
+        all_keys: set[str] = set()
+        for fv in dataset:
+            all_keys.update(fv.features.keys())
+        return sorted(all_keys)
+
+    # Fallback: static universal features (for inference with no dataset)
+    names: list[str] = []
     for prefix in ["h", "a"]:
-        for key in feature_keys:
+        for key in _UNIVERSAL_FEATURES:
             names.append(f"{prefix}_{key}")
 
-    # Differential features
     for window in [5, 10, 20]:
         for stat in ["goals_for", "goals_against", "win_pct"]:
             names.append(f"diff_roll_{window}_{stat}")
 
-    # H2H features
     names.extend(["h2h_matches", "h2h_home_wins", "h2h_away_wins", "h2h_draws", "h2h_home_win_pct"])
-
-    # Rest days
     names.extend(["h_rest_days", "a_rest_days", "rest_diff"])
 
     return names
