@@ -1,7 +1,7 @@
 """SQLAlchemy ORM models for the BetAgent Multi-Agent System.
 
-8 tables: matches, odds_markets, bankroll_ledger, placed_bets,
-model_metrics, team_aliases, team_daily_stats, historical_matches.
+9 tables: matches, odds_markets, bankroll_ledger, placed_bets,
+model_metrics, team_aliases, team_daily_stats, historical_matches, predictions.
 """
 
 import enum
@@ -67,6 +67,13 @@ class MatchState(str, enum.Enum):
     IN_PROGRESS = "in_progress"
     BREAK = "break"
     FINISHED = "finished"
+
+
+class PredictionStatus(str, enum.Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    VETOED = "vetoed"
+    PLACED = "placed"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -413,3 +420,63 @@ class HistoricalMatch(Base):
         Index("ix_hist_sport_date", "sport", "match_date"),
         Index("ix_hist_season", "sport", "season"),
     )
+
+
+class Prediction(Base):
+    """ML/analytical model prediction for a specific match and market.
+
+    Tracks a prediction through the pipeline: pending → approved → placed
+    (or vetoed by the Devil's Advocate).
+    """
+
+    __tablename__ = "predictions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    match_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("matches.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    model_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    market_type: Mapped[MarketType] = mapped_column(
+        Enum(MarketType, native_enum=False), nullable=False
+    )
+    selection: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # Probabilities and EV
+    model_prob: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    implied_prob: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    prob_edge: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    ev: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+
+    # Model metadata
+    model_source: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="analytical"
+    )  # "xgboost" or "analytical"
+
+    # Pipeline status
+    status: Mapped[PredictionStatus] = mapped_column(
+        Enum(PredictionStatus, native_enum=False),
+        default=PredictionStatus.PENDING,
+        nullable=False, index=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now(), nullable=False
+    )
+
+    # Relationships
+    match: Mapped["Match"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "match_id", "model_name", "market_type", "selection",
+            name="uq_prediction_identity",
+        ),
+        Index("ix_pred_status", "status"),
+    )
+
+    def __repr__(self) -> str:
+        status_str = self.status.value if self.status is not None else "no_status"
+        return f"<Prediction {self.selection} ev={self.ev} ({status_str})>"

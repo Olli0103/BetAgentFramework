@@ -45,6 +45,9 @@ agents:
       - query_bankroll_ledger
       - push_alert_to_human
       - log_decision
+      - run_daily_predictions
+      - get_positive_ev_predictions
+      - update_prediction_status
     reports_to: null  # Top of hierarchy
     receives_from:
       - scout
@@ -163,6 +166,7 @@ agents:
       - find_latest_model
       - run_training_pipeline
       - build_feature_vector
+      - estimate_params
     reports_to: master
     schedule: null  # Triggered by data_janitor output
 
