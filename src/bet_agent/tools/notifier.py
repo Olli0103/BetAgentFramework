@@ -1,12 +1,13 @@
 """Master Alert System — push notifications for final betting tickets.
 
 Supports multiple notification channels:
-  - Telegram webhook (production)
+  - Telegram syndicate broadcast (production) — sends to ALL whitelisted IDs
+  - Telegram group chat (if TELEGRAM_GROUP_ID is set)
   - macOS osascript desktop notification (development)
   - Console/logging fallback (always available)
 
 The Final Ticket consolidates vetted, sized, and shopped bet data
-into a human-readable alert for the operator.
+into a human-readable alert for the operator and syndicate members.
 """
 
 from __future__ import annotations
@@ -155,7 +156,7 @@ class ConsoleNotifier(NotificationBackend):
 
 
 class TelegramNotifier(NotificationBackend):
-    """Sends alerts via Telegram Bot API webhook."""
+    """Sends alerts to a single Telegram chat (legacy single-user mode)."""
 
     def __init__(
         self,
@@ -165,32 +166,110 @@ class TelegramNotifier(NotificationBackend):
         self.bot_token = bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
         self.chat_id = chat_id or os.environ.get("TELEGRAM_CHAT_ID", "")
 
+    def _send_to_chat(self, chat_id: str, message: str) -> bool:
+        """Send a message to a specific Telegram chat_id."""
+        import urllib.request
+
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        payload = json.dumps({
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML",
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200
+
     def send(self, message: str, title: str = "BetAgent Alert") -> bool:
         if not self.bot_token or not self.chat_id:
             logger.warning("Telegram not configured (missing bot_token or chat_id)")
             return False
 
         try:
-            import urllib.request
-
-            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-            payload = json.dumps({
-                "chat_id": self.chat_id,
-                "text": message,
-                "parse_mode": "HTML",
-            }).encode("utf-8")
-
-            req = urllib.request.Request(
-                url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return resp.status == 200
+            return self._send_to_chat(self.chat_id, message)
         except Exception as exc:
             logger.error("Telegram send failed: %s", exc)
             return False
+
+
+class TelegramSyndicateBroadcaster(NotificationBackend):
+    """Broadcasts alerts to ALL whitelisted syndicate members.
+
+    Reads ALLOWED_TELEGRAM_IDS from env and sends to each member.
+    Also sends to TELEGRAM_GROUP_ID if set.
+    """
+
+    def __init__(
+        self,
+        bot_token: str | None = None,
+        allowed_ids: str | None = None,
+        group_id: str | None = None,
+    ):
+        self.bot_token = bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        self._allowed_raw = allowed_ids or os.environ.get("ALLOWED_TELEGRAM_IDS", "")
+        self.group_id = group_id or os.environ.get("TELEGRAM_GROUP_ID", "")
+
+    def _get_target_ids(self) -> list[str]:
+        """Parse all target chat IDs for broadcasting."""
+        targets: list[str] = []
+
+        # Individual whitelisted users
+        for part in self._allowed_raw.split(","):
+            part = part.strip()
+            if part:
+                targets.append(part)
+
+        # Group chat (if configured and not already in list)
+        if self.group_id and self.group_id not in targets:
+            targets.append(self.group_id)
+
+        return targets
+
+    def send(self, message: str, title: str = "BetAgent Alert") -> bool:
+        if not self.bot_token:
+            logger.warning("Telegram bot token not configured for broadcast")
+            return False
+
+        targets = self._get_target_ids()
+        if not targets:
+            logger.warning("No broadcast targets configured")
+            return False
+
+        import urllib.request
+
+        success_count = 0
+        for chat_id in targets:
+            try:
+                url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+                payload = json.dumps({
+                    "chat_id": chat_id,
+                    "text": message,
+                    "parse_mode": "HTML",
+                }).encode("utf-8")
+
+                req = urllib.request.Request(
+                    url,
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if resp.status == 200:
+                        success_count += 1
+            except Exception as exc:
+                logger.warning("Broadcast to %s failed: %s", chat_id, exc)
+
+        logger.info(
+            "Syndicate broadcast: %d/%d targets reached",
+            success_count, len(targets),
+        )
+        return success_count > 0
 
 
 class MacOSNotifier(NotificationBackend):
@@ -225,10 +304,25 @@ class MacOSNotifier(NotificationBackend):
 
 
 def get_notifiers() -> list[NotificationBackend]:
-    """Build list of available notification backends based on environment."""
+    """Build list of available notification backends based on environment.
+
+    Priority:
+      1. Console (always)
+      2. Syndicate Broadcaster (if ALLOWED_TELEGRAM_IDS is set — broadcasts to all)
+      3. Single TelegramNotifier fallback (if only TELEGRAM_CHAT_ID is set)
+      4. macOS desktop (if on Darwin)
+    """
     notifiers: list[NotificationBackend] = [ConsoleNotifier()]
 
-    if os.environ.get("TELEGRAM_BOT_TOKEN"):
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    allowed_ids = os.environ.get("ALLOWED_TELEGRAM_IDS", "")
+    single_chat = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+    if bot_token and allowed_ids:
+        # Syndicate mode: broadcast to all whitelisted members
+        notifiers.append(TelegramSyndicateBroadcaster())
+    elif bot_token and single_chat:
+        # Legacy single-user mode
         notifiers.append(TelegramNotifier())
 
     if platform.system() == "Darwin":

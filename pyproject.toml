@@ -21,6 +21,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+ui = [
+    "streamlit>=1.30",
+]
+telegram = [
+    "python-telegram-bot>=20.0",
+]
 dev = [
     "pytest>=7.0",
     "alembic>=1.12",

@@ -33,14 +33,16 @@ agents:
   # ── 1. MASTER AGENT (Portfolio Manager) ──────────────────────────────
   - id: master
     name: "Master Agent"
-    role: "Portfolio Manager & CEO"
+    role: "Portfolio Manager, CEO & Syndicate Concierge"
     llm_tier: tier1_heavy_reasoning
     soul_file: agents/master/SOUL.md
     description: >
       Orchestrates all workflows. Routes picks through the pipeline,
-      decides Paper vs Real placement, and pushes final actionable
-      alerts to the human operator.
+      decides Paper vs Real placement, broadcasts alerts to the
+      syndicate team, and answers natural language queries from
+      Telegram as the fund's AI concierge.
     tools:
+      # Pipeline tools
       - route_to_agent
       - query_bankroll_ledger
       - push_alert_to_human
@@ -54,9 +56,19 @@ agents:
       - push_alert
       - push_daily_summary
       - build_ticket
+      # Settlement tools
       - fetch_and_update_results
       - settle_finished_matches
       - run_daily_audit
+      # Concierge read-only tools
+      - fetch_portfolio_summary
+      - fetch_model_health
+      - explain_veto_reason
+      - fetch_recent_activity
+      - fetch_sport_exposure
+      - fetch_pending_for_human
+      - fetch_pnl_timeseries
+      - mark_bet_placed_by_user
     reports_to: null  # Top of hierarchy
     receives_from:
       - scout
@@ -309,3 +321,42 @@ agents:
       brier_score_max: 0.22          # Above = degraded
       roi_min_pct: -5.0              # Below = degraded
       rolling_window_bets: 50        # Minimum bets before checking
+
+# ══════════════════════════════════════════════════════════════════════
+# INTERFACES — Command Center (Phase 5)
+# ══════════════════════════════════════════════════════════════════════
+
+interfaces:
+  # ── WebUI (Streamlit) ─────────────────────────────────────────────
+  webui:
+    engine: streamlit
+    entry_point: src/bet_agent/ui/app.py
+    host: "0.0.0.0"
+    port: 8501
+    tabs:
+      - pipeline     # Kanban: NOT STARTED → PENDING → VETOED → APPROVED → SETTLED
+      - portfolio     # Time-series PnL, bankroll growth, sport exposure
+      - mlops         # Model health, Brier Scores, ROI, killswitch
+      - agent_logs    # Live tail of agent execution logs
+
+  # ── Telegram Syndicate Bot ────────────────────────────────────────
+  telegram:
+    engine: python-telegram-bot
+    entry_point: src/bet_agent/interfaces/telegram_bot.py
+    mode: long_polling
+    env_vars:
+      bot_token: TELEGRAM_BOT_TOKEN
+      allowed_ids: ALLOWED_TELEGRAM_IDS
+      group_id: TELEGRAM_GROUP_ID
+    commands:
+      - /start    # Welcome + help
+      - /status   # Daily portfolio summary
+      - /pending  # Bets awaiting human execution
+      - /pnl      # Balance & P&L
+      - /health   # Model health overview
+      - /placed   # Confirm bet placement (syncs to team)
+    natural_language: true  # Free text → Master Agent concierge
+    security:
+      whitelist_mode: strict
+      fail_behavior: silent_block  # Unauthorized users get no response
+      audit_log: true              # Log all unauthorized attempts
