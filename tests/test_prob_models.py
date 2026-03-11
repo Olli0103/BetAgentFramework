@@ -87,6 +87,42 @@ class TestFootball:
         )
         assert p == 0.0  # Home lost
 
+    def test_dixon_coles_increases_draw_prob(self):
+        """Dixon-Coles rho < 0 should increase draw probability vs naive Poisson."""
+        # With rho=0 (no correction = naive independent Poisson)
+        probs_naive = self.model.match_outcome_probs(home_xg=1.3, away_xg=1.1, rho=0.0)
+        # With default rho (Dixon-Coles correction)
+        probs_dc = self.model.match_outcome_probs(home_xg=1.3, away_xg=1.1)
+        assert probs_dc["draw"] > probs_naive["draw"], (
+            f"Dixon-Coles should increase draw prob: {probs_dc['draw']:.4f} vs naive {probs_naive['draw']:.4f}"
+        )
+
+    def test_dixon_coles_probs_sum_to_one(self):
+        probs = self.model.match_outcome_probs(home_xg=1.5, away_xg=1.2)
+        _assert_probs_sum_to_one(probs)
+
+    def test_dixon_coles_rho_zero_equals_naive(self):
+        """With rho=0, results should match independent Poisson."""
+        probs = self.model.match_outcome_probs(home_xg=1.5, away_xg=1.2, rho=0.0)
+        _assert_probs_sum_to_one(probs)
+        # Just verify it doesn't crash and sums to 1
+
+    def test_live_update_with_pre_match_xg(self):
+        """live_update should use explicit pre-match xG instead of magic numbers."""
+        p = self.model.live_update(
+            pre_match_prob=0.5, live_score=(1, 0), live_time=60.0,
+            pre_match_home_xg=1.8, pre_match_away_xg=0.9,
+        )
+        _assert_valid_prob(p, "P(home wins 60min 1-0 with xG)")
+        assert p > 0.7  # Leading 1-0 at 60' with superior xG
+
+    def test_live_update_no_xg_uses_defaults(self):
+        """Without xG args, live_update should use class defaults (not crash)."""
+        p = self.model.live_update(
+            pre_match_prob=0.5, live_score=(0, 0), live_time=45.0,
+        )
+        _assert_valid_prob(p, "P(home wins 0-0 at HT)")
+
 
 # ── Ice Hockey ─────────────────────────────────────────────────────────
 

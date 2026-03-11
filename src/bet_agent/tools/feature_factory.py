@@ -6,11 +6,15 @@ and historical_matches tables.
 
 Golden Rule #1: NO LLM MATH.  All feature engineering is deterministic Python.
 Golden Rule #2: STATEFUL MEMORY.  All data sourced from PostgreSQL.
+
+Performance: build_training_dataset uses bulk-loading to avoid N+1 queries.
+For 10k matches this means ~3 queries instead of ~60k.
 """
 
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Sequence
@@ -200,6 +204,11 @@ def build_training_dataset(
 ) -> list[FeatureVector]:
     """Build a complete training dataset from historical matches.
 
+    Uses bulk-loading to avoid the N+1 query problem: instead of running
+    2 queries per match (home stats + away stats) plus H2H + rest-day lookups,
+    we load ALL TeamDailyStats and HistoricalMatches for the sport in ~3 queries
+    and resolve features in-memory.
+
     Only includes matches where both teams have at least `min_games_played`
     games of history (to avoid cold-start noise).
 
@@ -217,27 +226,192 @@ def build_training_dataset(
     matches: Sequence[HistoricalMatch] = session.execute(query).scalars().all()
     logger.info("Building training set for %s from %d matches", sport.value, len(matches))
 
+    if not matches:
+        return []
+
+    # ── Bulk-load all TeamDailyStats for this sport ──
+    stats_cache = _bulk_load_team_stats(session, sport)
+
+    # ── Bulk-load all historical matches for H2H and rest-day lookups ──
+    all_hist = _bulk_load_historical(session, sport)
+
+    feature_keys = SPORT_FEATURES.get(sport, _UNIVERSAL_FEATURES)
+
     dataset: list[FeatureVector] = []
     for hm in matches:
-        fv = build_feature_vector(
-            session, sport, hm.home_team, hm.away_team,
-            hm.match_date, include_target=True,
-        )
+        home_stats = _lookup_stats_at_date(stats_cache, hm.home_team, hm.match_date)
+        away_stats = _lookup_stats_at_date(stats_cache, hm.away_team, hm.match_date)
+
+        features: dict[str, float] = {}
+
+        # Home + Away features
+        for key in feature_keys:
+            features[f"h_{key}"] = float(home_stats.get(key, 0.0) or 0.0)
+            features[f"a_{key}"] = float(away_stats.get(key, 0.0) or 0.0)
+
+        # Differential features
+        for window in [5, 10, 20]:
+            for stat in ["goals_for", "goals_against", "win_pct"]:
+                h_key = f"roll_{window}_{stat}"
+                h_val = float(home_stats.get(h_key, 0.0) or 0.0)
+                a_val = float(away_stats.get(h_key, 0.0) or 0.0)
+                features[f"diff_{h_key}"] = h_val - a_val
+
+        # H2H (in-memory)
+        h2h = _h2h_from_cache(all_hist, hm.home_team, hm.away_team, hm.match_date, n=5)
+        features.update(h2h)
+
+        # Rest days (in-memory)
+        home_rest = _rest_days_from_cache(all_hist, hm.home_team, hm.match_date)
+        away_rest = _rest_days_from_cache(all_hist, hm.away_team, hm.match_date)
+        features["h_rest_days"] = float(home_rest) if home_rest is not None else 7.0
+        features["a_rest_days"] = float(away_rest) if away_rest is not None else 7.0
+        features["rest_diff"] = features["h_rest_days"] - features["a_rest_days"]
 
         # Skip if insufficient history
-        if fv.features.get("h_games_played", 0) < min_games_played:
+        if features.get("h_games_played", 0) < min_games_played:
             continue
-        if fv.features.get("a_games_played", 0) < min_games_played:
+        if features.get("a_games_played", 0) < min_games_played:
             continue
 
-        # Override targets from the historical match directly
-        fv.target_result = hm.result
-        fv.target_total_goals = hm.home_score + hm.away_score
-
+        fv = FeatureVector(
+            match_date=hm.match_date,
+            sport=sport,
+            home_team=hm.home_team,
+            away_team=hm.away_team,
+            features=features,
+            target_result=hm.result,
+            target_total_goals=hm.home_score + hm.away_score,
+        )
         dataset.append(fv)
 
     logger.info("Built %d training samples (filtered from %d)", len(dataset), len(matches))
     return dataset
+
+
+# ── Bulk-Loading Helpers (eliminate N+1) ─────────────────────────────
+
+
+def _bulk_load_team_stats(
+    session: Session, sport: Sport,
+) -> dict[str, list[tuple[date, dict]]]:
+    """Load ALL TeamDailyStats for a sport into a dict keyed by team_name.
+
+    Returns:
+        {team_name: [(stat_date, stats_dict), ...]} sorted by date ascending.
+    """
+    rows = session.execute(
+        select(TeamDailyStats)
+        .where(TeamDailyStats.sport == sport)
+        .order_by(TeamDailyStats.team_name, TeamDailyStats.stat_date)
+    ).scalars().all()
+
+    cache: dict[str, list[tuple[date, dict]]] = defaultdict(list)
+    for row in rows:
+        cache[row.team_name].append((row.stat_date, row.stats or {}))
+
+    return dict(cache)
+
+
+def _lookup_stats_at_date(
+    cache: dict[str, list[tuple[date, dict]]],
+    team: str,
+    at_date: date,
+) -> dict:
+    """Binary-search the bulk cache for the latest stats BEFORE at_date."""
+    entries = cache.get(team)
+    if not entries:
+        return {}
+
+    # Entries are sorted by date ascending. Find rightmost entry < at_date.
+    lo, hi = 0, len(entries) - 1
+    result_idx = -1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if entries[mid][0] < at_date:
+            result_idx = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    if result_idx < 0:
+        return {}
+    return entries[result_idx][1]
+
+
+def _bulk_load_historical(
+    session: Session, sport: Sport,
+) -> list[HistoricalMatch]:
+    """Load ALL historical matches for a sport, sorted by date ascending."""
+    return list(
+        session.execute(
+            select(HistoricalMatch)
+            .where(HistoricalMatch.sport == sport)
+            .order_by(HistoricalMatch.match_date)
+        ).scalars().all()
+    )
+
+
+def _h2h_from_cache(
+    all_matches: list[HistoricalMatch],
+    home: str,
+    away: str,
+    before_date: date,
+    n: int = 5,
+) -> dict[str, float]:
+    """Compute H2H stats from in-memory match list."""
+    meetings = []
+    for m in reversed(all_matches):
+        if m.match_date >= before_date:
+            continue
+        if (m.home_team == home and m.away_team == away) or \
+           (m.home_team == away and m.away_team == home):
+            meetings.append(m)
+            if len(meetings) >= n:
+                break
+
+    if not meetings:
+        return {"h2h_matches": 0.0, "h2h_home_wins": 0.0, "h2h_away_wins": 0.0, "h2h_draws": 0.0, "h2h_home_win_pct": 0.0}
+
+    home_wins = away_wins = draws = 0
+    for m in meetings:
+        if m.home_team == home:
+            if m.result == "H":
+                home_wins += 1
+            elif m.result == "A":
+                away_wins += 1
+            else:
+                draws += 1
+        else:
+            if m.result == "A":
+                home_wins += 1
+            elif m.result == "H":
+                away_wins += 1
+            else:
+                draws += 1
+
+    total = len(meetings)
+    return {
+        "h2h_matches": float(total),
+        "h2h_home_wins": float(home_wins),
+        "h2h_away_wins": float(away_wins),
+        "h2h_draws": float(draws),
+        "h2h_home_win_pct": round(home_wins / total, 3) if total > 0 else 0.0,
+    }
+
+
+def _rest_days_from_cache(
+    all_matches: list[HistoricalMatch],
+    team: str,
+    before_date: date,
+) -> int | None:
+    """Find days since team's last match from in-memory list."""
+    for m in reversed(all_matches):
+        if m.match_date >= before_date:
+            continue
+        if m.home_team == team or m.away_team == team:
+            return (before_date - m.match_date).days
+    return None
 
 
 # ── Helper: Head-to-Head Stats ───────────────────────────────────────

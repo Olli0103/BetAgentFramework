@@ -477,6 +477,36 @@ class TestMLTrainer:
         assert d["sport"] == "football"
         assert d["model_name"] == "test"
 
+    def test_load_model_lru_cache(self):
+        """load_model should return the same object on repeated calls (LRU cached)."""
+        from bet_agent.ml.trainer import load_model, train_match_winner
+
+        # Clear cache from any prior tests
+        load_model.cache_clear()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            np.random.seed(42)
+            X = np.random.rand(50, 5)
+            y = np.random.randint(0, 3, 50)
+
+            artifact = train_match_winner(
+                X, y,
+                feature_names=[f"f{i}" for i in range(5)],
+                sport=Sport.FOOTBALL,
+                model_dir=model_dir,
+            )
+
+            m1 = load_model(artifact.file_path)
+            m2 = load_model(artifact.file_path)
+            assert m1 is m2, "LRU cache should return the same object"
+
+            info = load_model.cache_info()
+            assert info.hits >= 1
+
+        # Clean up
+        load_model.cache_clear()
+
 
 # ── Evaluate Model Performance ───────────────────────────────────────
 

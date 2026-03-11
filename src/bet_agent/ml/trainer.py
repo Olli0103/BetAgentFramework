@@ -13,6 +13,7 @@ Golden Rule #2: STATEFUL MEMORY.  Model metrics go to the model_metrics table.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
@@ -233,8 +234,16 @@ def train_over_under(
 # ── Loading & Inference ──────────────────────────────────────────────
 
 
+@functools.lru_cache(maxsize=8)
 def load_model(model_path: str | Path) -> object:
-    """Load a pickled model artifact from disk."""
+    """Load a pickled model artifact from disk.
+
+    Cached with LRU (maxsize=8) to avoid repeated unpickling when the
+    same model is used for multiple predictions in a single pipeline run.
+    The cache key is the string path, so callers should use consistent
+    path representations (str or resolved Path).
+    """
+    model_path = str(model_path)  # Normalize for cache key
     with open(model_path, "rb") as f:
         return pickle.load(f)
 
