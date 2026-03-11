@@ -480,7 +480,7 @@ def check_rolling_degradation(
     Returns:
         ModelHealthReport or None if insufficient data.
     """
-    # Get the last N settled bets for this model via predictions
+    # Get the last N settled bets for this model via full (match_id, market_type, selection) join
     pred_subq = (
         select(Prediction.match_id, Prediction.market_type, Prediction.selection)
         .where(Prediction.model_name == model_name)
@@ -490,10 +490,17 @@ def check_rolling_degradation(
     bets = list(
         session.execute(
             select(PlacedBet)
+            .join(
+                pred_subq,
+                and_(
+                    PlacedBet.match_id == pred_subq.c.match_id,
+                    PlacedBet.market_type == pred_subq.c.market_type,
+                    PlacedBet.selection == pred_subq.c.selection,
+                ),
+            )
             .where(
                 PlacedBet.status.in_([BetStatus.WON, BetStatus.LOST]),
                 PlacedBet.ledger_type == ledger_type,
-                PlacedBet.match_id.in_(select(pred_subq.c.match_id)),
             )
             .order_by(PlacedBet.resolved_at.desc())
             .limit(window)
@@ -503,8 +510,8 @@ def check_rolling_degradation(
     if len(bets) < window:
         return None
 
-    brier_inputs = [(float(b.model_prob), 1 if b.status == BetStatus.WON else 0) for b in bets]
-    brier = calculate_brier_score(brier_inputs)
+    # Use the correct Brier implementation (multiclass for 3-way markets)
+    brier = _compute_brier_for_bets(session, bets, model_name)
 
     total_staked = sum(b.stake_eur for b in bets)
     total_pnl = sum(b.pnl_eur or Decimal("0") for b in bets)
