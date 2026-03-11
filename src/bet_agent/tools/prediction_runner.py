@@ -109,7 +109,7 @@ def _predict_match(
     match: Match,
     prediction_date: date,
     model_dir: Path | None,
-    odds_map: dict[str, float] | None = None,
+    odds_map: dict | None = None,
 ) -> list[Prediction]:
     """Generate all market predictions for a single match."""
     predictions: list[Prediction] = []
@@ -137,7 +137,7 @@ def _try_ml_prediction(
     session: Session,
     match: Match,
     prediction_date: date,
-    odds_map: dict[str, float],
+    odds_map: dict,
     model_dir: Path | None,
 ) -> list[Prediction]:
     """Try to generate predictions using trained XGBoost model."""
@@ -149,9 +149,10 @@ def _try_ml_prediction(
 
     from bet_agent.tools.ev_calculator import calculate_ml_pre_match_ev
 
-    odds_home = odds_map.get("home")
-    odds_draw = odds_map.get("draw")
-    odds_away = odds_map.get("away")
+    mw_odds = odds_map.get("match_winner", {})
+    odds_home = mw_odds.get("home")
+    odds_draw = mw_odds.get("draw")
+    odds_away = mw_odds.get("away")
 
     if odds_home is None:
         return []
@@ -196,10 +197,15 @@ def _try_ml_over_under(
     session: Session,
     match: Match,
     prediction_date: date,
-    odds_map: dict[str, float],
+    odds_map: dict,
     model_dir: Path | None,
 ) -> list[Prediction]:
-    """Try over/under prediction using XGBoost regressor."""
+    """Try over/under prediction using XGBoost regressor.
+
+    Iterates ALL available O/U lines and generates both Over AND Under
+    predictions for each. The expected total from the ML model is used
+    with a normal approximation to derive P(over) and P(under) per line.
+    """
     from bet_agent.ml.trainer import find_latest_model, predict_total
     from bet_agent.tools.feature_factory import build_feature_vector, get_feature_names
 
@@ -209,10 +215,8 @@ def _try_ml_over_under(
     if artifact is None:
         return []
 
-    ou_line = odds_map.get("ou_line")
-    odds_over = odds_map.get("over")
-    odds_under = odds_map.get("under")
-    if ou_line is None or odds_over is None:
+    ou_markets = odds_map.get("over_under", {})
+    if not ou_markets:
         return []
 
     fv = build_feature_vector(session, match.sport, match.home_team, match.away_team, prediction_date)
@@ -223,48 +227,52 @@ def _try_ml_over_under(
 
     expected_total = predict_total(artifact.file_path, X)
 
-    # Crude probability: if expected_total > line, favor over
-    # Use a simple normal approximation with std ≈ 15% of expected
     from scipy.stats import norm
     std = max(expected_total * 0.15, 1.0)
-    p_over = float(1.0 - norm.cdf(ou_line, loc=expected_total, scale=std))
-    p_under = 1.0 - p_over
 
     predictions: list[Prediction] = []
 
-    if odds_over > 1.0:
-        implied = 1.0 / odds_over
-        edge = p_over - implied
-        ev = (p_over * (odds_over - 1.0)) - (1.0 - p_over)
-        predictions.append(Prediction(
-            match_id=match.id,
-            model_name=artifact.model_name,
-            market_type=MarketType.OVER_UNDER,
-            selection=f"over_{ou_line}",
-            model_prob=Decimal(str(round(p_over, 6))),
-            implied_prob=Decimal(str(round(implied, 6))),
-            prob_edge=Decimal(str(round(edge, 6))),
-            ev=Decimal(str(round(ev, 6))),
-            model_source="xgboost",
-            status=PredictionStatus.PENDING,
-        ))
+    for line, line_odds in ou_markets.items():
+        p_over = float(1.0 - norm.cdf(line, loc=expected_total, scale=std))
+        p_under = 1.0 - p_over
 
-    if odds_under is not None and odds_under > 1.0:
-        implied = 1.0 / odds_under
-        edge = p_under - implied
-        ev = (p_under * (odds_under - 1.0)) - (1.0 - p_under)
-        predictions.append(Prediction(
-            match_id=match.id,
-            model_name=artifact.model_name,
-            market_type=MarketType.OVER_UNDER,
-            selection=f"under_{ou_line}",
-            model_prob=Decimal(str(round(p_under, 6))),
-            implied_prob=Decimal(str(round(implied, 6))),
-            prob_edge=Decimal(str(round(edge, 6))),
-            ev=Decimal(str(round(ev, 6))),
-            model_source="xgboost",
-            status=PredictionStatus.PENDING,
-        ))
+        # Over prediction
+        odds_over = line_odds.get("over")
+        if odds_over is not None and odds_over > 1.0:
+            implied = 1.0 / odds_over
+            edge = p_over - implied
+            ev = (p_over * (odds_over - 1.0)) - (1.0 - p_over)
+            predictions.append(Prediction(
+                match_id=match.id,
+                model_name=artifact.model_name,
+                market_type=MarketType.OVER_UNDER,
+                selection=f"over_{line}",
+                model_prob=Decimal(str(round(p_over, 6))),
+                implied_prob=Decimal(str(round(implied, 6))),
+                prob_edge=Decimal(str(round(edge, 6))),
+                ev=Decimal(str(round(ev, 6))),
+                model_source="xgboost",
+                status=PredictionStatus.PENDING,
+            ))
+
+        # Under prediction
+        odds_under = line_odds.get("under")
+        if odds_under is not None and odds_under > 1.0:
+            implied = 1.0 / odds_under
+            edge = p_under - implied
+            ev = (p_under * (odds_under - 1.0)) - (1.0 - p_under)
+            predictions.append(Prediction(
+                match_id=match.id,
+                model_name=artifact.model_name,
+                market_type=MarketType.OVER_UNDER,
+                selection=f"under_{line}",
+                model_prob=Decimal(str(round(p_under, 6))),
+                implied_prob=Decimal(str(round(implied, 6))),
+                prob_edge=Decimal(str(round(edge, 6))),
+                ev=Decimal(str(round(ev, 6))),
+                model_source="xgboost",
+                status=PredictionStatus.PENDING,
+            ))
 
     return predictions
 
@@ -276,9 +284,13 @@ def _try_analytical_prediction(
     session: Session,
     match: Match,
     prediction_date: date,
-    odds_map: dict[str, float],
+    odds_map: dict,
 ) -> list[Prediction]:
-    """Generate predictions using analytical probability models + param estimator."""
+    """Generate predictions using analytical probability models + param estimator.
+
+    Iterates ALL available O/U lines and generates both Over AND Under
+    predictions for each, using the analytical model's over_under_prob().
+    """
     from bet_agent.tools.param_estimator import estimate_params
     from bet_agent.tools.prob_models.registry import get_model
 
@@ -300,9 +312,10 @@ def _try_analytical_prediction(
         logger.warning("Param mismatch for %s model: %s", match.sport.value, params.params)
         return []
 
-    odds_home = odds_map.get("home")
-    odds_draw = odds_map.get("draw")
-    odds_away = odds_map.get("away")
+    mw_odds = odds_map.get("match_winner", {})
+    odds_home = mw_odds.get("home")
+    odds_draw = mw_odds.get("draw")
+    odds_away = mw_odds.get("away")
 
     for selection, prob_key, odds_val in [
         ("home", "home", odds_home),
@@ -332,30 +345,54 @@ def _try_analytical_prediction(
             status=PredictionStatus.PENDING,
         ))
 
-    # Over/under analytical prediction
-    ou_line = odds_map.get("ou_line")
-    odds_over = odds_map.get("over")
-    if ou_line is not None and odds_over is not None and odds_over > 1.0:
+    # Over/Under analytical predictions — iterate ALL available lines
+    ou_markets = odds_map.get("over_under", {})
+    for line, line_odds in ou_markets.items():
         try:
-            p_over = model.over_under_prob(**params.params, line=ou_line)
-            implied = 1.0 / odds_over
-            edge = p_over - implied
-            ev = (p_over * (odds_over - 1.0)) - (1.0 - p_over)
+            p_over = model.over_under_prob(**params.params, line=line)
+            p_under = 1.0 - p_over
 
-            predictions.append(Prediction(
-                match_id=match.id,
-                model_name=model_name,
-                market_type=MarketType.OVER_UNDER,
-                selection=f"over_{ou_line}",
-                model_prob=Decimal(str(round(p_over, 6))),
-                implied_prob=Decimal(str(round(implied, 6))),
-                prob_edge=Decimal(str(round(edge, 6))),
-                ev=Decimal(str(round(ev, 6))),
-                model_source="analytical",
-                status=PredictionStatus.PENDING,
-            ))
+            # Over prediction
+            odds_over = line_odds.get("over")
+            if odds_over is not None and odds_over > 1.0:
+                implied = 1.0 / odds_over
+                edge = p_over - implied
+                ev = (p_over * (odds_over - 1.0)) - (1.0 - p_over)
+
+                predictions.append(Prediction(
+                    match_id=match.id,
+                    model_name=model_name,
+                    market_type=MarketType.OVER_UNDER,
+                    selection=f"over_{line}",
+                    model_prob=Decimal(str(round(p_over, 6))),
+                    implied_prob=Decimal(str(round(implied, 6))),
+                    prob_edge=Decimal(str(round(edge, 6))),
+                    ev=Decimal(str(round(ev, 6))),
+                    model_source="analytical",
+                    status=PredictionStatus.PENDING,
+                ))
+
+            # Under prediction (the missing link!)
+            odds_under = line_odds.get("under")
+            if odds_under is not None and odds_under > 1.0:
+                implied = 1.0 / odds_under
+                edge = p_under - implied
+                ev = (p_under * (odds_under - 1.0)) - (1.0 - p_under)
+
+                predictions.append(Prediction(
+                    match_id=match.id,
+                    model_name=model_name,
+                    market_type=MarketType.OVER_UNDER,
+                    selection=f"under_{line}",
+                    model_prob=Decimal(str(round(p_under, 6))),
+                    implied_prob=Decimal(str(round(implied, 6))),
+                    prob_edge=Decimal(str(round(edge, 6))),
+                    ev=Decimal(str(round(ev, 6))),
+                    model_source="analytical",
+                    status=PredictionStatus.PENDING,
+                ))
         except (TypeError, ValueError):
-            pass  # Model doesn't support these params for O/U
+            continue  # Model doesn't support O/U for these params
 
     return predictions
 
@@ -366,11 +403,14 @@ def _try_analytical_prediction(
 def _bulk_load_odds(
     session: Session,
     match_ids: list,
-) -> dict[object, dict[str, float]]:
+) -> dict[object, dict]:
     """Bulk-load pre-match odds for multiple matches in a single query.
 
-    Returns a dict keyed by match_id → odds_map (same format as _get_match_odds).
-    This eliminates the N+1 query pattern when generating daily predictions.
+    Returns a dict keyed by match_id → nested odds_map:
+        {
+            "match_winner": {"home": 2.10, "draw": 3.50, "away": 3.80},
+            "over_under": {2.5: {"over": 1.85, "under": 1.95}, ...}
+        }
 
     On PostgreSQL: uses DISTINCT ON to fetch only the latest odds per
     (match, market_type, selection) — loads O(matches) rows, not O(scrapes).
@@ -417,42 +457,52 @@ def _bulk_load_odds(
     for row in all_odds:
         by_match[row.match_id].append(row)
 
-    # Build odds_map per match (dedup logic: first seen = latest due to ORDER BY)
-    result: dict[object, dict[str, float]] = {}
+    # Build nested odds_map per match:
+    # {
+    #   "match_winner": {"home": 2.10, "draw": 3.50, "away": 3.80},
+    #   "over_under": {2.5: {"over": 1.85, "under": 1.95}, 3.5: {"over": ...}}
+    # }
+    # Dedup logic: first seen = latest due to ORDER BY scraped_at DESC.
+    result: dict[object, dict] = {}
     for mid, rows in by_match.items():
-        odds_map: dict[str, float] = {}
+        odds_map: dict = {"match_winner": {}, "over_under": {}}
         for row in rows:
             sel = row.selection.lower()
             odds = float(row.odds_decimal)
 
             if row.market_type == MarketType.MATCH_WINNER:
-                if sel == "home" and "home" not in odds_map:
-                    odds_map["home"] = odds
-                elif sel == "draw" and "draw" not in odds_map:
-                    odds_map["draw"] = odds
-                elif sel == "away" and "away" not in odds_map:
-                    odds_map["away"] = odds
+                if sel in ("home", "draw", "away") and sel not in odds_map["match_winner"]:
+                    odds_map["match_winner"][sel] = odds
+
             elif row.market_type == MarketType.OVER_UNDER:
-                if sel.startswith("over") and "over" not in odds_map:
-                    odds_map["over"] = odds
-                    parts = sel.split("_", 1)
-                    if len(parts) > 1:
-                        try:
-                            odds_map["ou_line"] = float(parts[1])
-                        except ValueError:
-                            pass
-                elif sel.startswith("under") and "under" not in odds_map:
-                    odds_map["under"] = odds
+                parts = sel.split("_", 1)
+                if len(parts) == 2:
+                    direction = parts[0]  # "over" or "under"
+                    try:
+                        line = float(parts[1])
+                    except ValueError:
+                        continue
+                    if line not in odds_map["over_under"]:
+                        odds_map["over_under"][line] = {}
+                    if direction not in odds_map["over_under"][line]:
+                        odds_map["over_under"][line][direction] = odds
+
         result[mid] = odds_map
 
     return result
 
 
-def _get_match_odds(session: Session, match: Match) -> dict[str, float]:
+def _get_match_odds(session: Session, match: Match) -> dict:
     """Get the best available odds for a match from odds_markets.
 
-    Returns a dict like:
-        {"home": 2.10, "draw": 3.50, "away": 3.80, "ou_line": 2.5, "over": 1.90, "under": 1.95}
+    Returns a nested dict:
+        {
+            "match_winner": {"home": 2.10, "draw": 3.50, "away": 3.80},
+            "over_under": {
+                2.5: {"over": 1.90, "under": 1.95},
+                3.5: {"over": 2.40, "under": 1.55},
+            }
+        }
     """
     odds_rows = session.execute(
         select(OddsMarket)
@@ -463,31 +513,28 @@ def _get_match_odds(session: Session, match: Match) -> dict[str, float]:
         .order_by(OddsMarket.scraped_at.desc())
     ).scalars().all()
 
-    result: dict[str, float] = {}
+    result: dict = {"match_winner": {}, "over_under": {}}
 
     for row in odds_rows:
         sel = row.selection.lower()
         odds = float(row.odds_decimal)
 
         if row.market_type == MarketType.MATCH_WINNER:
-            if sel == "home" and "home" not in result:
-                result["home"] = odds
-            elif sel == "draw" and "draw" not in result:
-                result["draw"] = odds
-            elif sel == "away" and "away" not in result:
-                result["away"] = odds
+            if sel in ("home", "draw", "away") and sel not in result["match_winner"]:
+                result["match_winner"][sel] = odds
+
         elif row.market_type == MarketType.OVER_UNDER:
-            if sel.startswith("over") and "over" not in result:
-                result["over"] = odds
-                # Extract line from selection like "over_2.5"
-                parts = sel.split("_", 1)
-                if len(parts) > 1:
-                    try:
-                        result["ou_line"] = float(parts[1])
-                    except ValueError:
-                        pass
-            elif sel.startswith("under") and "under" not in result:
-                result["under"] = odds
+            parts = sel.split("_", 1)
+            if len(parts) == 2:
+                direction = parts[0]
+                try:
+                    line = float(parts[1])
+                except ValueError:
+                    continue
+                if line not in result["over_under"]:
+                    result["over_under"][line] = {}
+                if direction not in result["over_under"][line]:
+                    result["over_under"][line][direction] = odds
 
     return result
 

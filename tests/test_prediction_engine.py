@@ -446,7 +446,7 @@ class TestOddsExtraction:
         match = _add_match(db_session)
         _add_odds(db_session, match, home=2.10, draw=3.50, away=3.80)
 
-        # Also add O/U odds
+        # Also add O/U odds for two different lines
         db_session.add(OddsMarket(
             match_id=match.id, sportsbook="test",
             market_type=MarketType.OVER_UNDER, selection="over_2.5",
@@ -457,19 +457,34 @@ class TestOddsExtraction:
             market_type=MarketType.OVER_UNDER, selection="under_2.5",
             odds_decimal=Decimal("1.95"), is_live=False,
         ))
+        db_session.add(OddsMarket(
+            match_id=match.id, sportsbook="test",
+            market_type=MarketType.OVER_UNDER, selection="over_3.5",
+            odds_decimal=Decimal("2.40"), is_live=False,
+        ))
+        db_session.add(OddsMarket(
+            match_id=match.id, sportsbook="test",
+            market_type=MarketType.OVER_UNDER, selection="under_3.5",
+            odds_decimal=Decimal("1.55"), is_live=False,
+        ))
         db_session.flush()
 
         odds = _get_match_odds(db_session, match)
-        assert odds["home"] == 2.10
-        assert odds["draw"] == 3.50
-        assert odds["away"] == 3.80
-        assert odds["over"] == 1.90
-        assert odds["under"] == 1.95
-        assert odds["ou_line"] == 2.5
 
-    def test_no_odds_returns_empty(self, db_session):
+        # Match winner: nested under "match_winner" key
+        assert odds["match_winner"]["home"] == 2.10
+        assert odds["match_winner"]["draw"] == 3.50
+        assert odds["match_winner"]["away"] == 3.80
+
+        # Over/Under: nested by line, each with "over" and "under"
+        assert odds["over_under"][2.5]["over"] == 1.90
+        assert odds["over_under"][2.5]["under"] == 1.95
+        assert odds["over_under"][3.5]["over"] == 2.40
+        assert odds["over_under"][3.5]["under"] == 1.55
+
+    def test_no_odds_returns_empty_structure(self, db_session):
         from bet_agent.tools.prediction_runner import _get_match_odds
 
         match = _add_match(db_session)
         odds = _get_match_odds(db_session, match)
-        assert odds == {}
+        assert odds == {"match_winner": {}, "over_under": {}}
