@@ -253,6 +253,95 @@ createdb betagent
 
 ---
 
+## Historical Data Import
+
+The system includes sport-specific ingesters for loading historical match data (CSV/Excel) into the database for ML training and backtesting.
+
+### Directory Structure
+
+Create a `data/` directory in the project root and organize files by sport:
+
+```
+data/
+├── football/          # CSV files (football-data.co.uk format)
+│   ├── D1_2324.csv    # Bundesliga 2023-24
+│   └── E0_2324.csv    # Premier League 2023-24
+├── nba/               # CSV files (game logs with team stats)
+│   └── nba_2324.csv
+├── nfl/               # XLSX files (openpyxl required)
+│   └── nfl_2024.xlsx
+├── nhl/               # CSV files (120+ columns, two rows per game)
+│   └── nhl_2324.csv
+└── tennis/            # XLSX or Sackmann CSV
+    └── atp_2024.xlsx
+```
+
+> The `data/` directory is **not** included in the repo — you must create it and download datasets yourself.
+
+### Data Sources
+
+| Sport | Format | Source |
+|-------|--------|--------|
+| Football | CSV | [football-data.co.uk](https://www.football-data.co.uk/) |
+| NBA | CSV | Game logs with team offensive/defensive stats |
+| NFL | XLSX | Season schedules with scores and stats |
+| NHL | CSV | Hockey statistics (120+ columns, 2 rows per game) |
+| Tennis | XLSX / CSV | ATP/WTA match data or [Sackmann repos](https://github.com/JeffSackmann) |
+
+### Running Imports
+
+There is no CLI entry point — imports are run programmatically in Python:
+
+```python
+from bet_agent.db.session import get_session, init_db
+from bet_agent.ingest import (
+    FootballIngester, NBAIngester, NFLIngester,
+    NHLIngester, TennisIngester,
+)
+from bet_agent.tools.historical_importer import run_full_historical_import
+
+# 1. Ensure tables exist
+init_db()
+
+# 2. Ingest raw files into historical_matches
+with get_session() as session:
+    FootballIngester(session).ingest_directory("data/football")
+    NBAIngester(session).ingest_directory("data/nba")
+    NFLIngester(session).ingest_directory("data/nfl")
+    NHLIngester(session).ingest_directory("data/nhl")
+    TennisIngester(session).ingest_directory("data/tennis")
+
+# 3. Post-process: populate matches + team_daily_stats tables
+run_full_historical_import()
+```
+
+**Web fetch helpers** (optional — download data directly):
+```python
+from bet_agent.ingest.nhl import fetch_hockey_statistics
+from bet_agent.ingest.tennis import fetch_sackmann_repo
+
+fetch_hockey_statistics("data/nhl", seasons=[2023, 2024])
+fetch_sackmann_repo("data/tennis")
+```
+
+### Import Flow
+
+```
+Raw CSV/XLSX  ──►  Ingester (sport-specific parser)
+                        │
+                        ▼
+              historical_matches table
+                        │
+                        ▼
+              historical_importer.py (post-processing)
+                        │
+                ┌───────┴───────┐
+                ▼               ▼
+          matches table   team_daily_stats table
+```
+
+---
+
 ## Risk Controls
 
 | Control | Limit |
