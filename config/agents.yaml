@@ -124,6 +124,7 @@ agents:
     description: >
       Cleans raw scraped data, normalizes live stats, and resolves
       fuzzy team/player naming conflicts using the team_aliases table.
+      Runs historical data imports and builds team daily stat snapshots.
     tools:
       - normalize_team_name
       - resolve_alias
@@ -131,6 +132,8 @@ agents:
       - merge_live_stats
       - process_crawl_results
       - upsert_daily_stats
+      - run_full_historical_import
+      - build_historical_daily_stats
     reports_to: master
     schedule: null  # Triggered by scout output
 
@@ -141,10 +144,11 @@ agents:
     llm_tier: tier2_local_tools
     soul_file: agents/quant/SOUL.md
     description: >
-      Executes deterministic Python ML tools. Pre-match: runs
-      sport-specific probability models. In-play: runs live_update()
-      combining pre-match expectations with live match stats.
-      NEVER does math itself — always calls Python tools.
+      Executes deterministic Python ML tools. Pre-match: runs XGBoost
+      models for ML-powered predictions, falling back to sport-specific
+      analytical models (Poisson, hierarchical). In-play: runs
+      live_update() combining pre-match expectations with live match
+      stats. NEVER does math itself — always calls Python tools.
     tools:
       - calculate_match_outcome_probs
       - calculate_over_under_prob
@@ -152,7 +156,13 @@ agents:
       - calculate_spread_prob
       - calculate_live_ev
       - calculate_pre_match_ev
+      - calculate_ml_pre_match_ev
       - get_sport_model
+      - predict_match_winner
+      - predict_total
+      - find_latest_model
+      - run_training_pipeline
+      - build_feature_vector
     reports_to: master
     schedule: null  # Triggered by data_janitor output
 
@@ -263,6 +273,7 @@ agents:
       - query_placed_bets
       - recommend_strategy_adjustment
       - promote_or_demote_model
+      - evaluate_model_performance
     reports_to: master
     schedule:
       daily_audit: "0 6 * * *"       # Every day at 06:00 UTC
