@@ -596,12 +596,24 @@ def evaluate_model_performance(
     """
     from sqlalchemy import select
 
+    from bet_agent.db.models import Prediction
+
     if eval_date is None:
         eval_date = date.today()
 
-    # Get all resolved bets from this model
+    # Get resolved bets that originated from THIS model's predictions.
+    # Join PlacedBet → Prediction on (match_id, market_type, selection)
+    # to filter bets by the model that generated the prediction.
     bets = session.execute(
-        select(PlacedBet).where(
+        select(PlacedBet)
+        .join(
+            Prediction,
+            (PlacedBet.match_id == Prediction.match_id)
+            & (PlacedBet.market_type == Prediction.market_type)
+            & (PlacedBet.selection == Prediction.selection),
+        )
+        .where(
+            Prediction.model_name == model_name,
             PlacedBet.ledger_type == ledger_type,
             PlacedBet.placed_at <= datetime.combine(eval_date, datetime.max.time(), tzinfo=timezone.utc),
             PlacedBet.status.in_(["won", "lost"]),

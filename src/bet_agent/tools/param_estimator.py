@@ -147,26 +147,46 @@ def _estimate_tennis(
     p_serve_away = defaults["p_serve_away"]
 
     if home_stats:
-        # first_serve_won_pct is the most direct indicator
-        fsw = home_stats.get("first_serve_won_pct")
+        # Try crawled keys first, then ingester-written rolling keys
+        fsw = (
+            home_stats.get("first_serve_won_pct")
+            or home_stats.get("roll_10_1stWon_pct")
+        )
         if fsw is not None:
-            # Convert: overall serve hold probability ≈ weighted average
-            # Typical: 65-70% 1st serve in, 72-80% 1st serve won, 48-55% 2nd serve won
             p_serve_home = float(fsw)
         else:
             # Fallback: estimate from ace% and bp_saved%
-            ace_pct = home_stats.get("ace_pct", 0.0)
-            bp_saved = home_stats.get("bp_saved_pct", 0.6)
+            ace_pct = (
+                home_stats.get("ace_pct")
+                or home_stats.get("roll_10_ace_avg")
+                or 0.0
+            )
+            bp_saved = (
+                home_stats.get("bp_saved_pct")
+                or home_stats.get("roll_10_bpSaved_pct")
+                or 0.6
+            )
             if ace_pct and bp_saved:
                 p_serve_home = min(0.80, 0.55 + float(ace_pct) * 0.5 + float(bp_saved) * 0.1)
 
     if away_stats:
-        fsw = away_stats.get("first_serve_won_pct")
+        fsw = (
+            away_stats.get("first_serve_won_pct")
+            or away_stats.get("roll_10_1stWon_pct")
+        )
         if fsw is not None:
             p_serve_away = float(fsw)
         else:
-            ace_pct = away_stats.get("ace_pct", 0.0)
-            bp_saved = away_stats.get("bp_saved_pct", 0.6)
+            ace_pct = (
+                away_stats.get("ace_pct")
+                or away_stats.get("roll_10_ace_avg")
+                or 0.0
+            )
+            bp_saved = (
+                away_stats.get("bp_saved_pct")
+                or away_stats.get("roll_10_bpSaved_pct")
+                or 0.6
+            )
             if ace_pct and bp_saved:
                 p_serve_away = min(0.80, 0.55 + float(ace_pct) * 0.5 + float(bp_saved) * 0.1)
 
@@ -231,17 +251,51 @@ def _estimate_basketball(
     params = dict(defaults)
 
     if home_stats:
-        params["home_off_rtg"] = float(home_stats.get("off_rtg", defaults["home_off_rtg"]))
-        params["home_def_rtg"] = float(home_stats.get("def_rtg", defaults["home_def_rtg"]))
-        params["pace"] = float(home_stats.get("pace", defaults["pace"]))
+        # Try crawled efficiency ratings first, then derive from ingester rolling stats.
+        # Ingester writes roll_5_points_for/against — use as proxy for off/def rating.
+        params["home_off_rtg"] = float(
+            home_stats.get("off_rtg")
+            or home_stats.get("roll_10_points_for")
+            or home_stats.get("roll_5_points_for")
+            or defaults["home_off_rtg"]
+        )
+        params["home_def_rtg"] = float(
+            home_stats.get("def_rtg")
+            or home_stats.get("roll_10_points_against")
+            or home_stats.get("roll_5_points_against")
+            or defaults["home_def_rtg"]
+        )
+        params["pace"] = float(
+            home_stats.get("pace")
+            or home_stats.get("roll_10_total_points")
+            or home_stats.get("roll_5_total_points")
+            or defaults["pace"]
+        )
 
     if away_stats:
-        params["away_off_rtg"] = float(away_stats.get("off_rtg", defaults["away_off_rtg"]))
-        params["away_def_rtg"] = float(away_stats.get("def_rtg", defaults["away_def_rtg"]))
+        params["away_off_rtg"] = float(
+            away_stats.get("off_rtg")
+            or away_stats.get("roll_10_points_for")
+            or away_stats.get("roll_5_points_for")
+            or defaults["away_off_rtg"]
+        )
+        params["away_def_rtg"] = float(
+            away_stats.get("def_rtg")
+            or away_stats.get("roll_10_points_against")
+            or away_stats.get("roll_5_points_against")
+            or defaults["away_def_rtg"]
+        )
         # Average both paces
-        if home_stats and home_stats.get("pace"):
-            away_pace = float(away_stats.get("pace", defaults["pace"]))
+        away_pace = float(
+            away_stats.get("pace")
+            or away_stats.get("roll_10_total_points")
+            or away_stats.get("roll_5_total_points")
+            or defaults["pace"]
+        )
+        if home_stats:
             params["pace"] = (params["pace"] + away_pace) / 2.0
+        else:
+            params["pace"] = away_pace
 
     return EstimatedParams(
         sport=sport, home_team=home_team, away_team=away_team,
@@ -260,24 +314,32 @@ def _estimate_american_football(
     away_power = defaults["away_power_rtg"]
 
     if home_stats:
-        off_epa = home_stats.get("off_epa", 0.0)
-        def_epa = home_stats.get("def_epa", 0.0)
+        off_epa = home_stats.get("off_epa")
+        def_epa = home_stats.get("def_epa")
         if off_epa is not None and def_epa is not None:
             # Power rating ≈ offensive EPA - defensive EPA (higher = better)
             home_power = float(off_epa) - float(def_epa)
         else:
-            # Fallback: estimate from win_pct
-            win_pct = home_stats.get("win_pct", 0.5)
-            home_power = (float(win_pct) - 0.5) * 10.0  # Scale to ~-5 to +5
+            # Fallback: derive from ingester rolling stats or win_pct
+            margin = home_stats.get("roll_10_margin") or home_stats.get("roll_5_margin")
+            if margin is not None:
+                home_power = float(margin) / 3.0  # Scale margin (~-15..+15) to power (~-5..+5)
+            else:
+                win_pct = home_stats.get("win_pct", 0.5)
+                home_power = (float(win_pct) - 0.5) * 10.0
 
     if away_stats:
-        off_epa = away_stats.get("off_epa", 0.0)
-        def_epa = away_stats.get("def_epa", 0.0)
+        off_epa = away_stats.get("off_epa")
+        def_epa = away_stats.get("def_epa")
         if off_epa is not None and def_epa is not None:
             away_power = float(off_epa) - float(def_epa)
         else:
-            win_pct = away_stats.get("win_pct", 0.5)
-            away_power = (float(win_pct) - 0.5) * 10.0
+            margin = away_stats.get("roll_10_margin") or away_stats.get("roll_5_margin")
+            if margin is not None:
+                away_power = float(margin) / 3.0
+            else:
+                win_pct = away_stats.get("win_pct", 0.5)
+                away_power = (float(win_pct) - 0.5) * 10.0
 
     return EstimatedParams(
         sport=sport, home_team=home_team, away_team=away_team,

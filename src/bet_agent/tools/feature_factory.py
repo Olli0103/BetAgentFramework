@@ -78,7 +78,7 @@ _UNIVERSAL_FEATURES = [
 ]
 
 # Keys that are metadata, NOT numeric features — never feed to XGBoost
-_METADATA_KEYS = {"hand", "height_cm", "age", "country", "surface", "name"}
+_METADATA_KEYS = {"hand", "height_cm", "age", "age_years", "country", "surface", "name"}
 
 # Keys from JSONB profiles to skip during dynamic feature extraction
 # (they are used for metadata features, not directly as model features)
@@ -543,9 +543,9 @@ def _extract_dynamic_features(
 
     # ── Tennis Metadata Features ────────────────────────────────────
     if sport == Sport.TENNIS:
-        # Age difference (home - away)
-        h_age = home_stats.get("age")
-        a_age = away_stats.get("age")
+        # Age difference (home - away) — check both key variants
+        h_age = home_stats.get("age") or home_stats.get("age_years")
+        a_age = away_stats.get("age") or away_stats.get("age_years")
         if h_age is not None and a_age is not None:
             features["age_diff"] = float(h_age) - float(a_age)
 
