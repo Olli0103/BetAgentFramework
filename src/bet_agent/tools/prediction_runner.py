@@ -76,11 +76,16 @@ def run_daily_predictions(
         "Found %d NOT_STARTED matches for %s", len(matches), prediction_date,
     )
 
+    # Bulk-load all odds for today's matches (eliminates N+1 query)
+    match_ids = [m.id for m in matches]
+    bulk_odds = _bulk_load_odds(session, match_ids) if match_ids else {}
+
     all_predictions: list[Prediction] = []
 
     for match in matches:
         try:
-            preds = _predict_match(session, match, prediction_date, model_dir)
+            odds_map = bulk_odds.get(match.id, {})
+            preds = _predict_match(session, match, prediction_date, model_dir, odds_map)
             for pred in preds:
                 if pred.ev >= Decimal(str(min_ev)):
                     _upsert_prediction(session, pred)
@@ -104,12 +109,14 @@ def _predict_match(
     match: Match,
     prediction_date: date,
     model_dir: Path | None,
+    odds_map: dict[str, float] | None = None,
 ) -> list[Prediction]:
     """Generate all market predictions for a single match."""
     predictions: list[Prediction] = []
 
-    # Get available odds for this match
-    odds_map = _get_match_odds(session, match)
+    # Use pre-loaded odds or fall back to per-match query
+    if odds_map is None:
+        odds_map = _get_match_odds(session, match)
 
     # Try ML prediction first
     ml_preds = _try_ml_prediction(session, match, prediction_date, odds_map, model_dir)
@@ -354,6 +361,65 @@ def _try_analytical_prediction(
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
+
+
+def _bulk_load_odds(
+    session: Session,
+    match_ids: list,
+) -> dict[object, dict[str, float]]:
+    """Bulk-load pre-match odds for multiple matches in a single query.
+
+    Returns a dict keyed by match_id → odds_map (same format as _get_match_odds).
+    This eliminates the N+1 query pattern when generating daily predictions.
+    """
+    from collections import defaultdict
+
+    if not match_ids:
+        return {}
+
+    all_odds = session.execute(
+        select(OddsMarket)
+        .where(
+            OddsMarket.match_id.in_(match_ids),
+            OddsMarket.is_live == False,
+        )
+        .order_by(OddsMarket.scraped_at.desc())
+    ).scalars().all()
+
+    # Group by match_id
+    by_match: dict[object, list[OddsMarket]] = defaultdict(list)
+    for row in all_odds:
+        by_match[row.match_id].append(row)
+
+    # Build odds_map per match (same logic as _get_match_odds)
+    result: dict[object, dict[str, float]] = {}
+    for mid, rows in by_match.items():
+        odds_map: dict[str, float] = {}
+        for row in rows:
+            sel = row.selection.lower()
+            odds = float(row.odds_decimal)
+
+            if row.market_type == MarketType.MATCH_WINNER:
+                if sel == "home" and "home" not in odds_map:
+                    odds_map["home"] = odds
+                elif sel == "draw" and "draw" not in odds_map:
+                    odds_map["draw"] = odds
+                elif sel == "away" and "away" not in odds_map:
+                    odds_map["away"] = odds
+            elif row.market_type == MarketType.OVER_UNDER:
+                if sel.startswith("over") and "over" not in odds_map:
+                    odds_map["over"] = odds
+                    parts = sel.split("_", 1)
+                    if len(parts) > 1:
+                        try:
+                            odds_map["ou_line"] = float(parts[1])
+                        except ValueError:
+                            pass
+                elif sel.startswith("under") and "under" not in odds_map:
+                    odds_map["under"] = odds
+        result[mid] = odds_map
+
+    return result
 
 
 def _get_match_odds(session: Session, match: Match) -> dict[str, float]:

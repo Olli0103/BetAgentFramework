@@ -193,18 +193,32 @@ def _settle_spread(selection: str, home: int, away: int) -> BetStatus:
 
 
 def calculate_pnl(bet: PlacedBet, outcome: BetStatus) -> Decimal:
-    """Calculate profit/loss for a settled bet.
+    """Calculate the bankroll adjustment at settlement time.
 
-    WON:  stake * (odds - 1)
-    LOST: -stake
-    VOID: 0 (stake returned)
+    Accounting model: stake is DEDUCTED from bankroll at placement time
+    (via ``deduct_stake_on_placement``).  At settlement we return money:
+
+    WON:  +stake * odds          (full payout: original stake + profit)
+    LOST:  0.00                  (stake already deducted — nothing to return)
+    VOID: +stake                 (refund the deducted stake)
+
+    The ``pnl_eur`` stored on the bet record represents the NET profit/loss
+    for reporting purposes (not the bankroll delta, which is the return value):
+      WON  net = stake * (odds - 1)   (profit)
+      LOST net = -stake               (loss)
+      VOID net = 0                    (break-even)
     """
     if outcome == BetStatus.WON:
-        return round(bet.stake_eur * (bet.odds_at_placement - Decimal("1")), 2)
+        # Bankroll gets full payout (stake was already deducted)
+        return round(bet.stake_eur * bet.odds_at_placement, 2)
     elif outcome == BetStatus.LOST:
-        return -bet.stake_eur
+        # Stake already gone at placement — nothing to return
+        return Decimal("0.00")
+    elif outcome == BetStatus.VOID:
+        # Refund the stake that was deducted at placement
+        return bet.stake_eur
     else:
-        # VOID or PUSHED_TO_HUMAN → no P&L
+        # PUSHED_TO_HUMAN → no change
         return Decimal("0.00")
 
 
@@ -216,16 +230,13 @@ def update_bankroll(
     ledger_type: LedgerType,
     pnl: Decimal,
 ) -> Decimal:
-    """Apply PnL to the bankroll ledger and return new balance.
+    """Apply settlement return to the bankroll ledger.
 
-    For WON bets, adds winnings. For LOST bets, loss was already
-    deducted at placement time (the stake), so we add back the
-    net result: for a WON bet we add stake + profit, for LOST
-    the stake is already gone.
-
-    In a simplified model where stake is NOT pre-deducted:
-      WON:  balance += stake * (odds - 1)  [profit only]
-      LOST: balance -= stake               [full loss]
+    Accounting model (deduct-at-placement):
+      - Stake was deducted when the bet was placed
+      - WON:  balance += stake * odds   (full payout returned)
+      - LOST: balance += 0              (stake already gone)
+      - VOID: balance += stake          (refund)
     """
     ledger = session.execute(
         select(BankrollLedger).where(BankrollLedger.ledger_type == ledger_type)
@@ -244,6 +255,22 @@ def update_bankroll(
 # ── Core settlement ──────────────────────────────────────────────────
 
 
+def _net_pnl(bet: PlacedBet, outcome: BetStatus) -> Decimal:
+    """Compute net profit/loss for reporting (stored on ``bet.pnl_eur``).
+
+    This is the human-readable number:
+      WON:  +stake * (odds - 1)   (profit)
+      LOST: -stake                (loss)
+      VOID:  0                    (break-even)
+    """
+    if outcome == BetStatus.WON:
+        return round(bet.stake_eur * (bet.odds_at_placement - Decimal("1")), 2)
+    elif outcome == BetStatus.LOST:
+        return -bet.stake_eur
+    else:
+        return Decimal("0.00")
+
+
 def settle_bet(
     session: Session,
     bet: PlacedBet,
@@ -252,24 +279,29 @@ def settle_bet(
     """Settle a single bet against a finished match.
 
     Updates bet status, PnL, resolved_at, and adjusts the bankroll.
+
+    Accounting: stake was deducted at placement.  At settlement we
+    return money to the bankroll (WON → full payout, VOID → refund).
+    The ``bet.pnl_eur`` stores the human-readable net profit/loss.
     """
     old_status = bet.status
     outcome = determine_outcome(bet, match)
-    pnl = calculate_pnl(bet, outcome)
+    bankroll_delta = calculate_pnl(bet, outcome)
+    net = _net_pnl(bet, outcome)
 
-    # Update the bet record
+    # Update the bet record (net PnL for reporting)
     bet.status = outcome
-    bet.pnl_eur = pnl
+    bet.pnl_eur = net
     bet.resolved_at = datetime.now(timezone.utc)
 
-    # Update the bankroll
-    update_bankroll(session, bet.ledger_type, pnl)
+    # Update the bankroll (return money: payout or refund)
+    update_bankroll(session, bet.ledger_type, bankroll_delta)
 
     return SettlementResult(
         bet_id=bet.id,
         old_status=old_status,
         new_status=outcome,
-        pnl_eur=pnl,
+        pnl_eur=net,
         reason=f"{bet.selection} vs score {match.home_score}-{match.away_score}",
     )
 

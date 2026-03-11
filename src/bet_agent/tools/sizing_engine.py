@@ -258,6 +258,45 @@ def size_bet(
     )
 
 
+def deduct_stake_on_placement(
+    session: Session,
+    stake_eur: Decimal,
+    ledger_type: LedgerType,
+) -> Decimal:
+    """Deduct the bet stake from the bankroll at placement time.
+
+    This is the first half of the double-entry accounting model:
+      1. Placement: balance -= stake  (this function)
+      2. Settlement: balance += payout (in settlement_engine)
+
+    Args:
+        session: SQLAlchemy session.
+        stake_eur: The stake amount to deduct.
+        ledger_type: REAL or PAPER ledger.
+
+    Returns:
+        New bankroll balance after deduction.
+    """
+    ledger = session.execute(
+        select(BankrollLedger).where(BankrollLedger.ledger_type == ledger_type)
+    ).scalar_one_or_none()
+
+    if ledger is None:
+        logger.warning(
+            "No %s ledger found — creating with negative balance", ledger_type.value,
+        )
+        ledger = BankrollLedger(ledger_type=ledger_type, balance=-stake_eur)
+        session.add(ledger)
+    else:
+        ledger.balance -= stake_eur
+
+    logger.info(
+        "Deducted %.2f EUR from %s ledger (new balance: %.2f)",
+        stake_eur, ledger_type.value, ledger.balance,
+    )
+    return ledger.balance
+
+
 def size_all_approved(
     session: Session,
     predictions: list[Prediction] | None = None,

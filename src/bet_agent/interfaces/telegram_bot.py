@@ -127,84 +127,57 @@ def get_user_display_name(user) -> str:
     return str(user.id)
 
 
-# ── Database session helper ──────────────────────────────────────────
-
-
-def _get_session():
-    """Create a new DB session for command handlers."""
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-
-    db_url = os.getenv("DATABASE_URL", "")
-    if not db_url:
-        raise RuntimeError("DATABASE_URL not set")
-
-    engine = create_engine(db_url, echo=False, pool_pre_ping=True)
-    return sessionmaker(bind=engine)()
-
-
 # ── Sync DB wrappers (run in thread to avoid blocking event loop) ────
 
 
 def _sync_fetch_status():
     """Synchronous: fetch portfolio summary and format text."""
+    from bet_agent.db.session import get_session
     from bet_agent.tools.master_analysis import (
         fetch_portfolio_summary,
         format_portfolio_text,
     )
-    sess = _get_session()
-    try:
+    with get_session() as sess:
         summary = fetch_portfolio_summary(sess)
         return format_portfolio_text(summary)
-    finally:
-        sess.close()
 
 
 def _sync_fetch_pending():
     """Synchronous: fetch pending bets and format text."""
+    from bet_agent.db.session import get_session
     from bet_agent.tools.master_analysis import (
         fetch_pending_for_human,
         format_pending_text,
     )
-    sess = _get_session()
-    try:
+    with get_session() as sess:
         pending = fetch_pending_for_human(sess)
         return format_pending_text(pending)
-    finally:
-        sess.close()
 
 
 def _sync_fetch_pnl():
     """Synchronous: fetch PnL and format text."""
+    from bet_agent.db.session import get_session
     from bet_agent.tools.master_analysis import format_pnl_text
-    sess = _get_session()
-    try:
+    with get_session() as sess:
         return format_pnl_text(sess)
-    finally:
-        sess.close()
 
 
 def _sync_fetch_health():
     """Synchronous: fetch model health reports."""
+    from bet_agent.db.session import get_session
     from bet_agent.tools.master_analysis import fetch_model_health
-    sess = _get_session()
-    try:
+    with get_session() as sess:
         return fetch_model_health(sess)
-    finally:
-        sess.close()
 
 
 def _sync_place_bet(bet_id: str, user_name: str):
     """Synchronous: mark bet as placed and commit."""
+    from bet_agent.db.session import get_session
     from bet_agent.tools.master_analysis import mark_bet_placed_by_user
-    sess = _get_session()
-    try:
+    with get_session() as sess:
         result = mark_bet_placed_by_user(sess, bet_id, user_name)
-        if result.get("success"):
-            sess.commit()
+        # get_session() auto-commits on success
         return result
-    finally:
-        sess.close()
 
 
 # ── Master Agent bridge (NL routing) ────────────────────────────────

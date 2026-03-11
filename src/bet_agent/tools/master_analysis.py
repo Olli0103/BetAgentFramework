@@ -470,6 +470,20 @@ def fetch_pnl_timeseries(
         date.today() - timedelta(days=days), time.min, tzinfo=timezone.utc
     )
 
+    # Compute pre-lookback baseline: sum of all PnL resolved before the window
+    baseline_query = (
+        select(func.coalesce(func.sum(PlacedBet.pnl_eur), 0))
+        .where(
+            PlacedBet.resolved_at < cutoff,
+            PlacedBet.status.in_([BetStatus.WON, BetStatus.LOST]),
+        )
+    )
+    if ledger_type:
+        baseline_query = baseline_query.where(PlacedBet.ledger_type == ledger_type)
+
+    baseline = Decimal(str(session.execute(baseline_query).scalar()))
+
+    # Fetch bets within the lookback window
     query = (
         select(PlacedBet)
         .where(
@@ -494,7 +508,7 @@ def fetch_pnl_timeseries(
         if b.resolved_at:
             daily[b.resolved_at.date()].append(b)
 
-    cumulative = Decimal("0.00")
+    cumulative = baseline  # Start from pre-lookback history
     timeseries = []
     for d in sorted(daily.keys()):
         day_pnl = sum(b.pnl_eur or Decimal("0") for b in daily[d])

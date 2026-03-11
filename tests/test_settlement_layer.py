@@ -357,7 +357,14 @@ class TestDetermineOutcome:
 
 
 class TestPnLCalculation:
-    """Tests for PnL arithmetic."""
+    """Tests for PnL arithmetic.
+
+    Accounting model: stake is deducted at placement.  ``calculate_pnl``
+    returns the bankroll delta at settlement:
+      WON  → +stake * odds  (full payout returned)
+      LOST → 0              (stake already gone)
+      VOID → +stake         (refund)
+    """
 
     def test_won_pnl(self, db_session):
         from bet_agent.tools.settlement_engine import calculate_pnl
@@ -366,7 +373,7 @@ class TestPnLCalculation:
         bet = _add_bet(db_session, match, odds=Decimal("2.50"), stake=Decimal("10.00"))
 
         pnl = calculate_pnl(bet, BetStatus.WON)
-        assert pnl == Decimal("15.00")  # 10 * (2.50 - 1)
+        assert pnl == Decimal("25.00")  # 10 * 2.50 (full payout)
 
     def test_lost_pnl(self, db_session):
         from bet_agent.tools.settlement_engine import calculate_pnl
@@ -375,16 +382,16 @@ class TestPnLCalculation:
         bet = _add_bet(db_session, match, stake=Decimal("25.00"))
 
         pnl = calculate_pnl(bet, BetStatus.LOST)
-        assert pnl == Decimal("-25.00")
+        assert pnl == Decimal("0.00")  # Stake already deducted at placement
 
     def test_void_pnl(self, db_session):
         from bet_agent.tools.settlement_engine import calculate_pnl
 
         match = _add_match(db_session)
-        bet = _add_bet(db_session, match)
+        bet = _add_bet(db_session, match, stake=Decimal("10.00"))
 
         pnl = calculate_pnl(bet, BetStatus.VOID)
-        assert pnl == Decimal("0.00")
+        assert pnl == Decimal("10.00")  # Stake refunded
 
 
 class TestSettlementEngine:
@@ -462,20 +469,30 @@ class TestSettlementEngine:
         assert summary.total_settled == 0
 
     def test_bankroll_updated_correctly(self, db_session):
-        """Bankroll should reflect PnL after settlement."""
+        """Bankroll should reflect payout after settlement.
+
+        With deduct-at-placement model: stake was already deducted,
+        so WON bet returns full payout (stake * odds) to bankroll.
+        """
         from bet_agent.tools.settlement_engine import settle_bet
 
         match = _add_match(db_session, home_score=2, away_score=0, state=MatchState.FINISHED)
         bet = _add_bet(db_session, match, selection="home", odds=Decimal("2.50"), stake=Decimal("10.00"))
+        # Balance already reflects the 10 EUR deduction at placement
         ledger = _add_bankroll(db_session, LedgerType.REAL, Decimal("990.00"))
 
         settle_bet(db_session, bet, match)
         db_session.flush()
 
-        assert ledger.balance == Decimal("1005.00")  # 990 + 15 (10 * 1.5)
+        assert ledger.balance == Decimal("1015.00")  # 990 + 25 (10 * 2.50 payout)
 
     def test_paper_and_real_ledgers_separate(self, db_session):
-        """REAL and PAPER bets go to their respective ledgers."""
+        """REAL and PAPER bets go to their respective ledgers.
+
+        Deduct-at-placement accounting:
+        - REAL bet WON: net PnL = 10*(2-1)=10, bankroll gets +20 (payout)
+        - PAPER bet LOST: net PnL = -5, bankroll gets +0 (already deducted)
+        """
         from bet_agent.tools.settlement_engine import settle_finished_matches
 
         match = _add_match(db_session, home_score=2, away_score=0, state=MatchState.FINISHED)
@@ -484,15 +501,16 @@ class TestSettlementEngine:
         _add_bet(db_session, match, selection="away", ledger=LedgerType.PAPER,
                  odds=Decimal("3.00"), stake=Decimal("5.00"))
 
+        # Balances already reflect stake deductions at placement
         real_ledger = _add_bankroll(db_session, LedgerType.REAL, Decimal("990.00"))
         paper_ledger = _add_bankroll(db_session, LedgerType.PAPER, Decimal("995.00"))
 
         summary = settle_finished_matches(db_session)
 
-        assert summary.total_pnl_real == Decimal("10.00")  # won: 10 * (2-1)
-        assert summary.total_pnl_paper == Decimal("-5.00")  # lost: -5
-        assert real_ledger.balance == Decimal("1000.00")
-        assert paper_ledger.balance == Decimal("990.00")
+        assert summary.total_pnl_real == Decimal("10.00")  # net: 10 * (2-1)
+        assert summary.total_pnl_paper == Decimal("-5.00")  # net: -5
+        assert real_ledger.balance == Decimal("1010.00")  # 990 + 20 (payout: 10*2.00)
+        assert paper_ledger.balance == Decimal("995.00")  # 995 + 0 (lost: nothing returned)
 
 
 # ── Auditor Metrics Tests ────────────────────────────────────────────
