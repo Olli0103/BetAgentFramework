@@ -420,7 +420,7 @@ class TestMarkBetPlaced:
         assert result["odds"] == 2.05  # Actual odds stored
         assert result["stake_eur"] == 12.00  # Actual stake stored
         assert result["original_odds"] == 2.10  # Original for comparison
-        assert bet.status == BetStatus.PUSHED_TO_HUMAN
+        assert bet.status == BetStatus.PLACED
         assert float(bet.odds_at_placement) == 2.05
         assert float(bet.stake_eur) == 12.00
 
@@ -506,7 +506,8 @@ class TestExpiryStaleBets:
 
         match = _add_match(db_session)
         bet = _add_bet(db_session, match, status=BetStatus.PENDING, stake=Decimal("25.00"))
-        ledger = _add_bankroll(db_session, LedgerType.REAL, Decimal("975.00"))
+        # PENDING bets never had stake deducted (deduct-at-placement model)
+        ledger = _add_bankroll(db_session, LedgerType.REAL, Decimal("1000.00"))
 
         # Fake the placed_at to 2 hours ago
         bet.placed_at = datetime.now(timezone.utc) - timedelta(hours=2)
@@ -518,8 +519,8 @@ class TestExpiryStaleBets:
         assert expired[0]["bet_id"] == str(bet.id)
         assert bet.status == BetStatus.VOID
         assert bet.pnl_eur == Decimal("0.00")
-        # Stake refunded
-        assert ledger.balance == Decimal("1000.00")  # 975 + 25 refund
+        # No refund — stake was never deducted for PENDING bets
+        assert ledger.balance == Decimal("1000.00")
 
     def test_does_not_expire_fresh_bets(self, db_session):
         from bet_agent.tools.settlement_engine import expire_stale_bets
@@ -872,10 +873,12 @@ class TestInlineKeyboardConstants:
         from bet_agent.interfaces.telegram_bot import (
             CONV_AWAITING_ODDS,
             CONV_AWAITING_STAKE,
+            CONV_TIMEOUT_SECONDS,
         )
 
-        assert CONV_AWAITING_ODDS == "awaiting_odds"
-        assert CONV_AWAITING_STAKE == "awaiting_stake"
+        assert CONV_AWAITING_ODDS == 0
+        assert CONV_AWAITING_STAKE == 1
+        assert CONV_TIMEOUT_SECONDS == 300  # 5 minutes
 
     def test_callback_data_format_with_bet_id(self):
         """Callback data should safely encode bet_id after the prefix."""
@@ -894,16 +897,19 @@ class TestAlertDigest:
     def test_queue_and_clear(self):
         import bet_agent.interfaces.telegram_bot as bot_mod
 
-        original = list(bot_mod._alert_buffer)
-        bot_mod._alert_buffer.clear()
+        # Drain any existing items
+        while not bot_mod._alert_queue.empty():
+            bot_mod._alert_queue.get_nowait()
         try:
             bot_mod.queue_alert("Test alert 1")
             bot_mod.queue_alert("Test alert 2")
-            assert len(bot_mod._alert_buffer) == 2
-            assert bot_mod._alert_buffer[0] == "Test alert 1"
+            assert bot_mod._alert_queue.qsize() == 2
+            assert bot_mod._alert_queue.get_nowait() == "Test alert 1"
+            assert bot_mod._alert_queue.get_nowait() == "Test alert 2"
         finally:
-            bot_mod._alert_buffer.clear()
-            bot_mod._alert_buffer.extend(original)
+            # Clean up
+            while not bot_mod._alert_queue.empty():
+                bot_mod._alert_queue.get_nowait()
 
     def test_digest_interval_configured(self):
         from bet_agent.interfaces.telegram_bot import _DIGEST_INTERVAL_SECONDS

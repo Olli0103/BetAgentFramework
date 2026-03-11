@@ -371,27 +371,53 @@ def _bulk_load_odds(
 
     Returns a dict keyed by match_id → odds_map (same format as _get_match_odds).
     This eliminates the N+1 query pattern when generating daily predictions.
+
+    On PostgreSQL: uses DISTINCT ON to fetch only the latest odds per
+    (match, market_type, selection) — loads O(matches) rows, not O(scrapes).
+    On SQLite (tests): falls back to full load + Python-side dedup.
     """
     from collections import defaultdict
 
     if not match_ids:
         return {}
 
-    all_odds = session.execute(
-        select(OddsMarket)
-        .where(
-            OddsMarket.match_id.in_(match_ids),
-            OddsMarket.is_live == False,
-        )
-        .order_by(OddsMarket.scraped_at.desc())
-    ).scalars().all()
+    # Detect dialect for DISTINCT ON support (PostgreSQL only)
+    bind = session.get_bind()
+    is_postgres = bind.dialect.name == "postgresql" if bind else False
+
+    if is_postgres:
+        # PostgreSQL: DISTINCT ON returns exactly 1 row per (match, market, selection)
+        all_odds = session.execute(
+            select(OddsMarket)
+            .distinct(OddsMarket.match_id, OddsMarket.market_type, OddsMarket.selection)
+            .where(
+                OddsMarket.match_id.in_(match_ids),
+                OddsMarket.is_live == False,
+            )
+            .order_by(
+                OddsMarket.match_id,
+                OddsMarket.market_type,
+                OddsMarket.selection,
+                OddsMarket.scraped_at.desc(),
+            )
+        ).scalars().all()
+    else:
+        # SQLite: load all, dedup in Python (fine for small test datasets)
+        all_odds = session.execute(
+            select(OddsMarket)
+            .where(
+                OddsMarket.match_id.in_(match_ids),
+                OddsMarket.is_live == False,
+            )
+            .order_by(OddsMarket.scraped_at.desc())
+        ).scalars().all()
 
     # Group by match_id
     by_match: dict[object, list[OddsMarket]] = defaultdict(list)
     for row in all_odds:
         by_match[row.match_id].append(row)
 
-    # Build odds_map per match (same logic as _get_match_odds)
+    # Build odds_map per match (dedup logic: first seen = latest due to ORDER BY)
     result: dict[object, dict[str, float]] = {}
     for mid, rows in by_match.items():
         odds_map: dict[str, float] = {}

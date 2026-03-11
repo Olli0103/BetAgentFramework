@@ -61,6 +61,7 @@ class LedgerType(str, enum.Enum):
 
 class BetStatus(str, enum.Enum):
     PENDING = "pending"
+    PLACED = "placed"  # Human confirmed at sportsbook, stake deducted
     WON = "won"
     LOST = "lost"
     VOID = "void"

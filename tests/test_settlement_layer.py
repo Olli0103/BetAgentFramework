@@ -440,14 +440,16 @@ class TestSettlementEngine:
         assert result.pnl_eur == Decimal("0.00")
 
     def test_settle_finished_matches_batch(self, db_session):
-        """settle_finished_matches processes all pending bets on finished matches."""
+        """settle_finished_matches processes all PLACED bets on finished matches."""
         from bet_agent.tools.settlement_engine import settle_finished_matches
 
         m1 = _add_match(db_session, home="A", away="B", home_score=2, away_score=0, state=MatchState.FINISHED)
         m2 = _add_match(db_session, home="C", away="D", home_score=1, away_score=3, state=MatchState.FINISHED)
 
-        _add_bet(db_session, m1, selection="home", stake=Decimal("10.00"), odds=Decimal("2.00"))
-        _add_bet(db_session, m2, selection="home", stake=Decimal("10.00"), odds=Decimal("2.00"))
+        _add_bet(db_session, m1, selection="home", stake=Decimal("10.00"), odds=Decimal("2.00"),
+                 status=BetStatus.PLACED)
+        _add_bet(db_session, m2, selection="home", stake=Decimal("10.00"), odds=Decimal("2.00"),
+                 status=BetStatus.PLACED)
 
         _add_bankroll(db_session, LedgerType.REAL, Decimal("1000.00"))
 
@@ -467,6 +469,28 @@ class TestSettlementEngine:
 
         summary = settle_finished_matches(db_session)
         assert summary.total_settled == 0
+
+    def test_pending_bets_never_settled(self, db_session):
+        """PENDING bets (never placed at sportsbook) must NOT be settled.
+
+        This prevents phantom wins/losses from bets the human never placed.
+        Instead, they are auto-voided by void_unplaced_finished().
+        """
+        from bet_agent.tools.settlement_engine import settle_finished_matches
+
+        match = _add_match(db_session, home_score=3, away_score=0, state=MatchState.FINISHED)
+        bet = _add_bet(db_session, match, selection="home", status=BetStatus.PENDING,
+                       stake=Decimal("50.00"), odds=Decimal("2.00"))
+        ledger = _add_bankroll(db_session, LedgerType.REAL, Decimal("1000.00"))
+
+        summary = settle_finished_matches(db_session)
+
+        # PENDING bet was NOT settled — it was auto-voided
+        assert summary.total_settled == 0
+        assert bet.status == BetStatus.VOID
+        assert bet.pnl_eur == Decimal("0.00")
+        # Bankroll unchanged — no stake was ever deducted for PENDING
+        assert ledger.balance == Decimal("1000.00")
 
     def test_bankroll_updated_correctly(self, db_session):
         """Bankroll should reflect payout after settlement.
@@ -497,9 +521,9 @@ class TestSettlementEngine:
 
         match = _add_match(db_session, home_score=2, away_score=0, state=MatchState.FINISHED)
         _add_bet(db_session, match, selection="home", ledger=LedgerType.REAL,
-                 odds=Decimal("2.00"), stake=Decimal("10.00"))
+                 odds=Decimal("2.00"), stake=Decimal("10.00"), status=BetStatus.PLACED)
         _add_bet(db_session, match, selection="away", ledger=LedgerType.PAPER,
-                 odds=Decimal("3.00"), stake=Decimal("5.00"))
+                 odds=Decimal("3.00"), stake=Decimal("5.00"), status=BetStatus.PLACED)
 
         # Balances already reflect stake deductions at placement
         real_ledger = _add_bankroll(db_session, LedgerType.REAL, Decimal("990.00"))
@@ -791,11 +815,11 @@ class TestFullPipeline:
         )
         from bet_agent.tools.settlement_engine import settle_finished_matches
 
-        # Setup: match from yesterday with pending bet
+        # Setup: match with a PLACED bet (human confirmed at sportsbook)
         match = _add_match(db_session)
         bet = _add_bet(db_session, match, selection="home",
                        odds=Decimal("2.00"), stake=Decimal("10.00"),
-                       model_prob=Decimal("0.60"))
+                       model_prob=Decimal("0.60"), status=BetStatus.PLACED)
         _add_prediction(db_session, match, selection="home")
         _add_bankroll(db_session, LedgerType.REAL, Decimal("990.00"))
 

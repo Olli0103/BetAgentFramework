@@ -103,12 +103,12 @@ def get_unsettled_matches(
     cutoff = datetime.combine(before_date, time.min, tzinfo=timezone.utc)
 
     # Matches that are past their scheduled time and not yet FINISHED
-    # AND have at least one PENDING placed bet
-    has_pending_bets = (
+    # AND have at least one unsettled bet (PENDING or PLACED)
+    has_unsettled_bets = (
         exists()
         .where(
             PlacedBet.match_id == Match.id,
-            PlacedBet.status == BetStatus.PENDING,
+            PlacedBet.status.in_([BetStatus.PENDING, BetStatus.PLACED]),
         )
     )
 
@@ -117,7 +117,7 @@ def get_unsettled_matches(
         .where(
             Match.match_state != MatchState.FINISHED,
             Match.scheduled_at < cutoff,
-            has_pending_bets,
+            has_unsettled_bets,
         )
         .order_by(Match.scheduled_at)
     )

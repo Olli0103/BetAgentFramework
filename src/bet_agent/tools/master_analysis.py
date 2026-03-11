@@ -580,8 +580,8 @@ def mark_bet_placed_by_user(
     from bet_agent.tools.sizing_engine import deduct_stake_on_placement
     deduct_stake_on_placement(session, bet.stake_eur, bet.ledger_type)
 
-    # Mark as placed
-    bet.status = BetStatus.PUSHED_TO_HUMAN
+    # Mark as placed (human confirmed at sportsbook)
+    bet.status = BetStatus.PLACED
     session.flush()
 
     match = bet.match if bet.match else session.get(Match, bet.match_id)
