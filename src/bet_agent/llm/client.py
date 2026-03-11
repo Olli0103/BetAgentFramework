@@ -1,0 +1,272 @@
+"""Tier-aware LLM client with OpenClaw → Gemini fallback.
+
+Reads ``config/llm_tiers.yaml`` and corresponding env vars, then exposes a
+simple ``chat()`` function that tries the primary provider first and
+transparently falls back to the secondary when the primary is unavailable
+(missing credentials, timeout, HTTP error).
+
+Design decisions:
+  * Uses raw ``requests`` — no vendor SDK required.  Both OpenClaw and
+    Gemini expose OpenAI-compatible ``/chat/completions`` endpoints (Gemini
+    via its OpenAI-compatible gateway ``generativelanguage.googleapis.com``).
+  * One ``LLMClient`` instance per tier; the module-level ``chat()``
+    convenience function targets **tier1_heavy_reasoning** by default.
+  * Stateless — each call is an independent HTTP request.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import requests
+import yaml
+
+logger = logging.getLogger(__name__)
+
+# ── Configuration data classes ────────────────────────────────────────
+
+_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "llm_tiers.yaml"
+
+
+@dataclass(frozen=True)
+class ProviderConfig:
+    """Connection details for a single LLM provider."""
+
+    name: str
+    base_url: str
+    model: str
+    api_key: str
+    max_tokens: int = 8192
+    temperature: float = 0.2
+    timeout: int = 60
+
+
+@dataclass
+class TierConfig:
+    """Primary + optional fallback for one tier."""
+
+    tier_name: str
+    primary: ProviderConfig | None = None
+    fallback: ProviderConfig | None = None
+
+
+# ── Provider URL builders ─────────────────────────────────────────────
+
+_PROVIDER_URLS: dict[str, str] = {
+    "openclaw": "https://api.openclaw.ai/v1",
+    "google": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "ollama": "",  # filled from env
+}
+
+
+def _resolve_provider(cfg: dict[str, Any]) -> ProviderConfig | None:
+    """Build a ``ProviderConfig`` from a raw YAML dict, or *None* if
+    credentials are missing."""
+    provider = cfg.get("provider", "")
+
+    # Resolve API key / OAuth token from env
+    api_key = ""
+    if "auth_env" in cfg:
+        api_key = os.environ.get(cfg["auth_env"], "")
+    elif "api_key_env" in cfg:
+        api_key = os.environ.get(cfg["api_key_env"], "")
+
+    if not api_key:
+        logger.debug("No credentials for provider %s — skipping", provider)
+        return None
+
+    # Base URL
+    if provider == "ollama":
+        base_url = os.environ.get(cfg.get("base_url_env", ""), "http://localhost:11434") + "/v1"
+    else:
+        base_url = _PROVIDER_URLS.get(provider, cfg.get("base_url", ""))
+
+    if not base_url:
+        return None
+
+    return ProviderConfig(
+        name=provider,
+        base_url=base_url,
+        model=cfg.get("model", ""),
+        api_key=api_key,
+        max_tokens=cfg.get("max_tokens", 8192),
+        temperature=cfg.get("temperature", 0.2),
+        timeout=cfg.get("timeout_seconds", 60),
+    )
+
+
+# ── Config loader ─────────────────────────────────────────────────────
+
+
+def load_tier_configs(
+    config_path: Path | str = _CONFIG_PATH,
+) -> dict[str, TierConfig]:
+    """Parse ``llm_tiers.yaml`` and return a mapping of tier name → config."""
+    path = Path(config_path)
+    if not path.exists():
+        logger.warning("LLM tier config not found at %s", path)
+        return {}
+
+    raw = yaml.safe_load(path.read_text())
+    tiers: dict[str, TierConfig] = {}
+    for tier_name, tier_data in (raw.get("tiers") or {}).items():
+        primary = _resolve_provider(tier_data.get("primary") or {})
+        fallback_raw = tier_data.get("fallback")
+        fallback = _resolve_provider(fallback_raw) if fallback_raw else None
+        tiers[tier_name] = TierConfig(
+            tier_name=tier_name,
+            primary=primary,
+            fallback=fallback,
+        )
+    return tiers
+
+
+# ── Core LLM client ──────────────────────────────────────────────────
+
+
+@dataclass
+class LLMClient:
+    """Tier-aware LLM client with automatic fallback.
+
+    Usage::
+
+        client = LLMClient.for_tier("tier1_heavy_reasoning")
+        reply = client.chat("Summarise today's portfolio risk.")
+    """
+
+    tier: TierConfig
+    _providers: list[ProviderConfig] = field(default_factory=list, init=False)
+
+    def __post_init__(self) -> None:
+        if self.tier.primary:
+            self._providers.append(self.tier.primary)
+        if self.tier.fallback:
+            self._providers.append(self.tier.fallback)
+
+    # ── Factory ───────────────────────────────────────────────────────
+
+    @classmethod
+    def for_tier(
+        cls,
+        tier_name: str = "tier1_heavy_reasoning",
+        config_path: Path | str = _CONFIG_PATH,
+    ) -> LLMClient:
+        tiers = load_tier_configs(config_path)
+        tier = tiers.get(tier_name)
+        if tier is None:
+            raise ValueError(
+                f"Tier '{tier_name}' not found in {config_path}. "
+                f"Available: {list(tiers)}"
+            )
+        return cls(tier=tier)
+
+    # ── Chat ──────────────────────────────────────────────────────────
+
+    def chat(
+        self,
+        user_message: str,
+        *,
+        system_prompt: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        """Send a chat completion request, falling back on failure.
+
+        Returns the assistant's reply text, or raises if all providers fail.
+        """
+        if not self._providers:
+            raise RuntimeError(
+                f"No LLM providers available for tier '{self.tier.tier_name}'. "
+                f"Set OPENCLAW_OAUTH_TOKEN or GEMINI_API_KEY in your environment."
+            )
+
+        last_err: Exception | None = None
+        for prov in self._providers:
+            try:
+                return self._call(prov, user_message, system_prompt, temperature, max_tokens)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Provider %s (%s) failed: %s — trying next",
+                    prov.name,
+                    prov.model,
+                    exc,
+                )
+                last_err = exc
+
+        raise RuntimeError(
+            f"All LLM providers exhausted for tier '{self.tier.tier_name}'"
+        ) from last_err
+
+    # ── Internal HTTP call ────────────────────────────────────────────
+
+    @staticmethod
+    def _call(
+        prov: ProviderConfig,
+        user_message: str,
+        system_prompt: str | None,
+        temperature: float | None,
+        max_tokens: int | None,
+    ) -> str:
+        messages: list[dict[str, str]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_message})
+
+        payload: dict[str, Any] = {
+            "model": prov.model,
+            "messages": messages,
+            "max_tokens": max_tokens or prov.max_tokens,
+            "temperature": temperature if temperature is not None else prov.temperature,
+        }
+
+        url = f"{prov.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {prov.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        logger.debug("LLM request → %s (%s)", prov.name, prov.model)
+        resp = requests.post(url, json=payload, headers=headers, timeout=prov.timeout)
+        resp.raise_for_status()
+
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+
+    # ── Convenience ───────────────────────────────────────────────────
+
+    @property
+    def active_provider(self) -> str | None:
+        """Name of the first available provider (for logging)."""
+        return self._providers[0].name if self._providers else None
+
+
+# ── Module-level convenience ──────────────────────────────────────────
+
+_default_client: LLMClient | None = None
+
+
+def _get_default_client() -> LLMClient:
+    global _default_client
+    if _default_client is None:
+        _default_client = LLMClient.for_tier("tier1_heavy_reasoning")
+    return _default_client
+
+
+def chat(
+    message: str,
+    *,
+    system_prompt: str | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> str:
+    """Quick tier-1 chat — ``from bet_agent.llm import chat``."""
+    return _get_default_client().chat(
+        message,
+        system_prompt=system_prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )

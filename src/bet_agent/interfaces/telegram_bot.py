@@ -261,23 +261,41 @@ def _sync_check_ev(bet_id: str, custom_odds: float) -> dict:
 class MasterAgentBridge:
     """Bridge for routing natural language queries to the Master Agent.
 
-    In production, this calls the actual LLM endpoint. The bridge is
+    Uses the Tier-1 LLM (OpenClaw primary, Gemini fallback) to answer
+    syndicate members' questions in concierge mode.  The bridge is
     injectable for testing purposes.
     """
 
-    def query(self, message: str, user_name: str) -> str:
-        """Send a natural language query to the Master Agent.
+    def __init__(self) -> None:
+        self._llm: "LLMClient | None" = None
 
-        Override this method to integrate with your LLM orchestration layer.
-        Default implementation returns a structured acknowledgment.
-        """
+    def _get_llm(self) -> "LLMClient":
+        if self._llm is None:
+            from bet_agent.llm.client import LLMClient
+
+            self._llm = LLMClient.for_tier("tier1_heavy_reasoning")
+        return self._llm
+
+    def query(self, message: str, user_name: str) -> str:
+        """Send a natural language query to the Master Agent via Tier-1 LLM."""
         logger.info("NL query from %s: %s", user_name, message)
-        return (
-            f"[Master Agent] Received your query: \"{message}\"\n\n"
-            f"This will be routed to the Tier 1 LLM for analysis. "
-            f"In production, connect MasterAgentBridge.query() to your "
-            f"LLM orchestration endpoint."
-        )
+        try:
+            client = self._get_llm()
+            return client.chat(
+                message,
+                system_prompt=(
+                    "You are the Master Agent concierge of a sports-betting "
+                    "quant syndicate. Answer concisely and professionally. "
+                    "Cite numbers when available. Never reveal internal model "
+                    "weights or proprietary algorithms."
+                ),
+            )
+        except Exception:
+            logger.exception("Tier-1 LLM unavailable for concierge query")
+            return (
+                "[Master Agent] I'm temporarily unable to process your query — "
+                "the LLM backend is unreachable. Please try again shortly."
+            )
 
 
 # Default bridge (override in production)

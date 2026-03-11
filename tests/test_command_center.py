@@ -834,12 +834,31 @@ class TestMasterAgentBridge:
     """Tests for the NL bridge to Master Agent."""
 
     def test_default_bridge_returns_acknowledgment(self):
+        from unittest.mock import patch
+
         from bet_agent.interfaces.telegram_bot import MasterAgentBridge
 
         bridge = MasterAgentBridge()
+        # Without LLM credentials the bridge returns a graceful fallback
         response = bridge.query("How is our NHL model?", "@olli")
-        assert "NHL model" in response
         assert "Master Agent" in response
+
+    def test_bridge_routes_through_llm(self):
+        from unittest.mock import MagicMock, patch
+
+        from bet_agent.interfaces.telegram_bot import MasterAgentBridge
+        from bet_agent.llm.client import LLMClient, ProviderConfig, TierConfig
+
+        bridge = MasterAgentBridge()
+        fake_client = MagicMock(spec=LLMClient)
+        fake_client.chat.return_value = "NHL xgboost Brier 0.19, ROI +2.1%"
+
+        with patch.object(bridge, "_get_llm", return_value=fake_client):
+            response = bridge.query("How is our NHL model?", "@olli")
+
+        assert "NHL" in response
+        assert "Brier" in response
+        fake_client.chat.assert_called_once()
 
     def test_custom_bridge_injectable(self):
         from bet_agent.interfaces.telegram_bot import MasterAgentBridge, set_master_bridge
