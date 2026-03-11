@@ -1,23 +1,29 @@
 """Database engine and session factory.
 
 Uses PostgreSQL via DATABASE_URL environment variable.
-Falls back to SQLite for testing if DATABASE_URL is not set.
+Fails hard if DATABASE_URL is not set (no silent SQLite fallback in production).
 """
 
 import os
 from contextlib import contextmanager
 
-from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from bet_agent.db.models import Base
 
-load_dotenv()
+_DATABASE_URL = os.getenv("DATABASE_URL")
 
-_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///betagent.db")
+if _DATABASE_URL is None:
+    if os.getenv("BETAGENT_ENV", "").lower() == "test":
+        _DATABASE_URL = "sqlite:///betagent_test.db"
+    else:
+        raise RuntimeError(
+            "DATABASE_URL environment variable is required. "
+            "Set BETAGENT_ENV=test to use SQLite for testing."
+        )
 
-engine = create_engine(_DATABASE_URL, echo=False)
+engine = create_engine(_DATABASE_URL, echo=False, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
 
 
@@ -27,7 +33,9 @@ def init_db() -> None:
 
 
 def drop_db() -> None:
-    """Drop all tables. Use only in tests."""
+    """Drop all tables. Only works when BETAGENT_ENV=test."""
+    if os.getenv("BETAGENT_ENV", "").lower() != "test":
+        raise RuntimeError("drop_db() is only allowed when BETAGENT_ENV=test")
     Base.metadata.drop_all(bind=engine)
 
 

@@ -105,7 +105,12 @@ class AmericanFootballModel:
         total_expected_diff = current_diff + expected_remaining_diff
 
         if scaled_std < 0.01:
-            return 1.0 if total_expected_diff > 0 else 0.0
+            if total_expected_diff > 0:
+                return 1.0
+            elif total_expected_diff < 0:
+                return 0.0
+            else:
+                return 0.5  # Tied → OT
 
         p_home = float(norm.cdf(total_expected_diff / scaled_std))
         return float(np.clip(p_home, 0.0, 1.0))

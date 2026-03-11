@@ -24,6 +24,8 @@ class FootballModel:
 
         Uses independent Poisson distributions for each team's goal count.
         """
+        home_xg = max(home_xg, 0.0)
+        away_xg = max(away_xg, 0.0)
         home_pmf = poisson.pmf(np.arange(_MAX_GOALS + 1), home_xg)
         away_pmf = poisson.pmf(np.arange(_MAX_GOALS + 1), away_xg)
 
@@ -40,6 +42,8 @@ class FootballModel:
         self, home_xg: float, away_xg: float, line: float = 2.5
     ) -> float:
         """P(total goals > line). Default line is 2.5."""
+        home_xg = max(home_xg, 0.0)
+        away_xg = max(away_xg, 0.0)
         total_xg = home_xg + away_xg
         # P(over) = 1 - P(X <= floor(line))
         p_under_or_equal = poisson.cdf(int(line), total_xg)
@@ -47,6 +51,8 @@ class FootballModel:
 
     def btts_prob(self, home_xg: float, away_xg: float) -> float:
         """P(both teams score at least 1 goal)."""
+        home_xg = max(home_xg, 0.0)
+        away_xg = max(away_xg, 0.0)
         p_home_scores = 1.0 - poisson.pmf(0, home_xg)
         p_away_scores = 1.0 - poisson.pmf(0, away_xg)
         return float(p_home_scores * p_away_scores)
@@ -81,16 +87,19 @@ class FootballModel:
             else:
                 return 0.0  # Draw — home doesn't "win"
 
-        # Derive expected goals rates from live xG or from pre-match prob
+        # Derive expected remaining goals from live xG or from pre-match prob
+        # Cap per-90 rates to avoid numerical explosion early in the match
+        _MAX_RATE = 5.0  # No team realistically averages > 5 xG per 90
+
         if live_stats and "home_xg" in live_stats and "away_xg" in live_stats:
-            # Use actual live xG — scale to remaining time
             elapsed_fraction = live_time / self.TOTAL_MINUTES
-            if elapsed_fraction > 0:
-                rate_home = live_stats["home_xg"] / elapsed_fraction
-                rate_away = live_stats["away_xg"] / elapsed_fraction
+            if elapsed_fraction > 0.05:  # Need at least ~5 min for reliable rate
+                rate_home = min(max(live_stats["home_xg"], 0.0) / elapsed_fraction, _MAX_RATE)
+                rate_away = min(max(live_stats["away_xg"], 0.0) / elapsed_fraction, _MAX_RATE)
             else:
-                rate_home = live_stats.get("home_xg", 1.3)
-                rate_away = live_stats.get("away_xg", 1.1)
+                # Too early — use raw live xG as full-match estimate
+                rate_home = max(live_stats.get("home_xg", 1.3), 0.0)
+                rate_away = max(live_stats.get("away_xg", 1.1), 0.0)
         else:
             # Estimate from pre-match probability (rough inverse)
             rate_home = max(0.1, -np.log(1.0 - min(pre_match_prob, 0.99)) * 1.5)

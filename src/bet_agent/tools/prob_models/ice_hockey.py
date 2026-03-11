@@ -27,6 +27,8 @@ class IceHockeyModel:
         Note: Most hockey markets are "including OT" — use
         match_outcome_probs_with_ot() for moneyline markets.
         """
+        home_xg = max(home_xg, 0.0)
+        away_xg = max(away_xg, 0.0)
         home_pmf = poisson.pmf(np.arange(_MAX_GOALS + 1), home_xg)
         away_pmf = poisson.pmf(np.arange(_MAX_GOALS + 1), away_xg)
         score_matrix = np.outer(home_pmf, away_pmf)
@@ -77,15 +79,16 @@ class IceHockeyModel:
             else:
                 return self.OT_PROB_HOME  # Regulation tie → OT
 
-        # Estimate per-60 rates
+        # Estimate per-60 rates (cap to avoid numerical explosion)
+        _MAX_RATE = 8.0  # Hockey rarely exceeds ~8 xG per 60
         if live_stats and "home_xg" in live_stats and "away_xg" in live_stats:
             elapsed_frac = live_time / self.TOTAL_MINUTES
-            if elapsed_frac > 0:
-                rate_home = live_stats["home_xg"] / elapsed_frac
-                rate_away = live_stats["away_xg"] / elapsed_frac
+            if elapsed_frac > 0.05:  # Need at least ~3 min for reliable rate
+                rate_home = min(max(live_stats["home_xg"], 0.0) / elapsed_frac, _MAX_RATE)
+                rate_away = min(max(live_stats["away_xg"], 0.0) / elapsed_frac, _MAX_RATE)
             else:
-                rate_home = 2.8
-                rate_away = 2.6
+                rate_home = max(live_stats.get("home_xg", 2.8), 0.0)
+                rate_away = max(live_stats.get("away_xg", 2.6), 0.0)
         else:
             rate_home = max(0.1, -np.log(1.0 - min(pre_match_prob, 0.99)) * 2.5)
             rate_away = max(0.1, rate_home * 0.85)

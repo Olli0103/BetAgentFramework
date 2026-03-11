@@ -48,8 +48,10 @@ agents:
     reports_to: null  # Top of hierarchy
     receives_from:
       - scout
+      - data_janitor
       - quant
       - devils_advocate
+      - line_shopper
       - risk_manager
       - moonshot
       - auditor
@@ -128,6 +130,7 @@ agents:
       - calculate_match_outcome_probs
       - calculate_over_under_prob
       - calculate_btts_prob
+      - calculate_spread_prob
       - calculate_live_ev
       - calculate_pre_match_ev
       - get_sport_model

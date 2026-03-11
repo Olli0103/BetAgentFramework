@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import create_engine
@@ -14,6 +15,7 @@ from bet_agent.db.models import (
     LedgerType,
     MarketType,
     Match,
+    MatchState,
     ModelMetrics,
     OddsMarket,
     PlacedBet,
@@ -73,11 +75,16 @@ class TestMatch:
         assert result.sport == Sport.FOOTBALL
         assert result.home_team == "Bayern München"
         assert result.is_live is False
-        assert result.match_state == "not_started"
+        assert result.match_state == MatchState.NOT_STARTED
 
     def test_all_sports(self, db_session: Session):
-        for sport in Sport:
-            m = self._make_match(sport=sport, league=f"Test {sport.value}")
+        for i, sport in enumerate(Sport):
+            m = self._make_match(
+                sport=sport,
+                league=f"Test {sport.value}",
+                home_team=f"Home {i}",
+                away_team=f"Away {i}",
+            )
             db_session.add(m)
         db_session.commit()
         assert db_session.query(Match).count() == len(Sport)
@@ -85,7 +92,7 @@ class TestMatch:
     def test_live_state(self, db_session: Session):
         match = self._make_match(
             is_live=True,
-            match_state="in_progress",
+            match_state=MatchState.IN_PROGRESS,
             match_period="first_half",
             home_score=1,
             away_score=0,
@@ -120,14 +127,14 @@ class TestOddsMarket:
             sportsbook="tipico",
             market_type=MarketType.MATCH_WINNER,
             selection="home",
-            odds_decimal=2.10,
+            odds_decimal=Decimal("2.10"),
         )
         db_session.add(odds)
         db_session.commit()
 
         result = db_session.query(OddsMarket).one()
         assert result.match_id == match.id
-        assert result.odds_decimal == 2.10
+        assert result.odds_decimal == Decimal("2.10")
         assert result.is_live is False
 
 
@@ -136,8 +143,8 @@ class TestOddsMarket:
 
 class TestBankrollLedger:
     def test_real_and_paper_ledgers(self, db_session: Session):
-        real = BankrollLedger(ledger_type=LedgerType.REAL, balance=500.00)
-        paper = BankrollLedger(ledger_type=LedgerType.PAPER, balance=10000.00)
+        real = BankrollLedger(ledger_type=LedgerType.REAL, balance=Decimal("500.00"))
+        paper = BankrollLedger(ledger_type=LedgerType.PAPER, balance=Decimal("10000.00"))
         db_session.add_all([real, paper])
         db_session.commit()
 
@@ -147,7 +154,7 @@ class TestBankrollLedger:
             .filter_by(ledger_type=LedgerType.REAL)
             .one()
         )
-        assert real_result.balance == 500.00
+        assert real_result.balance == Decimal("500.00")
 
 
 # ── PlacedBet ──────────────────────────────────────────────────────────
@@ -170,10 +177,10 @@ class TestPlacedBet:
             match_id=match.id,
             market_type=MarketType.OVER_UNDER,
             selection="over_5.5",
-            odds_at_placement=1.85,
-            stake_eur=10.00,
-            model_prob=0.58,
-            ev_at_placement=0.073,
+            odds_at_placement=Decimal("1.85"),
+            stake_eur=Decimal("10.00"),
+            model_prob=Decimal("0.58"),
+            ev_at_placement=Decimal("0.073"),
         )
         db_session.add(bet)
         db_session.commit()
@@ -200,10 +207,10 @@ class TestPlacedBet:
             match_id=match.id,
             market_type=MarketType.MATCH_WINNER,
             selection="home",
-            odds_at_placement=2.50,
-            stake_eur=1.00,  # Moonshot cap
-            model_prob=0.45,
-            ev_at_placement=0.125,
+            odds_at_placement=Decimal("2.50"),
+            stake_eur=Decimal("1.00"),  # Moonshot cap
+            model_prob=Decimal("0.45"),
+            ev_at_placement=Decimal("0.125"),
             is_parlay=True,
             parlay_group_id=parlay_id,
         )
@@ -213,7 +220,7 @@ class TestPlacedBet:
         result = db_session.query(PlacedBet).one()
         assert result.is_parlay is True
         assert result.parlay_group_id == parlay_id
-        assert result.stake_eur == 1.00
+        assert result.stake_eur == Decimal("1.00")
 
 
 # ── ModelMetrics ───────────────────────────────────────────────────────
@@ -224,8 +231,8 @@ class TestModelMetrics:
         metrics = ModelMetrics(
             model_name="xgboost_match_winner_v1",
             date=datetime(2026, 3, 10).date(),
-            brier_score=0.21,
-            roi_pct=3.5,
+            brier_score=Decimal("0.21"),
+            roi_pct=Decimal("3.5"),
             total_bets=50,
             record_win=28,
             record_loss=22,
@@ -235,7 +242,7 @@ class TestModelMetrics:
         db_session.commit()
 
         result = db_session.query(ModelMetrics).one()
-        assert result.brier_score == 0.21
+        assert result.brier_score == Decimal("0.21")
         assert result.record_win == 28
 
 
