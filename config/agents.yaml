@@ -48,6 +48,12 @@ agents:
       - run_daily_predictions
       - get_positive_ev_predictions
       - update_prediction_status
+      - run_veto_checks
+      - shop_all_approved
+      - size_all_approved
+      - push_alert
+      - push_daily_summary
+      - build_ticket
     reports_to: null  # Top of hierarchy
     receives_from:
       - scout
@@ -187,6 +193,8 @@ agents:
       - check_injury_reports
       - veto_pick
       - approve_pick
+      - veto_check
+      - run_veto_checks
     reports_to: master
     schedule: null  # Triggered per pick
 
@@ -204,6 +212,8 @@ agents:
       - compare_odds_across_books
       - get_best_odds
       - query_odds_markets
+      - shop_line
+      - shop_all_approved
     reports_to: master
     legal_sportsbooks:
       - tipico
@@ -229,6 +239,10 @@ agents:
       - check_daily_loss_limit
       - check_weekly_loss_limit
       - assign_ledger_type
+      - size_bet
+      - size_all_approved
+      - check_risk_limits
+      - get_bankroll
     reports_to: master
     risk_limits:
       max_single_bet_pct: 5.0          # % of bankroll
