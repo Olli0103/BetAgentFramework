@@ -1,0 +1,34 @@
+# LLM Tier Configuration for BetAgent MAS
+# ─────────────────────────────────────────
+# Tier 1: Heavy reasoning tasks (orchestration, veto, parlay logic, auditing)
+# Tier 2: Local tool calling & scraping (fast, private, cost-free)
+
+tiers:
+  tier1_heavy_reasoning:
+    description: "Strategic reasoning, orchestration, qualitative analysis"
+    primary:
+      provider: openclaw
+      model: openclaw/codex
+      auth: oauth
+      auth_env: OPENCLAW_OAUTH_TOKEN
+      max_tokens: 8192
+      temperature: 0.2
+      timeout_seconds: 60
+    fallback:
+      provider: google
+      model: gemini-2.0-flash
+      api_key_env: GEMINI_API_KEY
+      max_tokens: 8192
+      temperature: 0.3
+      timeout_seconds: 45
+
+  tier2_local_tools:
+    description: "Tool calling, scraping, data processing — runs on Mac Mini"
+    primary:
+      provider: ollama
+      model: ollama/gemma3:4b
+      base_url_env: OLLAMA_BASE_URL
+      max_tokens: 4096
+      temperature: 0.1
+      timeout_seconds: 30
+    fallback: null  # No fallback — local-only for cost and privacy

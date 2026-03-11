@@ -1,0 +1,247 @@
+# BetAgent Multi-Agent System Configuration
+# ═══════════════════════════════════════════
+# 9 Agents | 2 LLM Tiers | Human-in-the-Loop (GlüStV compliant)
+#
+# Golden Rules enforced:
+#   1. No LLM Math — all math via deterministic Python tools
+#   2. Stateful Memory — PostgreSQL is the single source of truth
+#   3. Multi-Market ML — Match Winner, O/U, BTTS, Spreads
+#   4. Moonshot Rule — parlays hard-capped at 1.00 EUR
+#   5. Paper Trading Sandbox — separate Real/Paper ledgers
+#   6. Intelligent LLM Routing — Tier 1 vs Tier 2
+#   7. Async In-Play Trading — live bets only during natural breaks
+
+system:
+  name: "BetAgent Quant Trading Syndicate"
+  version: "0.1.0"
+  database_url_env: DATABASE_URL
+  human_in_the_loop: true
+  supported_sports:
+    - football
+    - tennis
+    - ice_hockey
+    - basketball
+    - darts
+    - american_football
+  alert_channels:
+    - type: telegram
+      config_env: TELEGRAM_BOT_TOKEN
+    - type: push_notification
+      config_env: PUSH_NOTIFICATION_KEY
+
+agents:
+  # ── 1. MASTER AGENT (Portfolio Manager) ──────────────────────────────
+  - id: master
+    name: "Master Agent"
+    role: "Portfolio Manager & CEO"
+    llm_tier: tier1_heavy_reasoning
+    soul_file: agents/master/SOUL.md
+    description: >
+      Orchestrates all workflows. Routes picks through the pipeline,
+      decides Paper vs Real placement, and pushes final actionable
+      alerts to the human operator.
+    tools:
+      - route_to_agent
+      - query_bankroll_ledger
+      - push_alert_to_human
+      - log_decision
+    reports_to: null  # Top of hierarchy
+    receives_from:
+      - scout
+      - quant
+      - devils_advocate
+      - risk_manager
+      - moonshot
+      - auditor
+    schedule: null  # Always active, event-driven
+
+  # ── 2. SCOUT AGENT (Data Gatherer) ──────────────────────────────────
+  - id: scout
+    name: "Scout Agent"
+    role: "Data Gatherer & Live Monitor"
+    llm_tier: tier2_local_tools
+    soul_file: agents/scout/SOUL.md
+    description: >
+      Web scraper for pre-match odds and live score/odds APIs.
+      Detects match states (halftime, intermission) to trigger
+      the asynchronous live betting workflow.
+    tools:
+      - fetch_pre_match_odds
+      - poll_live_scores
+      - poll_live_odds
+      - detect_match_state
+      - update_match_record
+    reports_to: master
+    schedule:
+      pre_match_scan: "0 */2 * * *"   # Every 2 hours
+      live_polling: see in_play_trigger
+    in_play_trigger:
+      enabled: true
+      poll_interval_seconds: 30
+      trigger_states:
+        - halftime
+        - intermission
+        - set_break
+        - end_of_period
+        - quarter_break
+        - end_of_set
+      action: notify_master_for_live_workflow
+      message_schema:
+        match_id: uuid
+        sport: string
+        current_score: [int, int]
+        match_time: float
+        detected_state: string
+        live_odds_snapshot: object
+      avoid_hft: true
+      min_break_duration_seconds: 120  # Only trigger if break >= 2 min
+
+  # ── 3. DATA JANITOR (ETL & Resolution) ──────────────────────────────
+  - id: data_janitor
+    name: "Data Janitor"
+    role: "ETL & Name Resolution"
+    llm_tier: tier2_local_tools
+    soul_file: agents/data_janitor/SOUL.md
+    description: >
+      Cleans raw scraped data, normalizes live stats, and resolves
+      fuzzy team/player naming conflicts using the team_aliases table.
+    tools:
+      - normalize_team_name
+      - resolve_alias
+      - clean_odds_data
+      - merge_live_stats
+    reports_to: master
+    schedule: null  # Triggered by scout output
+
+  # ── 4. QUANT AGENT (Math Engine) ────────────────────────────────────
+  - id: quant
+    name: "Quant Agent"
+    role: "Probability & ML Engine"
+    llm_tier: tier2_local_tools
+    soul_file: agents/quant/SOUL.md
+    description: >
+      Executes deterministic Python ML tools. Pre-match: runs
+      sport-specific probability models. In-play: runs live_update()
+      combining pre-match expectations with live match stats.
+      NEVER does math itself — always calls Python tools.
+    tools:
+      - calculate_match_outcome_probs
+      - calculate_over_under_prob
+      - calculate_btts_prob
+      - calculate_live_ev
+      - calculate_pre_match_ev
+      - get_sport_model
+    reports_to: master
+    schedule: null  # Triggered by data_janitor output
+
+  # ── 5. DEVIL'S ADVOCATE (Qualitative Veto) ──────────────────────────
+  - id: devils_advocate
+    name: "Devil's Advocate"
+    role: "Qualitative Risk Assessor & Veto Power"
+    llm_tier: tier1_heavy_reasoning
+    soul_file: agents/devils_advocate/SOUL.md
+    description: >
+      Reads news, social media, and press conferences to identify
+      qualitative risks (injuries, fatigue, managerial changes, weather).
+      Has VETO power over any pick — can kill a bet before it reaches
+      the Risk Manager.
+    tools:
+      - search_news
+      - search_social_media
+      - check_injury_reports
+      - veto_pick
+      - approve_pick
+    reports_to: master
+    schedule: null  # Triggered per pick
+
+  # ── 6. LINE SHOPPER (Odds Maximizer) ────────────────────────────────
+  - id: line_shopper
+    name: "Line Shopper"
+    role: "Odds Comparison & Maximizer"
+    llm_tier: tier2_local_tools
+    soul_file: agents/line_shopper/SOUL.md
+    description: >
+      Scans legal German sportsbooks (Tipico, Bet365, etc.) for the
+      highest available odds on a specific approved pick. Reports the
+      best line back to Master.
+    tools:
+      - compare_odds_across_books
+      - get_best_odds
+      - query_odds_markets
+    reports_to: master
+    legal_sportsbooks:
+      - tipico
+      - bet365
+      - bwin
+      - betano
+      - unibet
+    schedule: null  # Triggered per approved pick
+
+  # ── 7. RISK MANAGER (Bankroll Sizing) ───────────────────────────────
+  - id: risk_manager
+    name: "Risk Manager"
+    role: "Bankroll Sizing & Risk Control"
+    llm_tier: tier2_local_tools
+    soul_file: agents/risk_manager/SOUL.md
+    description: >
+      Calls calculate_quarter_kelly() to size bets. Enforces the
+      5% bankroll cap, checks daily/weekly loss limits, and routes
+      unproven models to Paper ledger.
+    tools:
+      - calculate_quarter_kelly
+      - query_bankroll_ledger
+      - check_daily_loss_limit
+      - check_weekly_loss_limit
+      - assign_ledger_type
+    reports_to: master
+    risk_limits:
+      max_single_bet_pct: 5.0          # % of bankroll
+      max_daily_loss_pct: 10.0         # Stop-loss per day
+      max_weekly_loss_pct: 20.0        # Stop-loss per week
+      moonshot_hard_cap_eur: 1.00      # Parlay max stake
+    schedule: null  # Triggered per bet sizing request
+
+  # ── 8. MOONSHOT ARCHITECT (Parlay Builder) ──────────────────────────
+  - id: moonshot
+    name: "Moonshot Architect"
+    role: "Parlay Builder & Correlation Analyst"
+    llm_tier: tier1_heavy_reasoning
+    soul_file: agents/moonshot/SOUL.md
+    description: >
+      Builds smart +EV parlays (Kombiwetten) from surviving single
+      picks. Analyzes correlation between legs, avoids naive
+      independence assumptions. Hard-capped at 1.00 EUR per ticket.
+    tools:
+      - build_parlay
+      - check_leg_correlation
+      - calculate_parlay_ev
+      - validate_parlay_stake
+    reports_to: master
+    constraints:
+      max_stake_eur: 1.00
+      min_legs: 2
+      max_legs: 6
+      require_positive_ev: true
+    schedule: null  # Triggered after single picks are approved
+
+  # ── 9. AUDITOR (Feedback Loop) ──────────────────────────────────────
+  - id: auditor
+    name: "Auditor"
+    role: "Performance Evaluator & Strategy Tuner"
+    llm_tier: tier1_heavy_reasoning
+    soul_file: agents/auditor/SOUL.md
+    description: >
+      Wakes up daily to evaluate Brier Scores, track ROI across
+      Real/Paper ledgers, identify underperforming models, and
+      recommend strategy adjustments to the Master Agent.
+    tools:
+      - calculate_brier_score
+      - calculate_roi
+      - query_model_metrics
+      - query_placed_bets
+      - recommend_strategy_adjustment
+      - promote_or_demote_model
+    reports_to: master
+    schedule:
+      daily_audit: "0 6 * * *"       # Every day at 06:00 UTC
+      weekly_report: "0 8 * * 1"     # Every Monday at 08:00 UTC
