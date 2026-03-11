@@ -24,6 +24,7 @@ PROFILE STRUCTURE (TeamDailyStats JSONB):
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -59,9 +60,11 @@ def _read_xlsx(file_path: Path) -> list[dict]:
     from openpyxl import load_workbook
 
     wb = load_workbook(file_path, read_only=True, data_only=True)
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    wb.close()
+    try:
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+    finally:
+        wb.close()
 
     if not rows:
         return []
@@ -87,12 +90,13 @@ class _TeamBuffer:
     CRITICAL: Call snapshot() BEFORE update() for each match.
     """
 
-    __slots__ = ("matches", "season_wins", "season_losses", "total_played")
+    __slots__ = ("matches", "season_wins", "season_losses", "season_ties", "total_played")
 
     def __init__(self) -> None:
         self.matches: deque[dict] = deque(maxlen=max(_ROLL_WINDOWS))
         self.season_wins: int = 0
         self.season_losses: int = 0
+        self.season_ties: int = 0
         self.total_played: int = 0
 
     def snapshot(self) -> dict:
@@ -101,6 +105,7 @@ class _TeamBuffer:
             "games_played": self.total_played,
             "season_wins": self.season_wins,
             "season_losses": self.season_losses,
+            "season_ties": self.season_ties,
         }
 
         if self.total_played > 0:
@@ -127,15 +132,21 @@ class _TeamBuffer:
 
         return profile
 
-    def update(self, match_stats: dict, won: bool) -> None:
-        """Add current match to buffer (call AFTER snapshot)."""
+    def update(self, match_stats: dict, won: bool | None) -> None:
+        """Add current match to buffer (call AFTER snapshot).
+
+        Args:
+            won: True=win, False=loss, None=tie.
+        """
         match_stats["won"] = won
         self.matches.append(match_stats)
         self.total_played += 1
-        if won:
+        if won is True:
             self.season_wins += 1
-        else:
+        elif won is False:
             self.season_losses += 1
+        else:
+            self.season_ties += 1
 
 
 # ── NFL Ingester ───────────────────────────────────────────────────
@@ -227,8 +238,10 @@ class NFLIngester(BaseIngester):
 
         home_score = safe_int(raw_home_score)
         away_score = safe_int(raw_away_score)
-        home_won = home_score > away_score
-        away_won = away_score > home_score
+        # True=win, False=loss, None=tie (NFL ties are rare but real)
+        is_tie = home_score == away_score
+        home_won = True if home_score > away_score else (None if is_tie else False)
+        away_won = True if away_score > home_score else (None if is_tie else False)
 
         # ── Season-reset detection ────────────────────────────────────
         # NFL season: Aug-Feb. Derive season key from match_date.
@@ -363,7 +376,6 @@ class NFLIngester(BaseIngester):
 
     def _derive_season(self, source_file: str, match_date) -> str:
         """NFL season: Aug-Feb spans two calendar years."""
-        import re
         name = Path(source_file).stem
         m = re.search(r"(20\d{2})", name)
         if m:

@@ -25,6 +25,7 @@ PROFILE STRUCTURE (TeamDailyStats JSONB):
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -268,9 +269,14 @@ class FootballIngester(BaseIngester):
             "reds": safe_int(row.get("AR")),
         }
 
-        # Map FTR → per-team result
-        home_result = "W" if result_code == "H" else ("D" if result_code == "D" else "L")
-        away_result = "W" if result_code == "A" else ("D" if result_code == "D" else "L")
+        # Map FTR → per-team result (skip unknown results from buffer)
+        if result_code not in ("H", "D", "A"):
+            # Unknown result — still upsert the match but don't poison rolling stats
+            home_result = None
+            away_result = None
+        else:
+            home_result = "W" if result_code == "H" else ("D" if result_code == "D" else "L")
+            away_result = "W" if result_code == "A" else ("D" if result_code == "D" else "L")
 
         # ── Season-reset detection ────────────────────────────────────
         # Football seasons start ~July. Derive season key from match_date.
@@ -299,8 +305,10 @@ class FootballIngester(BaseIngester):
         self._upsert(session, model)
 
         # ── STEP 4: Update buffers WITH this match (for future use) ───
-        self._buffers[home_team].update(home_match_data, home_result)
-        self._buffers[away_team].update(away_match_data, away_result)
+        # Skip buffer update for unknown results to avoid poisoning rolling stats
+        if home_result is not None:
+            self._buffers[home_team].update(home_match_data, home_result)
+            self._buffers[away_team].update(away_match_data, away_result)
 
         return 1
 
@@ -383,17 +391,18 @@ class FootballIngester(BaseIngester):
 
     def _derive_season(self, source_file: str, match_date) -> str:
         """Try to extract season from filename like 'E0_2324.csv' or '2023-24'."""
-        import re
         name = Path(source_file).stem
-        # Pattern: 2324 or 2223 (two-digit year pairs)
-        m = re.search(r"(\d{2})(\d{2})", name)
-        if m:
-            y1, y2 = m.group(1), m.group(2)
-            return f"20{y1}-{y2}"
-        # Pattern: 2023-24 or 2023_24
+        # Pattern: 2023-24 or 2023_24 (check most specific first)
         m = re.search(r"(20\d{2})[-_](\d{2})", name)
         if m:
             return f"{m.group(1)}-{m.group(2)}"
+        # Pattern: 2324 (two-digit year pair, preceded by non-digit or start)
+        m = re.search(r"(?<!\d)(\d{2})(\d{2})(?!\d)", name)
+        if m:
+            y1, y2 = int(m.group(1)), int(m.group(2))
+            # Validate: y2 should be y1+1 (mod 100) for a season pair
+            if y2 == (y1 + 1) % 100 and 0 <= y1 <= 99:
+                return f"20{m.group(1)}-{m.group(2)}"
         # Fallback: derive from match date
         year = match_date.year
         month = match_date.month
