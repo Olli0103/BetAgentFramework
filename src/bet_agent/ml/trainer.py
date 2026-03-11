@@ -22,17 +22,25 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
+import os
+
 import numpy as np
 
 from bet_agent.db.models import LedgerType, ModelMetrics, PlacedBet, Sport
 
 logger = logging.getLogger(__name__)
 
+# Reserve CPU cores for the Telegram bot and async agents during training.
+# n_jobs=-1 would starve the entire system while XGBoost runs.
+_TRAINING_JOBS = max(1, (os.cpu_count() or 4) - 2)
+
 # Default model storage directory
 _MODEL_DIR = Path("models")
 
-# Brier Score threshold for the Auditor (above this = model needs retraining)
-BRIER_THRESHOLD = 0.25
+# Brier Score threshold for the Auditor (above this = model needs retraining).
+# 0.25 = coin-flip baseline (worthless). A model must beat the bookmaker's
+# implied probabilities, which typically sit around 0.18-0.21 Brier.
+BRIER_THRESHOLD = 0.21
 
 
 @dataclass
@@ -97,7 +105,7 @@ def train_match_winner(
         "num_class": 3,
         "eval_metric": "mlogloss",
         "random_state": 42,
-        "n_jobs": -1,
+        "n_jobs": _TRAINING_JOBS,
     }
     if hyperparams:
         params.update(hyperparams)
@@ -179,7 +187,7 @@ def train_over_under(
         "objective": "reg:squarederror",
         "eval_metric": "rmse",
         "random_state": 42,
-        "n_jobs": -1,
+        "n_jobs": _TRAINING_JOBS,
     }
     if hyperparams:
         params.update(hyperparams)
@@ -422,7 +430,10 @@ def evaluate_model_performance(
             "reason": "no_resolved_bets",
         }
 
-    # Brier Score: mean of (predicted_prob - outcome)^2
+    # Brier Score: binary (predicted_prob - outcome)^2
+    # NOTE: For proper multi-class Brier on 3-way markets, use
+    # auditor_metrics.evaluate_model_performance() which reconstructs
+    # the full probability vector from sibling predictions.
     brier_sum = 0.0
     total_stake = 0.0
     total_pnl = 0.0

@@ -579,6 +579,38 @@ class TestBrierScore:
         assert brier < 0.25
 
 
+class TestMulticlassBrierScore:
+    """Tests for multi-class Brier Score (3-way markets)."""
+
+    def test_perfect_3way(self):
+        from bet_agent.tools.auditor_metrics import calculate_multiclass_brier_score
+
+        # Perfect: predicted [1, 0, 0] and outcome was [1, 0, 0]
+        inputs = [([1.0, 0.0, 0.0], [1, 0, 0])]
+        assert calculate_multiclass_brier_score(inputs) == 0.0
+
+    def test_worst_3way(self):
+        from bet_agent.tools.auditor_metrics import calculate_multiclass_brier_score
+
+        # Worst: predicted [0, 0, 1] but outcome was [1, 0, 0]
+        inputs = [([0.0, 0.0, 1.0], [1, 0, 0])]
+        assert calculate_multiclass_brier_score(inputs) == 2.0
+
+    def test_uniform_3way(self):
+        from bet_agent.tools.auditor_metrics import calculate_multiclass_brier_score
+
+        # Uniform: [0.33, 0.33, 0.33] vs home win [1, 0, 0]
+        # (0.33-1)^2 + (0.33-0)^2 + (0.33-0)^2 = 0.4489 + 0.1089 + 0.1089 = 0.6667
+        inputs = [([1 / 3, 1 / 3, 1 / 3], [1, 0, 0])]
+        brier = calculate_multiclass_brier_score(inputs)
+        assert abs(brier - 0.6667) < 0.01
+
+    def test_empty(self):
+        from bet_agent.tools.auditor_metrics import calculate_multiclass_brier_score
+
+        assert calculate_multiclass_brier_score([]) == 0.0
+
+
 class TestROI:
     """Tests for ROI calculation."""
 

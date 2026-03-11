@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from bet_agent.db.models import (
     BetStatus,
     LedgerType,
+    MarketType,
     Match,
     ModelMetrics,
     PlacedBet,
@@ -75,7 +76,10 @@ class AuditSummary:
 
 
 def calculate_brier_score(predictions: list[tuple[float, int]]) -> float:
-    """Calculate the Brier Score (mean squared error of probability predictions).
+    """Calculate the binary Brier Score (mean squared error of probability predictions).
+
+    Suitable for 2-way markets (Over/Under, BTTS). For 3-way markets
+    (Match Winner), use calculate_multiclass_brier_score() instead.
 
     Args:
         predictions: List of (predicted_probability, actual_outcome) tuples.
@@ -89,6 +93,36 @@ def calculate_brier_score(predictions: list[tuple[float, int]]) -> float:
 
     total = sum((prob - outcome) ** 2 for prob, outcome in predictions)
     return round(total / len(predictions), 6)
+
+
+def calculate_multiclass_brier_score(
+    prob_vectors: list[tuple[list[float], list[int]]],
+) -> float:
+    """Calculate the multi-class Brier Score for N-way markets.
+
+    For 3-way markets (Home/Draw/Away), the binary formula is incorrect:
+    it only evaluates the probability of the selected outcome, missing
+    how probability mass was distributed across all 3 outcomes.
+
+    Multi-class Brier: (1/N) * sum_i( sum_j( (p_ij - o_ij)^2 ) )
+    where j iterates over all outcomes (home, draw, away).
+
+    Args:
+        prob_vectors: List of (predicted_probs, outcome_vector) tuples.
+                      predicted_probs: [p_home, p_draw, p_away]
+                      outcome_vector:  [1, 0, 0] for home win, etc.
+
+    Returns:
+        Multi-class Brier Score (lower is better).
+    """
+    if not prob_vectors:
+        return 0.0
+
+    total = 0.0
+    for probs, outcomes in prob_vectors:
+        total += sum((p - o) ** 2 for p, o in zip(probs, outcomes))
+
+    return round(total / len(prob_vectors), 6)
 
 
 def calculate_roi(total_staked: Decimal, total_pnl: Decimal) -> float:
@@ -124,6 +158,96 @@ def _get_model_for_bet(
         return pred.model_name
     # Fallback: use a generic name
     return "unknown"
+
+
+def _compute_brier_for_bets(
+    session: Session,
+    bets: list[PlacedBet],
+    model_name: str,
+) -> float:
+    """Compute Brier Score using the correct formula per market type.
+
+    For MATCH_WINNER (3-way): uses multi-class Brier by looking up sibling
+    predictions from the same model to reconstruct the full probability
+    vector [p_home, p_draw, p_away] vs outcome vector [1, 0, 0].
+
+    For OVER_UNDER and other 2-way markets: uses standard binary Brier.
+
+    This prevents the common error of evaluating a 3-way model as if
+    it were binary, which would mask poor probability distribution.
+    """
+    binary_inputs: list[tuple[float, int]] = []
+    multiclass_inputs: list[tuple[list[float], list[int]]] = []
+
+    # Cache: match_id → {selection: model_prob} for 3-way lookups
+    _mw_cache: dict[object, dict[str, float]] = {}
+
+    for bet in bets:
+        if bet.market_type == MarketType.MATCH_WINNER:
+            # Multi-class: reconstruct full probability vector
+            match_id = bet.match_id
+
+            if match_id not in _mw_cache:
+                # Fetch all predictions for this match/model
+                sibling_preds = session.execute(
+                    select(Prediction).where(
+                        Prediction.match_id == match_id,
+                        Prediction.model_name == model_name,
+                        Prediction.market_type == MarketType.MATCH_WINNER,
+                    )
+                ).scalars().all()
+                _mw_cache[match_id] = {
+                    p.selection.lower(): float(p.model_prob) for p in sibling_preds
+                }
+
+            probs_dict = _mw_cache[match_id]
+
+            # Get the actual match result
+            match = bet.match if bet.match else session.get(Match, bet.match_id)
+            if match is None or match.home_score is None or match.away_score is None:
+                continue
+
+            if match.home_score > match.away_score:
+                outcome_vec = [1, 0, 0]
+            elif match.home_score == match.away_score:
+                outcome_vec = [0, 1, 0]
+            else:
+                outcome_vec = [0, 0, 1]
+
+            prob_vec = [
+                probs_dict.get("home", 0.33),
+                probs_dict.get("draw", 0.33),
+                probs_dict.get("away", 0.33),
+            ]
+
+            multiclass_inputs.append((prob_vec, outcome_vec))
+        else:
+            # Binary: Over/Under, BTTS, Spread — (p, outcome) is correct
+            prob = float(bet.model_prob)
+            outcome = 1 if bet.status == BetStatus.WON else 0
+            binary_inputs.append((prob, outcome))
+
+    # Combine: weighted average of both Brier scores
+    scores: list[float] = []
+    weights: list[int] = []
+
+    if multiclass_inputs:
+        mc_brier = calculate_multiclass_brier_score(multiclass_inputs)
+        scores.append(mc_brier)
+        weights.append(len(multiclass_inputs))
+
+    if binary_inputs:
+        bin_brier = calculate_brier_score(binary_inputs)
+        scores.append(bin_brier)
+        weights.append(len(binary_inputs))
+
+    if not scores:
+        return 0.0
+
+    # Weighted average across market types
+    total_weight = sum(weights)
+    combined = sum(s * w for s, w in zip(scores, weights)) / total_weight
+    return round(combined, 6)
 
 
 # ── Core metrics evaluation ──────────────────────────────────────────
@@ -182,14 +306,8 @@ def evaluate_model_performance(
     reports: list[ModelHealthReport] = []
 
     for (model_name, lt), bets in groups.items():
-        # Brier Score: compare predicted probability vs actual (1/0)
-        brier_inputs: list[tuple[float, int]] = []
-        for bet in bets:
-            prob = float(bet.model_prob)
-            outcome = 1 if bet.status == BetStatus.WON else 0
-            brier_inputs.append((prob, outcome))
-
-        brier = calculate_brier_score(brier_inputs)
+        # Brier Score: use multi-class for 3-way markets, binary for 2-way
+        brier = _compute_brier_for_bets(session, bets, model_name)
 
         # ROI
         total_staked = sum(bet.stake_eur for bet in bets)
