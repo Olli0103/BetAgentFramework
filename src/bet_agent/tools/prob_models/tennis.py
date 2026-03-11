@@ -11,6 +11,8 @@ from functools import lru_cache
 
 from bet_agent.tools.prob_models.registry import register
 
+_ROUND = 4  # decimal places for float rounding (cache-friendly)
+
 
 class TennisModel:
     sport = "tennis"
@@ -104,6 +106,34 @@ class TennisModel:
         return p
 
     @staticmethod
+    @lru_cache(maxsize=4096)
+    def _expected_set_games(
+        p_serve_a: float, p_serve_b: float,
+        a_games: int = 0, b_games: int = 0, a_serving: bool = True,
+    ) -> float:
+        """Expected total games remaining in a set from current score."""
+        if a_games >= 6 and a_games - b_games >= 2:
+            return 0.0
+        if b_games >= 6 and b_games - a_games >= 2:
+            return 0.0
+        if a_games == 6 and b_games == 6:
+            return 1.0  # tiebreak counts as 1 game
+
+        if a_serving:
+            p_a_wins_game = TennisModel._p_game(p_serve_a)
+        else:
+            p_a_wins_game = 1.0 - TennisModel._p_game(p_serve_b)
+
+        e = 1.0  # current game
+        e += p_a_wins_game * TennisModel._expected_set_games(
+            p_serve_a, p_serve_b, a_games + 1, b_games, not a_serving,
+        )
+        e += (1 - p_a_wins_game) * TennisModel._expected_set_games(
+            p_serve_a, p_serve_b, a_games, b_games + 1, not a_serving,
+        )
+        return e
+
+    @staticmethod
     @lru_cache(maxsize=1024)
     def _p_match(p_serve_a: float, p_serve_b: float, a_sets: int = 0, b_sets: int = 0, best_of: int = 3, a_serving: bool = True) -> float:
         """P(player A wins match) from current set score."""
@@ -126,6 +156,8 @@ class TennisModel:
         best_of: int = 3,
     ) -> dict[str, float]:
         """P(player A wins), P(player B wins). No draws in tennis."""
+        p_serve_home = round(p_serve_home, _ROUND)
+        p_serve_away = round(p_serve_away, _ROUND)
         p_home = self._p_match(p_serve_home, p_serve_away, best_of=best_of)
         return {"home": p_home, "draw": 0.0, "away": 1.0 - p_home}
 
@@ -136,16 +168,37 @@ class TennisModel:
         line: float = 22.5,
         best_of: int = 3,
     ) -> float:
-        """P(total games > line). Approximation using expected games."""
-        # Average games per set ≈ 9-10 for competitive matches
-        # This is a simplification; a full model would simulate
-        p_match = self._p_match(p_serve_home, p_serve_away, best_of=best_of)
-        avg_sets = best_of * 0.7  # rough approximation
-        avg_games_per_set = 10.0  # competitive average
-        expected_games = avg_sets * avg_games_per_set
-        std_games = 4.0
+        """P(total games > line).
+
+        Computes expected games per set from serve probabilities using the
+        hierarchical model, then estimates total match games via expected
+        number of sets.
+        """
+        p_serve_home = round(p_serve_home, _ROUND)
+        p_serve_away = round(p_serve_away, _ROUND)
+
+        e_games_per_set = self._expected_set_games(p_serve_home, p_serve_away)
+        p_set_a = self._p_set(p_serve_home, p_serve_away)
+
+        sets_to_win = (best_of + 1) // 2
+
+        if sets_to_win == 2:  # best of 3
+            p_straight = p_set_a ** 2 + (1 - p_set_a) ** 2
+            e_sets = 2.0 * p_straight + 3.0 * (1 - p_straight)
+        elif sets_to_win == 3:  # best of 5
+            p_3_0 = p_set_a ** 3 + (1 - p_set_a) ** 3
+            p_3_1 = 3 * p_set_a ** 3 * (1 - p_set_a) + 3 * (1 - p_set_a) ** 3 * p_set_a
+            p_3_2 = 1.0 - p_3_0 - p_3_1
+            e_sets = 3.0 * p_3_0 + 4.0 * p_3_1 + 5.0 * p_3_2
+        else:
+            e_sets = best_of * 0.75  # fallback for unusual formats
+
+        expected_games = e_games_per_set * e_sets
+        # Variance approximation: CV ~15%, floor at 2.0
+        std_games = max(expected_games * 0.15, 2.0)
 
         from scipy.stats import norm
+
         return float(1.0 - norm.cdf(line, loc=expected_games, scale=std_games))
 
     def live_update(
@@ -176,6 +229,9 @@ class TennisModel:
             p_serve_away = live_stats.get("p_serve_away", p_serve_away)
             best_of = live_stats.get("best_of", best_of)
             a_serving = live_stats.get("a_serving", a_serving)
+
+        p_serve_home = round(p_serve_home, _ROUND)
+        p_serve_away = round(p_serve_away, _ROUND)
 
         return self._p_match(
             p_serve_home, p_serve_away,

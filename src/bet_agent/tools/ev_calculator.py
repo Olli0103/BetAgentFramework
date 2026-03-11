@@ -17,7 +17,7 @@ class EVResult:
 
     updated_prob: float
     implied_prob: float
-    edge: float
+    prob_edge: float  # updated_prob - implied_prob (probability difference)
     ev: float
     is_positive_ev: bool
 
@@ -64,13 +64,13 @@ def calculate_live_ev(
 
     # EV calculation (deterministic math)
     implied_prob = 1.0 / live_odds
-    edge = updated_prob - implied_prob
+    prob_edge = updated_prob - implied_prob
     ev = (updated_prob * (live_odds - 1.0)) - (1.0 - updated_prob)
 
     return EVResult(
         updated_prob=round(updated_prob, 6),
         implied_prob=round(implied_prob, 6),
-        edge=round(edge, 6),
+        prob_edge=round(prob_edge, 6),
         ev=round(ev, 6),
         is_positive_ev=ev > 0.0,
     )
@@ -95,13 +95,13 @@ def calculate_pre_match_ev(
         raise ValueError(f"odds must be > 1.0, got {odds}")
 
     implied_prob = 1.0 / odds
-    edge = model_prob - implied_prob
+    prob_edge = model_prob - implied_prob
     ev = (model_prob * (odds - 1.0)) - (1.0 - model_prob)
 
     return EVResult(
         updated_prob=round(model_prob, 6),
         implied_prob=round(implied_prob, 6),
-        edge=round(edge, 6),
+        prob_edge=round(prob_edge, 6),
         ev=round(ev, 6),
         is_positive_ev=ev > 0.0,
     )

@@ -10,7 +10,7 @@ class TestQuarterKelly:
         result = calculate_quarter_kelly(prob=0.55, odds=2.0, bankroll=1000.0)
         assert result.stake_eur > 0
         assert result.reason is None
-        assert result.edge > 0
+        assert result.expected_profit > 0
 
     def test_negative_ev_returns_zero(self):
         result = calculate_quarter_kelly(prob=0.40, odds=2.0, bankroll=1000.0)

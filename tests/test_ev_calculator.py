@@ -20,14 +20,14 @@ class TestPreMatchEV:
         result = calculate_pre_match_ev(model_prob=0.55, odds=2.0)
         assert result.is_positive_ev
         assert result.ev > 0
-        assert result.edge > 0
+        assert result.prob_edge > 0
 
     def test_negative_ev(self):
         # Model says 40% but odds imply 50% → -EV
         result = calculate_pre_match_ev(model_prob=0.40, odds=2.0)
         assert not result.is_positive_ev
         assert result.ev < 0
-        assert result.edge < 0
+        assert result.prob_edge < 0
 
     def test_fair_odds(self):
         # Model = implied → EV ≈ 0

@@ -20,6 +20,7 @@ from sqlalchemy import (
     Numeric,
     String,
     UniqueConstraint,
+    func,
 )
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -112,10 +113,10 @@ class Match(Base):
 
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, nullable=False
+        DateTime(timezone=True), default=_utcnow, server_default=func.now(), nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, server_default=func.now(), nullable=False
     )
 
     # Relationships
@@ -157,7 +158,7 @@ class OddsMarket(Base):
     odds_decimal: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False)
     is_live: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     scraped_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, nullable=False, index=True
+        DateTime(timezone=True), default=_utcnow, server_default=func.now(), nullable=False, index=True
     )
 
     # Relationships
@@ -186,7 +187,7 @@ class BankrollLedger(Base):
         Numeric(12, 2), nullable=False, default=Decimal("0.00")
     )
     last_updated: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, server_default=func.now(), nullable=False
     )
 
     def __repr__(self) -> str:
@@ -230,7 +231,7 @@ class PlacedBet(Base):
     )
     is_live_bet: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     placed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, nullable=False, index=True
+        DateTime(timezone=True), default=_utcnow, server_default=func.now(), nullable=False, index=True
     )
     resolved_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

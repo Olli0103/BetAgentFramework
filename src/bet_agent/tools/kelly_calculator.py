@@ -16,7 +16,7 @@ class KellyResult:
     stake_eur: float
     kelly_fraction: float
     full_kelly_fraction: float
-    edge: float
+    expected_profit: float  # (prob * odds) - 1, expected profit per unit staked
     reason: str | None
 
 
@@ -53,16 +53,16 @@ def calculate_quarter_kelly(
     if bankroll < 0.0:
         raise ValueError(f"bankroll must be >= 0, got {bankroll}")
 
-    # Edge = expected profit per unit staked
-    edge = (prob * odds) - 1.0
+    # Expected profit per unit staked
+    expected_profit = (prob * odds) - 1.0
 
     # Negative EV → don't bet
-    if edge <= 0.0:
+    if expected_profit <= 0.0:
         return KellyResult(
             stake_eur=0.0,
             kelly_fraction=0.0,
             full_kelly_fraction=0.0,
-            edge=round(edge, 6),
+            expected_profit=round(expected_profit, 6),
             reason="negative_ev",
         )
 
@@ -72,12 +72,12 @@ def calculate_quarter_kelly(
             stake_eur=0.0,
             kelly_fraction=0.0,
             full_kelly_fraction=0.0,
-            edge=round(edge, 6),
+            expected_profit=round(expected_profit, 6),
             reason="zero_bankroll",
         )
 
-    # Full Kelly: f* = edge / (odds - 1)
-    full_kelly_fraction = edge / (odds - 1.0)
+    # Full Kelly: f* = expected_profit / (odds - 1)
+    full_kelly_fraction = expected_profit / (odds - 1.0)
 
     # Quarter Kelly (more conservative, reduces variance)
     quarter_kelly_fraction = full_kelly_fraction * 0.25
@@ -95,7 +95,7 @@ def calculate_quarter_kelly(
             stake_eur=0.0,
             kelly_fraction=0.0,
             full_kelly_fraction=round(full_kelly_fraction, 6),
-            edge=round(edge, 6),
+            expected_profit=round(expected_profit, 6),
             reason="below_minimum_stake",
         )
 
@@ -106,6 +106,6 @@ def calculate_quarter_kelly(
         stake_eur=stake,
         kelly_fraction=round(quarter_kelly_fraction, 6),
         full_kelly_fraction=round(full_kelly_fraction, 6),
-        edge=round(edge, 6),
+        expected_profit=round(expected_profit, 6),
         reason=None,
     )
