@@ -49,6 +49,7 @@ class NFLIngester(BaseIngester):
     source_name = "nfl_historical_xlsx"
 
     def __init__(self, default_season: str = "unknown") -> None:
+        super().__init__()
         self._default_season = default_season
 
     def parse_file(self, file_path: Path) -> list[dict]:

@@ -50,6 +50,7 @@ class TennisIngester(BaseIngester):
 
     def __init__(self, tour: str = "ATP") -> None:
         """Args: tour: 'ATP' or 'WTA'."""
+        super().__init__()
         self.tour = tour.upper()
 
     def parse_file(self, file_path: Path) -> list[dict]:

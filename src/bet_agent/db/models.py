@@ -286,7 +286,11 @@ class ModelMetrics(Base):
 
 
 class TeamAlias(Base):
-    """Fuzzy name resolution: maps sportsbook-specific names to canonical names."""
+    """Sport-scoped name resolution: maps variant names to canonical names.
+
+    Every alias is scoped to a sport so that e.g. a tennis player "Sinner"
+    and a hypothetical hockey team "Sinner" can coexist without collision.
+    """
 
     __tablename__ = "team_aliases"
 
@@ -294,11 +298,20 @@ class TeamAlias(Base):
         UUID(as_uuid=True), primary_key=True, default=_new_uuid
     )
     canonical_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
-    alias: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    alias: Mapped[str] = mapped_column(String(128), nullable=False)
+    sport: Mapped[Sport | None] = mapped_column(
+        Enum(Sport, native_enum=False), nullable=True, index=True
+    )
     source: Mapped[str] = mapped_column(String(64), nullable=False)
 
+    __table_args__ = (
+        UniqueConstraint("alias", "sport", name="uq_alias_sport"),
+        Index("ix_alias_sport", "alias", "sport"),
+    )
+
     def __repr__(self) -> str:
-        return f"<TeamAlias '{self.alias}' -> '{self.canonical_name}'>"
+        sport_str = self.sport.value if self.sport else "global"
+        return f"<TeamAlias '{self.alias}' -> '{self.canonical_name}' ({sport_str})>"
 
 
 class TeamDailyStats(Base):

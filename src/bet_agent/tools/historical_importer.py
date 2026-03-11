@@ -1,12 +1,13 @@
 """Historical Data Importer — populates matches + team_daily_stats from historical_matches.
 
 Reads historical_matches (already ingested via the ingest/ package), resolves
-team/player names through the team_aliases table, and produces:
+team/player names through the IroncladAliasResolver, and produces:
   1. Resolved Match records in the `matches` table (with correct canonical names)
   2. Historical TeamDailyStats snapshots (point-in-time rolling stats)
 
 Golden Rule #1: NO LLM MATH.  All aggregation is deterministic Python.
 Golden Rule #2: STATEFUL MEMORY.  Everything goes to PostgreSQL.
+Golden Rule #3: NO RAW STRINGS.  Every name passes through IroncladAliasResolver.
 """
 
 from __future__ import annotations
@@ -26,43 +27,65 @@ from bet_agent.db.models import (
     TeamAlias,
     TeamDailyStats,
 )
+from bet_agent.ingest.alias_resolver import IroncladAliasResolver
 
 logger = logging.getLogger(__name__)
 
 
-# ── Alias Resolution ─────────────────────────────────────────────────
+# ── Alias Resolution (backward-compatible wrapper) ──────────────────
 
 
 class AliasResolver:
-    """Resolves team/player names to canonical form via team_aliases table.
+    """Legacy wrapper around IroncladAliasResolver.
 
-    Caches the alias→canonical mapping in memory for the duration of an
-    import run to avoid repeated DB queries.
+    Maintains the same public API (resolve, add_alias) but delegates
+    to sport-specific IroncladAliasResolvers under the hood.
+    Also supports sport-agnostic resolution for backward compatibility.
     """
 
     def __init__(self, session: Session) -> None:
         self._session = session
-        self._cache: dict[str, str] = {}
-        self._load_cache()
+        self._resolvers: dict[Sport, IroncladAliasResolver] = {}
+        # Legacy cache for sport-agnostic aliases
+        self._global_cache: dict[str, str] = {}
+        self._load_global_cache()
 
-    def _load_cache(self) -> None:
-        """Load all known aliases into memory."""
+    def _load_global_cache(self) -> None:
+        """Load all aliases (any sport) into the global cache."""
+        from bet_agent.ingest.alias_resolver import make_key
+
         rows = self._session.execute(select(TeamAlias)).scalars().all()
         for row in rows:
-            self._cache[row.alias.lower()] = row.canonical_name
-            # Also map canonical name to itself
-            self._cache[row.canonical_name.lower()] = row.canonical_name
-        logger.info("Loaded %d team aliases into cache", len(self._cache))
+            key = make_key(row.alias)
+            self._global_cache[key] = row.canonical_name
+            self._global_cache[make_key(row.canonical_name)] = row.canonical_name
 
-    def resolve(self, name: str) -> str:
+    def _get_resolver(self, sport: Sport) -> IroncladAliasResolver:
+        if sport not in self._resolvers:
+            self._resolvers[sport] = IroncladAliasResolver(self._session, sport)
+        return self._resolvers[sport]
+
+    def resolve(self, name: str, sport: Sport | None = None) -> str:
         """Return canonical name for a team/player.
 
-        If no alias exists, returns the input name unchanged (passthrough).
-        This ensures the pipeline never blocks on unrecognized names.
+        If sport is None, does a global lookup across all aliases (legacy behavior).
         """
-        return self._cache.get(name.strip().lower(), name.strip())
+        if sport is not None:
+            return self._get_resolver(sport).resolve(name)
 
-    def add_alias(self, canonical: str, alias: str, source: str = "historical_import") -> None:
+        from bet_agent.ingest.alias_resolver import make_key
+
+        key = make_key(name)
+
+        # Legacy: check global cache
+        if key in self._global_cache:
+            return self._global_cache[key]
+
+        # Passthrough if no alias matched
+        return name.strip()
+
+    def add_alias(self, canonical: str, alias: str, source: str = "historical_import",
+                  sport: Sport | None = None) -> None:
         """Register a new alias mapping (persists to DB)."""
         existing = self._session.execute(
             select(TeamAlias).where(TeamAlias.alias == alias)
@@ -73,9 +96,16 @@ class AliasResolver:
             canonical_name=canonical,
             alias=alias,
             source=source,
+            sport=sport,
         ))
-        self._cache[alias.lower()] = canonical
-        self._cache[canonical.lower()] = canonical
+        # Update caches
+        from bet_agent.ingest.alias_resolver import make_key
+
+        self._global_cache[make_key(alias)] = canonical
+        self._global_cache[make_key(canonical)] = canonical
+        if sport and sport in self._resolvers:
+            self._resolvers[sport]._cache[make_key(alias)] = canonical
+            self._resolvers[sport]._canonicals[make_key(canonical)] = canonical
 
 
 # ── Match Population ─────────────────────────────────────────────────
@@ -114,8 +144,8 @@ def import_historical_to_matches(
     count = 0
     for hm in hist_matches:
         try:
-            home = resolver.resolve(hm.home_team)
-            away = resolver.resolve(hm.away_team)
+            home = resolver.resolve(hm.home_team, sport=hm.sport)
+            away = resolver.resolve(hm.away_team, sport=hm.sport)
             league = hm.division or "unknown"
 
             scheduled_at = datetime.combine(hm.match_date, time(15, 0), tzinfo=timezone.utc)
@@ -237,8 +267,8 @@ def build_historical_daily_stats(
     team_history: dict[str, list[dict]] = {}
 
     for hm in matches:
-        home = resolver.resolve(hm.home_team)
-        away = resolver.resolve(hm.away_team)
+        home = resolver.resolve(hm.home_team, sport=sport)
+        away = resolver.resolve(hm.away_team, sport=sport)
 
         home_record = _extract_team_record(hm, home, is_home=True)
         away_record = _extract_team_record(hm, away, is_home=False)
@@ -378,7 +408,7 @@ def run_full_historical_import(
 ) -> dict[str, int]:
     """Run the complete historical import pipeline.
 
-    1. Resolve aliases
+    1. Resolve aliases (via IroncladAliasResolver)
     2. Populate matches table
     3. Build team_daily_stats snapshots
 

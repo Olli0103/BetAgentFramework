@@ -2,6 +2,7 @@
 
 Golden Rule #1: NO LLM MATH. All parsing is deterministic Python.
 Golden Rule #2: STATEFUL MEMORY. All data goes to PostgreSQL.
+Golden Rule #3: NO RAW STRINGS. Every name passes through IroncladAliasResolver.
 """
 
 from __future__ import annotations
@@ -21,10 +22,19 @@ logger = logging.getLogger(__name__)
 
 
 class BaseIngester(ABC):
-    """Base class for sport-specific historical data ingesters."""
+    """Base class for sport-specific historical data ingesters.
+
+    ENFORCEMENT: After each row_to_model() call, home_team and away_team
+    are normalized through the IroncladAliasResolver. No subclass can
+    write raw strings to the database — the base class intercepts and
+    resolves every name before the upsert.
+    """
 
     sport: Sport
     source_name: str  # e.g. "football_data_co_uk", "sackmann_atp"
+
+    def __init__(self) -> None:
+        self._resolver = None
 
     @abstractmethod
     def parse_file(self, file_path: Path) -> list[dict]:
@@ -37,6 +47,38 @@ class BaseIngester(ABC):
     def row_to_model(self, row: dict, source_file: str) -> HistoricalMatch:
         """Convert a parsed row dict to a HistoricalMatch instance."""
 
+    def _ensure_resolver(self, session: Session) -> None:
+        """Lazily initialize the IroncladAliasResolver on first use."""
+        if self._resolver is None:
+            from bet_agent.ingest.alias_resolver import IroncladAliasResolver
+
+            self._resolver = IroncladAliasResolver(session, self.sport)
+
+    def resolve_name(self, raw_name: str) -> str:
+        """Resolve a team/player name through the alias resolver.
+
+        Can be called by subclasses for additional name fields beyond
+        home_team / away_team (e.g. match_stats["actual_winner"]).
+        Raises RuntimeError if called before ingest_file (no resolver).
+        """
+        if self._resolver is None:
+            raise RuntimeError(
+                "resolve_name() called before resolver initialization. "
+                "Call ingest_file() first, or use _ensure_resolver()."
+            )
+        return self._resolver.resolve(raw_name)
+
+    def _normalize_model(self, model: HistoricalMatch) -> HistoricalMatch:
+        """Enforce name normalization on a HistoricalMatch.
+
+        This is the IRONCLAD GATE — called after every row_to_model().
+        No raw string gets past this point.
+        """
+        assert self._resolver is not None, "Resolver must be initialized"
+        model.home_team = self._resolver.resolve(model.home_team)
+        model.away_team = self._resolver.resolve(model.away_team)
+        return model
+
     def ingest_file(self, session: Session, file_path: Path) -> int:
         """Parse a file and upsert all rows into the database.
 
@@ -47,12 +89,15 @@ class BaseIngester(ABC):
         Returns:
             Number of rows upserted.
         """
+        self._ensure_resolver(session)
+
         rows = self.parse_file(file_path)
         count = 0
 
         for row in rows:
             try:
                 model = self.row_to_model(row, str(file_path))
+                model = self._normalize_model(model)
                 self._upsert(session, model)
                 count += 1
             except Exception as exc:

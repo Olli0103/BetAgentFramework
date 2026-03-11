@@ -61,6 +61,7 @@ class FootballIngester(BaseIngester):
     source_name = "football_data_co_uk"
 
     def __init__(self, default_season: str = "unknown") -> None:
+        super().__init__()
         self._default_season = default_season
 
     def parse_file(self, file_path: Path) -> list[dict]:
