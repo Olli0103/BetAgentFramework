@@ -54,6 +54,9 @@ agents:
       - push_alert
       - push_daily_summary
       - build_ticket
+      - fetch_and_update_results
+      - settle_finished_matches
+      - run_daily_audit
     reports_to: null  # Top of hierarchy
     receives_from:
       - scout
@@ -281,18 +284,28 @@ agents:
     llm_tier: tier1_heavy_reasoning
     soul_file: agents/auditor/SOUL.md
     description: >
-      Wakes up daily to evaluate Brier Scores, track ROI across
-      Real/Paper ledgers, identify underperforming models, and
-      recommend strategy adjustments to the Master Agent.
+      Wakes up daily at 05:00 UTC to close the feedback loop:
+      fetch final match results, settle pending bets, evaluate
+      Brier Scores and ROI across Real/Paper ledgers, and trigger
+      degradation alerts if model performance drops.
     tools:
+      - fetch_and_update_results
+      - settle_finished_matches
+      - run_daily_audit
+      - evaluate_model_performance
+      - write_daily_metrics
+      - check_rolling_degradation
       - calculate_brier_score
       - calculate_roi
       - query_model_metrics
       - query_placed_bets
       - recommend_strategy_adjustment
       - promote_or_demote_model
-      - evaluate_model_performance
     reports_to: master
     schedule:
-      daily_audit: "0 6 * * *"       # Every day at 06:00 UTC
+      morning_audit: "0 5 * * *"     # Every day at 05:00 UTC
       weekly_report: "0 8 * * 1"     # Every Monday at 08:00 UTC
+    degradation_thresholds:
+      brier_score_max: 0.22          # Above = degraded
+      roi_min_pct: -5.0              # Below = degraded
+      rolling_window_bets: 50        # Minimum bets before checking
