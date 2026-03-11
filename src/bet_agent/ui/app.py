@@ -12,6 +12,9 @@ Tabs:
     3. MLOps         — Model health, Brier Scores, ROI, killswitch indicators
     4. Agent Logs    — Live tail of agent execution logs
 
+Charts: Plotly with dark theme, hover tooltips, fill-to-zero.
+Auto-refresh: streamlit-autorefresh (proper component, no meta-refresh hack).
+
 Golden Rule: This file contains ZERO betting logic. Read-only DB queries only.
 """
 
@@ -24,6 +27,19 @@ from decimal import Decimal
 from pathlib import Path
 
 import streamlit as st
+
+try:
+    import plotly.graph_objects as go
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+    HAS_AUTOREFRESH = True
+except ImportError:
+    HAS_AUTOREFRESH = False
+
 from sqlalchemy import select
 
 # ── Page config (must be first Streamlit call) ───────────────────────
@@ -33,6 +49,10 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ── Auto-refresh (every 30s) ────────────────────────────────────────
+if HAS_AUTOREFRESH:
+    st_autorefresh(interval=30_000, limit=None, key="global_autorefresh")
 
 # ── Database connection ──────────────────────────────────────────────
 
@@ -61,6 +81,24 @@ from bet_agent.db.models import (
 )
 from bet_agent.db.session import get_session
 
+# ── Plotly dark theme helper ─────────────────────────────────────────
+
+_PLOTLY_LAYOUT = dict(
+    template="plotly_dark",
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    margin=dict(l=40, r=20, t=40, b=40),
+    font=dict(size=12),
+    hovermode="x unified",
+)
+
+
+def _plotly_layout(**overrides):
+    """Return a dark-theme Plotly layout with overrides."""
+    layout = dict(_PLOTLY_LAYOUT)
+    layout.update(overrides)
+    return layout
+
 
 # ── Sidebar ──────────────────────────────────────────────────────────
 
@@ -82,7 +120,10 @@ except Exception:
     st.sidebar.warning("DB not reachable")
 
 st.sidebar.divider()
-st.sidebar.caption("Auto-refreshes every 30s")
+if HAS_AUTOREFRESH:
+    st.sidebar.caption("Auto-refreshes every 30s (streamlit-autorefresh)")
+else:
+    st.sidebar.caption("Install streamlit-autorefresh for auto-refresh")
 
 # ── Tab layout ───────────────────────────────────────────────────────
 
@@ -249,22 +290,70 @@ with tab_portfolio:
             ts_data = fetch_pnl_timeseries(sess, days=lookback, ledger_type=lt)
 
             if ts_data:
-                import json
-
                 dates = [d["date"] for d in ts_data]
                 daily_pnl = [d["pnl"] for d in ts_data]
                 cumulative = [d["cumulative_pnl"] for d in ts_data]
                 counts = [d["bets_count"] for d in ts_data]
 
-                # Cumulative PnL chart
+                # ── Cumulative PnL chart ────────────────────────────
                 st.subheader("Cumulative PnL")
-                chart_data = {d["date"]: d["cumulative_pnl"] for d in ts_data}
-                st.line_chart(chart_data)
 
-                # Daily PnL bar chart
+                if HAS_PLOTLY:
+                    fig_cum = go.Figure()
+                    fig_cum.add_trace(go.Scatter(
+                        x=dates,
+                        y=cumulative,
+                        mode="lines",
+                        fill="tozeroy",
+                        fillcolor="rgba(0, 200, 83, 0.15)",
+                        line=dict(color="#00c853", width=2),
+                        name="Cumulative PnL",
+                        hovertemplate="%{x}<br>PnL: %{y:+.2f} EUR<extra></extra>",
+                    ))
+                    fig_cum.add_hline(
+                        y=0, line_dash="dash", line_color="rgba(255,255,255,0.3)",
+                    )
+                    fig_cum.update_layout(
+                        **_plotly_layout(
+                            yaxis_title="EUR",
+                            xaxis_title="",
+                            height=350,
+                        )
+                    )
+                    st.plotly_chart(fig_cum, use_container_width=True)
+                else:
+                    chart_data = {d["date"]: d["cumulative_pnl"] for d in ts_data}
+                    st.line_chart(chart_data)
+
+                # ── Daily PnL bar chart ─────────────────────────────
                 st.subheader("Daily PnL")
-                bar_data = {d["date"]: d["pnl"] for d in ts_data}
-                st.bar_chart(bar_data)
+
+                if HAS_PLOTLY:
+                    colors = [
+                        "#00c853" if v >= 0 else "#ff1744" for v in daily_pnl
+                    ]
+                    fig_daily = go.Figure()
+                    fig_daily.add_trace(go.Bar(
+                        x=dates,
+                        y=daily_pnl,
+                        marker_color=colors,
+                        name="Daily PnL",
+                        hovertemplate="%{x}<br>PnL: %{y:+.2f} EUR<extra></extra>",
+                    ))
+                    fig_daily.add_hline(
+                        y=0, line_dash="dash", line_color="rgba(255,255,255,0.3)",
+                    )
+                    fig_daily.update_layout(
+                        **_plotly_layout(
+                            yaxis_title="EUR",
+                            xaxis_title="",
+                            height=300,
+                        )
+                    )
+                    st.plotly_chart(fig_daily, use_container_width=True)
+                else:
+                    bar_data = {d["date"]: d["pnl"] for d in ts_data}
+                    st.bar_chart(bar_data)
 
                 # Summary metrics
                 total_pnl = sum(daily_pnl)
@@ -286,8 +375,26 @@ with tab_portfolio:
 
             exposure = fetch_sport_exposure(sess)
             if exposure:
-                exp_data = {e.sport: float(e.total_stake) for e in exposure}
-                st.bar_chart(exp_data)
+                if HAS_PLOTLY:
+                    sports = [e.sport for e in exposure]
+                    stakes = [float(e.total_stake) for e in exposure]
+                    fig_exp = go.Figure()
+                    fig_exp.add_trace(go.Bar(
+                        x=sports,
+                        y=stakes,
+                        marker_color="#42a5f5",
+                        hovertemplate="%{x}<br>Stake: %{y:.2f} EUR<extra></extra>",
+                    ))
+                    fig_exp.update_layout(
+                        **_plotly_layout(
+                            yaxis_title="EUR Staked",
+                            height=300,
+                        )
+                    )
+                    st.plotly_chart(fig_exp, use_container_width=True)
+                else:
+                    exp_data = {e.sport: float(e.total_stake) for e in exposure}
+                    st.bar_chart(exp_data)
 
                 for e in exposure:
                     st.markdown(
@@ -369,13 +476,44 @@ with tab_mlops:
                 )
 
                 if metrics:
-                    chart: dict[str, dict[str, float]] = defaultdict(dict)
-                    for m in metrics:
-                        chart[m.date.isoformat()][m.model_name] = float(m.brier_score)
+                    if HAS_PLOTLY:
+                        # Group by model_name
+                        model_series: dict[str, tuple[list, list]] = {}
+                        for m in metrics:
+                            if m.model_name not in model_series:
+                                model_series[m.model_name] = ([], [])
+                            model_series[m.model_name][0].append(m.date.isoformat())
+                            model_series[m.model_name][1].append(float(m.brier_score))
 
-                    st.line_chart(chart)
+                        fig_brier = go.Figure()
+                        for model_name, (dates_b, scores) in model_series.items():
+                            fig_brier.add_trace(go.Scatter(
+                                x=dates_b, y=scores,
+                                mode="lines+markers",
+                                name=model_name,
+                                hovertemplate="%{x}<br>Brier: %{y:.4f}<extra></extra>",
+                            ))
 
-                    # Threshold line annotation
+                        # Degradation threshold line
+                        fig_brier.add_hline(
+                            y=0.22, line_dash="dash", line_color="#ff1744",
+                            annotation_text="Degradation threshold (0.22)",
+                            annotation_position="top right",
+                        )
+                        fig_brier.update_layout(
+                            **_plotly_layout(
+                                yaxis_title="Brier Score",
+                                height=350,
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                            )
+                        )
+                        st.plotly_chart(fig_brier, use_container_width=True)
+                    else:
+                        chart: dict[str, dict[str, float]] = defaultdict(dict)
+                        for m in metrics:
+                            chart[m.date.isoformat()][m.model_name] = float(m.brier_score)
+                        st.line_chart(chart)
+
                     st.caption("Degradation threshold: Brier > 0.22 (red zone)")
             else:
                 st.info("No model metrics yet. Run the Auditor morning audit first.")
@@ -439,12 +577,3 @@ with tab_logs:
                 c6.metric("Placed", activity.placed_today)
         except Exception as e:
             st.error(f"Activity query failed: {e}")
-
-
-# ── Auto-refresh ─────────────────────────────────────────────────────
-st.markdown(
-    """
-    <meta http-equiv="refresh" content="30">
-    """,
-    unsafe_allow_html=True,
-)

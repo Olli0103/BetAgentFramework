@@ -854,3 +854,75 @@ class TestMasterAgentBridge:
             assert bot_mod._master_bridge.query("test", "@user") == "Mock response for @user: test"
         finally:
             bot_mod._master_bridge = original
+
+
+class TestInlineKeyboardConstants:
+    """Tests for InlineKeyboard callback data prefixes and conversation states."""
+
+    def test_callback_prefixes_defined(self):
+        from bet_agent.interfaces.telegram_bot import (
+            CALLBACK_PLACE_CUSTOM,
+            CALLBACK_PLACE_STD,
+        )
+
+        assert CALLBACK_PLACE_STD.startswith("place_std:")
+        assert CALLBACK_PLACE_CUSTOM.startswith("place_cst:")
+
+    def test_conversation_states_defined(self):
+        from bet_agent.interfaces.telegram_bot import (
+            CONV_AWAITING_ODDS,
+            CONV_AWAITING_STAKE,
+        )
+
+        assert CONV_AWAITING_ODDS == "awaiting_odds"
+        assert CONV_AWAITING_STAKE == "awaiting_stake"
+
+    def test_callback_data_format_with_bet_id(self):
+        """Callback data should safely encode bet_id after the prefix."""
+        from bet_agent.interfaces.telegram_bot import CALLBACK_PLACE_STD
+
+        bet_id = "abc123de-f456-7890-abcd-ef1234567890"
+        data = f"{CALLBACK_PLACE_STD}{bet_id}"
+        assert data.startswith("place_std:")
+        extracted = data[len(CALLBACK_PLACE_STD):]
+        assert extracted == bet_id
+
+
+class TestAlertDigest:
+    """Tests for the alert digest/batching system."""
+
+    def test_queue_and_clear(self):
+        import bet_agent.interfaces.telegram_bot as bot_mod
+
+        original = list(bot_mod._alert_buffer)
+        bot_mod._alert_buffer.clear()
+        try:
+            bot_mod.queue_alert("Test alert 1")
+            bot_mod.queue_alert("Test alert 2")
+            assert len(bot_mod._alert_buffer) == 2
+            assert bot_mod._alert_buffer[0] == "Test alert 1"
+        finally:
+            bot_mod._alert_buffer.clear()
+            bot_mod._alert_buffer.extend(original)
+
+    def test_digest_interval_configured(self):
+        from bet_agent.interfaces.telegram_bot import _DIGEST_INTERVAL_SECONDS
+
+        assert _DIGEST_INTERVAL_SECONDS == 600  # 10 minutes
+
+    def test_sync_fetch_pending_data_returns_list(self, db_session):
+        """_sync_fetch_pending_data returns structured dicts (for InlineKeyboard)."""
+        from bet_agent.tools.master_analysis import fetch_pending_for_human
+
+        match = _add_match(db_session)
+        _add_bet(db_session, match, status=BetStatus.PENDING)
+
+        pending = fetch_pending_for_human(db_session)
+        assert isinstance(pending, list)
+        assert len(pending) == 1
+        # Keys needed for InlineKeyboard rendering
+        assert "bet_id" in pending[0]
+        assert "match" in pending[0]
+        assert "selection" in pending[0]
+        assert "odds" in pending[0]
+        assert "stake_eur" in pending[0]

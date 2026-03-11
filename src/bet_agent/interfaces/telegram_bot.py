@@ -3,11 +3,17 @@
 Secure, multi-user Telegram bot with strict whitelist authentication.
 All members of the syndicate can interact with the system via:
   - /status   — daily portfolio summary
-  - /pending  — bets waiting for human execution
-  - /pnl      — current balance and P&L
+  - /pending  — bets waiting for human execution (InlineKeyboard buttons)
+  - /pnl      — current balance & P&L
   - /placed   — confirm manual bet placement (syncs to team)
   - /health   — model health overview
   - Free text — routed to the Master Agent (Tier 1 LLM) for NL answers
+
+UX:
+  - /pending renders each bet as an InlineKeyboard with two buttons:
+    "✅ Standard" (use model values) or "✏️ Custom" (enter real odds/stake)
+  - After placement, buttons are replaced with a confirmation via edit_message_text
+    to prevent double-placement in group chat.
 
 Security:
   - ALLOWED_TELEGRAM_IDS from .env enforces strict whitelist
@@ -142,6 +148,14 @@ def _sync_fetch_status():
         return format_portfolio_text(summary)
 
 
+def _sync_fetch_pending_data():
+    """Synchronous: fetch pending bets as structured dicts."""
+    from bet_agent.db.session import get_session
+    from bet_agent.tools.master_analysis import fetch_pending_for_human
+    with get_session() as sess:
+        return fetch_pending_for_human(sess)
+
+
 def _sync_fetch_pending():
     """Synchronous: fetch pending bets and format text."""
     from bet_agent.db.session import get_session
@@ -235,6 +249,14 @@ def _check_auth(update) -> bool:
     return is_authorized(user.id, chat_id)
 
 
+# ── Callback data prefixes ──────────────────────────────────────────
+
+CALLBACK_PLACE_STD = "place_std:"     # place_std:<short_bet_id>
+CALLBACK_PLACE_CUSTOM = "place_cst:"  # place_cst:<short_bet_id>
+CONV_AWAITING_ODDS = "awaiting_odds"
+CONV_AWAITING_STAKE = "awaiting_stake"
+
+
 # ── Command handlers ─────────────────────────────────────────────────
 
 
@@ -248,9 +270,9 @@ async def cmd_start(update, context) -> None:
         "Welcome to the OpenClaw Syndicate.\n\n"
         "Commands:\n"
         "/status  — Portfolio summary\n"
-        "/pending — Bets awaiting execution\n"
+        "/pending — Bets awaiting execution (tap to place)\n"
         "/pnl     — Balance & P&L\n"
-        "/placed <id> <odds> <stake> — Confirm placement\n"
+        "/placed <id> <odds> <stake> — Manual placement\n"
         "/health  — Model health overview\n\n"
         "Or just type a question in natural language."
     )
@@ -271,13 +293,55 @@ async def cmd_status(update, context) -> None:
 
 
 async def cmd_pending(update, context) -> None:
-    """Handle /pending — bets waiting for human execution."""
+    """Handle /pending — bets waiting for human execution with InlineKeyboard buttons.
+
+    Each pending bet is rendered as a card with two action buttons:
+      ✅ Standard — place at model odds/stake (one tap)
+      ✏️ Custom   — enter your actual sportsbook odds/stake
+    """
     if not _check_auth(update):
         return
 
     try:
-        text = await asyncio.to_thread(_sync_fetch_pending)
-        await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        pending = await asyncio.to_thread(_sync_fetch_pending_data)
+
+        if not pending:
+            await update.message.reply_text("No pending bets. All clear.")
+            return
+
+        await update.message.reply_text(
+            f"\U0001f4cb **{len(pending)} bet(s) waiting for placement:**",
+            parse_mode="Markdown",
+        )
+
+        for bet in pending:
+            short_id = bet["bet_id"][:8]
+            text = (
+                f"\u26bd **{bet['match']}**\n"
+                f"Selection: `{bet['selection']}` ({bet['market']})\n"
+                f"Odds: {bet['odds']:.2f} | Stake: {bet['stake_eur']:.2f} EUR\n"
+                f"Ledger: {bet['ledger']} | ID: `{short_id}...`"
+            )
+
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "\u2705 Place (standard)",
+                        callback_data=f"{CALLBACK_PLACE_STD}{bet['bet_id']}",
+                    ),
+                    InlineKeyboardButton(
+                        "\u270f\ufe0f Custom odds/stake",
+                        callback_data=f"{CALLBACK_PLACE_CUSTOM}{bet['bet_id']}",
+                    ),
+                ]
+            ])
+
+            await update.message.reply_text(
+                text, reply_markup=keyboard, parse_mode="Markdown",
+            )
+
     except Exception as e:
         logger.error("Error in /pending: %s", e)
         await update.message.reply_text(f"Error: {e}")
@@ -333,6 +397,9 @@ async def cmd_placed(update, context) -> None:
     The human MUST provide the actual odds and stake obtained at the
     sportsbook. The system recalculates EV on the real numbers, warns
     on -EV, and deducts the actual stake from the bankroll ledger.
+
+    NOTE: The preferred UX is via /pending → InlineKeyboard buttons.
+    This command is kept as a fallback for power users.
     """
     if not _check_auth(update):
         return
@@ -344,7 +411,7 @@ async def cmd_placed(update, context) -> None:
             "Usage: /placed <bet_id> <actual_odds> <actual_stake>\n\n"
             "Example: /placed 1234abcd 1.85 45.00\n\n"
             "You MUST provide the real odds and stake from the sportsbook.\n"
-            "Use /pending to see available bet IDs."
+            "Easier: Use /pending for clickable buttons."
         )
         return
 
@@ -376,78 +443,105 @@ async def cmd_placed(update, context) -> None:
         result = await asyncio.to_thread(
             _sync_place_bet, bet_id, user_name, actual_odds, actual_stake,
         )
-
-        if "error" in result:
-            await update.message.reply_text(f"Error: {result['error']}")
-            return
-
-        # Build confirmation message
-        ev_str = f"{result['ev']:+.4f}"
-        ev_emoji = "\u2705" if result["ev"] >= 0 else "\u26a0\ufe0f"
-        lines = [
-            f"{ev_emoji} Bet confirmed as placed!",
-            "",
-            f"Match: {result['match']}",
-            f"Selection: {result['selection']}",
-            f"Stake: {result['stake_eur']:.2f} EUR @ {result['odds']:.2f}",
-            f"EV at actual odds: {ev_str}",
-            f"Placed by: {user_name}",
-        ]
-
-        # Show slippage if odds changed
-        if result.get("original_odds") and abs(result["odds"] - result["original_odds"]) > 0.001:
-            lines.append(
-                f"\nOriginal model odds: {result['original_odds']:.2f} "
-                f"-> Actual: {result['odds']:.2f}"
-            )
-
-        # Append warnings
-        for warning in result.get("warnings", []):
-            lines.append(f"\n\u26a0\ufe0f {warning}")
-
-        await update.message.reply_text("\n".join(lines))
-
-        # Broadcast to the group (if configured)
-        if TELEGRAM_GROUP_ID and context.bot:
-            broadcast_msg = (
-                f"\U0001f4e2 BET PLACED by {user_name}\n\n"
-                f"Match: {result['match']}\n"
-                f"Selection: {result['selection']}\n"
-                f"Stake: {result['stake_eur']:.2f} EUR @ {result['odds']:.2f}\n"
-                f"EV: {ev_str}\n"
-                f"ID: {bet_id[:8]}..."
-            )
-            try:
-                await context.bot.send_message(
-                    chat_id=TELEGRAM_GROUP_ID,
-                    text=broadcast_msg,
-                )
-            except Exception as exc:
-                logger.error("Group broadcast failed: %s", exc)
-
-        # Also broadcast to all whitelisted individual users
-        for uid in ALLOWED_IDS:
-            if uid != user.id and uid != int(TELEGRAM_GROUP_ID or 0):
-                try:
-                    await context.bot.send_message(
-                        chat_id=uid,
-                        text=(
-                            f"\U0001f4e2 {user_name} placed: "
-                            f"{result['match']} — {result['selection']} "
-                            f"@ {result['odds']:.2f} ({result['stake_eur']:.2f} EUR) "
-                            f"EV: {ev_str}"
-                        ),
-                    )
-                except Exception:
-                    pass  # User may not have started the bot yet
-
+        await _send_placement_confirmation(update.message, context, result, bet_id, user_name, user)
     except Exception as e:
         logger.error("Error in /placed: %s", e)
         await update.message.reply_text(f"Error: {e}")
 
 
+# ── InlineKeyboard callback handler ─────────────────────────────────
+
+
+async def handle_callback_query(update, context) -> None:
+    """Handle InlineKeyboard button presses for bet placement.
+
+    Callback data formats:
+      - place_std:<bet_id>   → place at model odds/stake
+      - place_cst:<bet_id>   → ask user for custom odds/stake
+    """
+    query = update.callback_query
+    if query is None:
+        return
+
+    user = query.from_user
+    if not is_authorized(user.id, query.message.chat_id if query.message else None):
+        await query.answer("Unauthorized.", show_alert=True)
+        return
+
+    data = query.data or ""
+    user_name = get_user_display_name(user)
+
+    # ── Standard placement (model values) ────────────────────────────
+    if data.startswith(CALLBACK_PLACE_STD):
+        bet_id = data[len(CALLBACK_PLACE_STD):]
+        await query.answer("Placing bet...")
+
+        try:
+            result = await asyncio.to_thread(
+                _sync_place_bet, bet_id, user_name,
+            )
+
+            if "error" in result:
+                await query.edit_message_text(
+                    f"\u274c Placement failed: {result['error']}\n\n"
+                    f"(Original bet ID: `{bet_id[:8]}...`)",
+                    parse_mode="Markdown",
+                )
+                return
+
+            # State-aware: replace buttons with confirmation
+            ev_str = f"{result['ev']:+.4f}"
+            ev_emoji = "\u2705" if result["ev"] >= 0 else "\u26a0\ufe0f"
+            confirmation = (
+                f"{ev_emoji} **PLACED** by {user_name}\n\n"
+                f"Match: {result['match']}\n"
+                f"Selection: `{result['selection']}`\n"
+                f"Stake: {result['stake_eur']:.2f} EUR @ {result['odds']:.2f}\n"
+                f"EV: {ev_str}"
+            )
+
+            for warning in result.get("warnings", []):
+                confirmation += f"\n\u26a0\ufe0f {warning}"
+
+            await query.edit_message_text(confirmation, parse_mode="Markdown")
+
+            # Broadcast
+            await _broadcast_placement(context, result, bet_id, user_name, user)
+
+        except Exception as e:
+            logger.error("Callback placement error: %s", e)
+            await query.edit_message_text(f"\u274c Error: {e}")
+        return
+
+    # ── Custom placement (ask for odds/stake) ────────────────────────
+    if data.startswith(CALLBACK_PLACE_CUSTOM):
+        bet_id = data[len(CALLBACK_PLACE_CUSTOM):]
+        await query.answer()
+
+        # Store bet_id in user_data for the conversation flow
+        context.user_data["custom_bet_id"] = bet_id
+        context.user_data["conv_state"] = CONV_AWAITING_ODDS
+
+        await query.edit_message_text(
+            f"\u270f\ufe0f **Custom placement** for `{bet_id[:8]}...`\n\n"
+            f"Enter the actual odds from the sportsbook:\n"
+            f"(e.g. `1.85`)",
+            parse_mode="Markdown",
+        )
+        return
+
+    await query.answer("Unknown action.")
+
+
+# ── Conversation flow for custom odds/stake ─────────────────────────
+
+
 async def handle_message(update, context) -> None:
-    """Handle free-text messages — route to Master Agent via NL bridge."""
+    """Handle free-text messages — conversation flow or NL routing.
+
+    If the user is in a custom placement conversation flow, handle
+    the odds/stake input. Otherwise route to Master Agent.
+    """
     if not _check_auth(update):
         user = update.effective_user
         logger.warning(
@@ -457,15 +551,78 @@ async def handle_message(update, context) -> None:
         )
         return  # Silent block
 
-    text = update.message.text
+    text = (update.message.text or "").strip()
     if not text:
         return
 
     user = update.effective_user
     user_name = get_user_display_name(user)
+
+    # ── Custom placement conversation flow ───────────────────────────
+    conv_state = context.user_data.get("conv_state")
+
+    if conv_state == CONV_AWAITING_ODDS:
+        # User is entering odds
+        try:
+            odds = float(text)
+        except ValueError:
+            await update.message.reply_text(
+                "Invalid number. Please enter the odds as a decimal (e.g. `1.85`):",
+                parse_mode="Markdown",
+            )
+            return
+
+        if odds <= 1.0:
+            await update.message.reply_text("Odds must be > 1.00. Try again:")
+            return
+
+        context.user_data["custom_odds"] = odds
+        context.user_data["conv_state"] = CONV_AWAITING_STAKE
+        await update.message.reply_text(
+            f"Odds: **{odds:.2f}** \u2705\n\n"
+            f"Now enter the actual stake in EUR (e.g. `45.00`):",
+            parse_mode="Markdown",
+        )
+        return
+
+    if conv_state == CONV_AWAITING_STAKE:
+        # User is entering stake
+        try:
+            stake = float(text)
+        except ValueError:
+            await update.message.reply_text(
+                "Invalid number. Please enter the stake in EUR (e.g. `45.00`):",
+                parse_mode="Markdown",
+            )
+            return
+
+        if stake <= 0:
+            await update.message.reply_text("Stake must be > 0. Try again:")
+            return
+
+        bet_id = context.user_data.get("custom_bet_id", "")
+        odds = context.user_data.get("custom_odds", 0.0)
+
+        # Clear conversation state
+        context.user_data.pop("conv_state", None)
+        context.user_data.pop("custom_bet_id", None)
+        context.user_data.pop("custom_odds", None)
+
+        try:
+            result = await asyncio.to_thread(
+                _sync_place_bet, bet_id, user_name, odds, stake,
+            )
+            await _send_placement_confirmation(
+                update.message, context, result, bet_id, user_name, user,
+            )
+        except Exception as e:
+            logger.error("Custom placement error: %s", e)
+            await update.message.reply_text(f"Error: {e}")
+        return
+
+    # ── Normal NL routing ────────────────────────────────────────────
     logger.info("NL query from %s (id=%d): %s", user_name, user.id, text[:100])
 
-    # Route to Master Agent (bridge.query may be slow — run in thread)
     try:
         response = await asyncio.to_thread(_master_bridge.query, text, user_name)
         await update.message.reply_text(response)
@@ -475,6 +632,131 @@ async def handle_message(update, context) -> None:
             "The Master Agent encountered an error processing your request. "
             "Please try again or use a slash command."
         )
+
+
+# ── Shared placement confirmation + broadcast ───────────────────────
+
+
+async def _send_placement_confirmation(message, context, result, bet_id, user_name, user):
+    """Send placement confirmation (reusable for /placed and button flows)."""
+    if "error" in result:
+        await message.reply_text(f"Error: {result['error']}")
+        return
+
+    ev_str = f"{result['ev']:+.4f}"
+    ev_emoji = "\u2705" if result["ev"] >= 0 else "\u26a0\ufe0f"
+    lines = [
+        f"{ev_emoji} Bet confirmed as placed!",
+        "",
+        f"Match: {result['match']}",
+        f"Selection: {result['selection']}",
+        f"Stake: {result['stake_eur']:.2f} EUR @ {result['odds']:.2f}",
+        f"EV at actual odds: {ev_str}",
+        f"Placed by: {user_name}",
+    ]
+
+    if result.get("original_odds") and abs(result["odds"] - result["original_odds"]) > 0.001:
+        lines.append(
+            f"\nOriginal model odds: {result['original_odds']:.2f} "
+            f"-> Actual: {result['odds']:.2f}"
+        )
+
+    for warning in result.get("warnings", []):
+        lines.append(f"\n\u26a0\ufe0f {warning}")
+
+    await message.reply_text("\n".join(lines))
+    await _broadcast_placement(context, result, bet_id, user_name, user)
+
+
+async def _broadcast_placement(context, result, bet_id, user_name, user):
+    """Broadcast placement to group and individual syndicate members."""
+    ev_str = f"{result['ev']:+.4f}"
+
+    if TELEGRAM_GROUP_ID and context.bot:
+        broadcast_msg = (
+            f"\U0001f4e2 BET PLACED by {user_name}\n\n"
+            f"Match: {result['match']}\n"
+            f"Selection: {result['selection']}\n"
+            f"Stake: {result['stake_eur']:.2f} EUR @ {result['odds']:.2f}\n"
+            f"EV: {ev_str}\n"
+            f"ID: {bet_id[:8]}..."
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=TELEGRAM_GROUP_ID,
+                text=broadcast_msg,
+            )
+        except Exception as exc:
+            logger.error("Group broadcast failed: %s", exc)
+
+    for uid in ALLOWED_IDS:
+        if uid != user.id and uid != int(TELEGRAM_GROUP_ID or 0):
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=(
+                        f"\U0001f4e2 {user_name} placed: "
+                        f"{result['match']} — {result['selection']} "
+                        f"@ {result['odds']:.2f} ({result['stake_eur']:.2f} EUR) "
+                        f"EV: {ev_str}"
+                    ),
+                )
+            except Exception:
+                pass  # User may not have started the bot yet
+
+
+# ── Alert digest / batching ─────────────────────────────────────────
+
+# In-memory buffer for batching alerts on busy days.
+# call flush_alert_digest() periodically (e.g. via job_queue).
+_alert_buffer: list[str] = []
+_DIGEST_INTERVAL_SECONDS = 600  # 10 minutes
+
+
+def queue_alert(text: str) -> None:
+    """Add an alert to the digest buffer (called by pipeline agents)."""
+    _alert_buffer.append(text)
+
+
+async def flush_alert_digest(context) -> None:
+    """Flush buffered alerts as a single digest message.
+
+    Called by the Application job_queue every DIGEST_INTERVAL_SECONDS.
+    If only 1-2 alerts, send immediately. If 3+, combine into a digest.
+    """
+    if not _alert_buffer:
+        return
+
+    alerts = list(_alert_buffer)
+    _alert_buffer.clear()
+
+    if len(alerts) <= 2:
+        # Few alerts — send individually
+        for alert in alerts:
+            await _send_to_all(context, alert)
+    else:
+        # Many alerts — combine into digest
+        digest = (
+            f"\U0001f4cb **Alert Digest** ({len(alerts)} items)\n"
+            + "\n---\n".join(alerts)
+        )
+        await _send_to_all(context, digest)
+
+
+async def _send_to_all(context, text: str) -> None:
+    """Send a message to the group and all whitelisted users."""
+    if TELEGRAM_GROUP_ID and context.bot:
+        try:
+            await context.bot.send_message(chat_id=TELEGRAM_GROUP_ID, text=text)
+        except Exception as exc:
+            logger.error("Digest broadcast failed: %s", exc)
+
+    for uid in ALLOWED_IDS:
+        if uid != int(TELEGRAM_GROUP_ID or 0):
+            try:
+                await context.bot.send_message(chat_id=uid, text=text)
+            except Exception:
+                pass
 
 
 # ── Bot builder ──────────────────────────────────────────────────────
@@ -488,6 +770,7 @@ def build_application():
     """
     from telegram.ext import (
         Application,
+        CallbackQueryHandler,
         CommandHandler,
         MessageHandler,
         filters,
@@ -509,11 +792,20 @@ def build_application():
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("placed", cmd_placed))
 
-    # Free-text → Master Agent NL bridge (must be last)
+    # InlineKeyboard callback handler (for /pending buttons)
+    app.add_handler(CallbackQueryHandler(handle_callback_query))
+
+    # Free-text → conversation flow or Master Agent NL bridge (must be last)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # Schedule alert digest flush every 10 minutes
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(
+            flush_alert_digest, interval=_DIGEST_INTERVAL_SECONDS, first=60,
+        )
+
     logger.info(
-        "Telegram bot configured with %d whitelisted users",
+        "Telegram bot configured with %d whitelisted users, InlineKeyboard enabled",
         len(ALLOWED_IDS),
     )
 
@@ -539,6 +831,5 @@ def run_bot() -> None:
 
 
 # ── Entry point ──────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     run_bot()
