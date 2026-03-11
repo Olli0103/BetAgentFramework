@@ -161,7 +161,7 @@ PENDING ──► PLACED ──► WON / LOST / VOID
 ### Streamlit WebUI (Port 8501)
 
 ```bash
-streamlit run src/bet_agent/ui/app.py
+make ui
 ```
 
 4 tabs:
@@ -173,7 +173,7 @@ streamlit run src/bet_agent/ui/app.py
 ### Telegram Syndicate Bot
 
 ```bash
-python -m bet_agent.interfaces.telegram_bot
+make bot
 ```
 
 Commands:
@@ -197,49 +197,58 @@ Commands:
 - PostgreSQL 14+
 - Ollama (for Tier 2 local models)
 
-### Installation
+### Quick Start
 
 ```bash
-# Clone
 git clone <repo-url> && cd BetAgentFramework
 
-# Install with all extras
-pip install -e ".[ui,telegram,dev]"
+# One command: installs deps, copies .env, creates DB tables
+make setup
 
-# Copy and configure environment
-cp .env.example .env
 # Edit .env with your credentials
+nano .env
+
+# Launch the dashboard
+make ui
+
+# In another terminal: start the Telegram bot
+make bot
 ```
+
+### Available Commands
+
+| Command | What it does |
+|---------|-------------|
+| `make setup` | Full first-time setup (install + .env + DB tables) |
+| `make install` | Install all Python dependencies |
+| `make db` | Create/update database tables |
+| `make test` | Run test suite (320 tests, SQLite in-memory) |
+| `make ui` | Launch Streamlit dashboard on http://localhost:8501 |
+| `make bot` | Start the Telegram syndicate bot |
+| `make clean` | Remove caches and build artifacts |
 
 ### Environment Variables
 
+Edit `.env` after running `make setup`:
+
 ```env
 DATABASE_URL=postgresql://betagent:password@localhost:5432/betagent
-TELEGRAM_BOT_TOKEN=           # From @BotFather
-ALLOWED_TELEGRAM_IDS=123456   # Comma-separated whitelist
-TELEGRAM_GROUP_ID=            # Optional syndicate group
-GEMINI_API_KEY=               # Tier 1 fallback
+TELEGRAM_BOT_TOKEN=              # From @BotFather
+ALLOWED_TELEGRAM_IDS=123456      # Comma-separated whitelist
+TELEGRAM_GROUP_ID=               # Optional syndicate group
+GEMINI_API_KEY=                  # Tier 1 fallback
 OLLAMA_BASE_URL=http://localhost:11434
-CLOUDFLARE_ACCOUNT_ID=        # For daily crawls
+CLOUDFLARE_ACCOUNT_ID=           # For daily crawls
 CLOUDFLARE_API_TOKEN=
 ```
 
-### Database Setup
+### Database
 
 ```bash
-# Create database
+# Create the PostgreSQL database (one time)
 createdb betagent
 
-# Tables auto-create via SQLAlchemy on first run
-# Or use Alembic for migrations:
-alembic upgrade head
-```
-
-### Running Tests
-
-```bash
-pytest tests/ -q        # 310 tests, SQLite in-memory
-pytest tests/ -x -v     # Stop on first failure, verbose
+# Tables are created automatically by `make setup` or `make db`
 ```
 
 ---
@@ -308,7 +317,7 @@ BetAgentFramework/
 │   └── interfaces/          # Telegram syndicate bot
 ├── config/                  # Agent + LLM tier configuration (YAML)
 ├── agents/                  # 9 agent SOUL.md character sheets
-├── tests/                   # 310 tests (pytest, SQLite in-memory)
+├── tests/                   # 320 tests (pytest, SQLite in-memory)
 ├── pyproject.toml           # Dependencies & build config
 └── .env.example             # Environment variable template
 ```
