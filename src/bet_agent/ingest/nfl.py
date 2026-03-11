@@ -149,6 +149,8 @@ class NFLIngester(BaseIngester):
         super().__init__()
         self._default_season = default_season
         self._buffers: dict[str, _TeamBuffer] = defaultdict(_TeamBuffer)
+        # Track last-seen season per team for reset detection
+        self._team_season: dict[str, str] = {}
 
     def parse_file(self, file_path: Path) -> list[dict]:
         rows = _read_xlsx(file_path)
@@ -216,10 +218,27 @@ class NFLIngester(BaseIngester):
         home_team = self.resolve_name(row["Home Team"].strip())
         away_team = self.resolve_name(row["Away Team"].strip())
 
-        home_score = safe_int(row.get("Home Score"))
-        away_score = safe_int(row.get("Away Score"))
+        # Validate scores — skip rows with missing/empty scores (avoid phantom 0-0)
+        raw_home_score = (row.get("Home Score") or "").strip()
+        raw_away_score = (row.get("Away Score") or "").strip()
+        if not raw_home_score or not raw_away_score:
+            logger.debug("Skipping row with missing score: %s vs %s", home_team, away_team)
+            return 0
+
+        home_score = safe_int(raw_home_score)
+        away_score = safe_int(raw_away_score)
         home_won = home_score > away_score
         away_won = away_score > home_score
+
+        # ── Season-reset detection ────────────────────────────────────
+        # NFL season: Aug-Feb. Derive season key from match_date.
+        season_key = self._derive_season("", match_date)
+        for team in (home_team, away_team):
+            prev = self._team_season.get(team)
+            if prev is not None and prev != season_key:
+                self._buffers[team] = _TeamBuffer()
+                logger.debug("Season reset for %s: %s → %s", team, prev, season_key)
+            self._team_season[team] = season_key
 
         # Per-team match stats for buffer
         margin_home = home_score - away_score

@@ -60,11 +60,16 @@ def _parse_season(raw: str | None, match_date=None) -> str:
 
     s = str(raw).strip()
 
-    # Handle float-like strings: "2024.0" → "2024"
+    # Handle float-like strings: "2024.0" → "2024", reject NaN/Inf
     try:
         val = float(s)
+        if val != val or val == float("inf") or val == float("-inf"):
+            # NaN or Inf — treat as missing
+            if match_date is not None:
+                return str(match_date.year)
+            return "unknown"
         return str(int(val))
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         pass
 
     return s
@@ -140,6 +145,8 @@ class NBAIngester(BaseIngester):
     def __init__(self) -> None:
         super().__init__()
         self._buffers: dict[str, _TeamBuffer] = defaultdict(_TeamBuffer)
+        # Track last-seen season per team for reset detection
+        self._team_season: dict[str, str] = {}
 
     def parse_file(self, file_path: Path) -> list[dict]:
         rows = read_csv(file_path)
@@ -201,10 +208,27 @@ class NBAIngester(BaseIngester):
         home_team = self.resolve_name(row["home"].strip())
         away_team = self.resolve_name(row["away"].strip())
 
-        home_score = safe_int(row.get("score_home"))
-        away_score = safe_int(row.get("score_away"))
+        # Validate scores — skip rows with missing/empty scores (avoid phantom 0-0)
+        raw_home_score = (row.get("score_home") or "").strip()
+        raw_away_score = (row.get("score_away") or "").strip()
+        if not raw_home_score or not raw_away_score:
+            logger.debug("Skipping row with missing score: %s vs %s", home_team, away_team)
+            return 0
+
+        home_score = safe_int(raw_home_score)
+        away_score = safe_int(raw_away_score)
         home_won = home_score > away_score
         away_won = away_score > home_score
+
+        # ── Season-reset detection ────────────────────────────────────
+        # NBA season: Oct-Jun. Use CSV season column for reset detection.
+        season_key = _parse_season(row.get("season"), match_date)
+        for team in (home_team, away_team):
+            prev = self._team_season.get(team)
+            if prev is not None and prev != season_key:
+                self._buffers[team] = _TeamBuffer()
+                logger.debug("Season reset for %s: %s → %s", team, prev, season_key)
+            self._team_season[team] = season_key
 
         # Per-team match stats for buffer
         margin_home = home_score - away_score

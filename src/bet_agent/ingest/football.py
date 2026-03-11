@@ -178,6 +178,8 @@ class FootballIngester(BaseIngester):
         self._default_season = default_season
         # Per-team buffers keyed by canonical name
         self._buffers: dict[str, _TeamBuffer] = defaultdict(_TeamBuffer)
+        # Track last-seen season per team for reset detection
+        self._team_season: dict[str, str] = {}
 
     def parse_file(self, file_path: Path) -> list[dict]:
         rows = read_csv(file_path)
@@ -269,6 +271,16 @@ class FootballIngester(BaseIngester):
         # Map FTR → per-team result
         home_result = "W" if result_code == "H" else ("D" if result_code == "D" else "L")
         away_result = "W" if result_code == "A" else ("D" if result_code == "D" else "L")
+
+        # ── Season-reset detection ────────────────────────────────────
+        # Football seasons start ~July. Derive season key from match_date.
+        season_key = self._derive_season("", match_date)
+        for team in (home_team, away_team):
+            prev = self._team_season.get(team)
+            if prev is not None and prev != season_key:
+                self._buffers[team].reset_season()
+                logger.debug("Season reset for %s: %s → %s", team, prev, season_key)
+            self._team_season[team] = season_key
 
         # ── STEP 1: Snapshot profiles BEFORE this match (NO LEAKAGE) ──
         home_profile = self._buffers[home_team].snapshot()

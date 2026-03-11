@@ -167,7 +167,9 @@ def calculate_ml_pre_match_ev(
 
     # Build feature vector
     fv = build_feature_vector(session, sport, home_team, away_team, match_date)
-    feature_names = get_feature_names(sport)
+    # Use feature names from the trained model artifact (not static fallback)
+    # to ensure the feature vector matches what the model was trained on.
+    feature_names = artifact.feature_names or get_feature_names(sport)
 
     X = np.zeros((1, len(feature_names)))
     for j, fname in enumerate(feature_names):

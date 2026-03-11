@@ -220,7 +220,9 @@ def _try_ml_over_under(
         return []
 
     fv = build_feature_vector(session, match.sport, match.home_team, match.away_team, prediction_date)
-    feature_names = get_feature_names(match.sport)
+    # Use feature names from the trained model artifact (not static fallback)
+    # to ensure the feature vector matches what the model was trained on.
+    feature_names = artifact.feature_names or get_feature_names(match.sport)
     X = np.zeros((1, len(feature_names)))
     for j, fname in enumerate(feature_names):
         X[0, j] = fv.features.get(fname, 0.0)
