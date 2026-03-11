@@ -122,6 +122,7 @@ def start_crawl(
     seed_url: str | None = None,
     include_patterns: list[str] | None = None,
     max_pages: int | None = None,
+    depth: int = 2,
     render: bool = False,
 ) -> str:
     """Start an async crawl job on Cloudflare.
@@ -131,6 +132,7 @@ def start_crawl(
         seed_url: Override the default seed URL for this sport.
         include_patterns: Override URL include patterns.
         max_pages: Override max pages (capped at MAX_PAGES_PER_CRAWL).
+        depth: Max link-follow depth from seed URL (default 2).
         render: Whether to render JS (costs browser minutes). Default False.
 
     Returns:
@@ -156,8 +158,12 @@ def start_crawl(
 
     payload: dict = {
         "url": url,
-        "maxPages": pages,
+        "limit": pages,
+        "depth": depth,
         "render": render,
+        "formats": ["html"],
+        "source": "links",
+        "rejectResourceTypes": ["image", "media", "font"],
     }
     if patterns:
         payload["includePatterns"] = patterns
