@@ -48,6 +48,7 @@ class TestTableCreation:
             "model_metrics",
             "team_aliases",
             "team_daily_stats",
+            "historical_matches",
         }
         assert expected == set(tables)
 

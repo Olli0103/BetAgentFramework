@@ -1,7 +1,7 @@
 """SQLAlchemy ORM models for the BetAgent Multi-Agent System.
 
-7 tables: matches, odds_markets, bankroll_ledger, placed_bets,
-model_metrics, team_aliases, team_daily_stats.
+8 tables: matches, odds_markets, bankroll_ledger, placed_bets,
+model_metrics, team_aliases, team_daily_stats, historical_matches.
 """
 
 import enum
@@ -337,3 +337,79 @@ class TeamDailyStats(Base):
 
     def __repr__(self) -> str:
         return f"<TeamDailyStats {self.team_name} ({self.sport.value}) {self.stat_date}>"
+
+
+class HistoricalMatch(Base):
+    """Bulk-imported historical match data from CSV/XLSX/external sources.
+
+    Uses JSONB columns for sport-specific data to accommodate widely
+    different schemas across sports:
+      - football: shots, corners, cards, halftime scores + multi-book odds
+      - basketball: quarter scores, spread, total, moneylines
+      - ice_hockey: 120+ columns of rolling stats, Corsi, Fenwick, PP/PK
+      - american_football: detailed odds lines (open/min/max/close)
+      - tennis: set scores, rankings, surface, round + multi-book odds
+    """
+
+    __tablename__ = "historical_matches"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    sport: Mapped[Sport] = mapped_column(
+        Enum(Sport, native_enum=False), nullable=False, index=True
+    )
+    season: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    division: Mapped[str] = mapped_column(String(64), nullable=False)
+    match_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+
+    # Teams (for tennis: winner=home, loser=away)
+    home_team: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    away_team: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+
+    # Final result
+    home_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    away_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    result: Mapped[str] = mapped_column(String(8), nullable=False)  # H/D/A or W/L
+
+    # Sport-specific match stats (JSONB)
+    # football: {ht_home, ht_away, ht_result, home_shots, away_shots, ...}
+    # basketball: {q1_home, q2_home, ..., ot_home, regular, playoffs}
+    # ice_hockey: {shots, pp_goals, pp_opps, faceoff_pct, hits, ...}
+    # american_football: {overtime, playoff, neutral_venue}
+    # tennis: {surface, round, best_of, w1-w5, l1-l5, wsets, lsets, ...}
+    match_stats: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+    # Odds from multiple bookmakers (JSONB)
+    # football: {b365_home, b365_draw, b365_away, bw_home, ...}
+    # basketball: {moneyline_away, moneyline_home}
+    # tennis: {b365_winner, b365_loser, ps_winner, ps_loser, ...}
+    odds: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+    # Betting lines — spreads, totals, moneylines (JSONB)
+    # basketball: {spread, total, h2_spread, h2_total}
+    # ice_hockey: {spread, over_under, favorite_moneyline}
+    # american_football: {home_line_open/min/max/close, total_open/...}
+    betting_lines: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+    # Rolling/advanced stats — mainly NHL (JSONB)
+    # ice_hockey: {roll_3_*, roll_10_*, roll_30_*, opp_*, rest_days, ...}
+    # tennis: {winner_rank, loser_rank, winner_pts, loser_pts}
+    advanced_stats: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+    # Import metadata
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_file: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "sport", "home_team", "away_team", "match_date", "division",
+            name="uq_historical_match",
+        ),
+        Index("ix_hist_sport_date", "sport", "match_date"),
+        Index("ix_hist_season", "sport", "season"),
+    )
