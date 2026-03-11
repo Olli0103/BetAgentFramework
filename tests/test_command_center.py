@@ -511,8 +511,9 @@ class TestWhitelist:
         original = bot_mod.ALLOWED_IDS
         try:
             bot_mod.ALLOWED_IDS = {12345, 67890}
-            assert bot_mod.is_authorized(12345) is True
-            assert bot_mod.is_authorized(99999) is False
+            # Private DM: chat_id == user_id
+            assert bot_mod.is_authorized(12345, chat_id=12345) is True
+            assert bot_mod.is_authorized(99999, chat_id=99999) is False
         finally:
             bot_mod.ALLOWED_IDS = original
 
@@ -524,6 +525,75 @@ class TestWhitelist:
         try:
             bot_mod.ALLOWED_IDS = set()
             assert bot_mod.is_authorized(12345) is False
+        finally:
+            bot_mod.ALLOWED_IDS = original
+
+    def test_private_dm_allowed(self):
+        """Whitelisted user in a private DM (chat_id == user_id) is authorized."""
+        import bet_agent.interfaces.telegram_bot as bot_mod
+
+        original = bot_mod.ALLOWED_IDS
+        try:
+            bot_mod.ALLOWED_IDS = {12345}
+            assert bot_mod.is_authorized(12345, chat_id=12345) is True
+        finally:
+            bot_mod.ALLOWED_IDS = original
+
+    def test_official_group_allowed(self):
+        """Whitelisted user in the official syndicate group is authorized."""
+        import bet_agent.interfaces.telegram_bot as bot_mod
+
+        original_ids = bot_mod.ALLOWED_IDS
+        original_group = bot_mod.TELEGRAM_GROUP_ID
+        try:
+            bot_mod.ALLOWED_IDS = {12345}
+            bot_mod.TELEGRAM_GROUP_ID = "-100999888"
+            assert bot_mod.is_authorized(12345, chat_id=-100999888) is True
+        finally:
+            bot_mod.ALLOWED_IDS = original_ids
+            bot_mod.TELEGRAM_GROUP_ID = original_group
+
+    def test_random_group_blocked(self):
+        """Whitelisted user in a random public group is BLOCKED (syndicate leak fix)."""
+        import bet_agent.interfaces.telegram_bot as bot_mod
+
+        original_ids = bot_mod.ALLOWED_IDS
+        original_group = bot_mod.TELEGRAM_GROUP_ID
+        try:
+            bot_mod.ALLOWED_IDS = {12345}
+            bot_mod.TELEGRAM_GROUP_ID = "-100999888"
+            # User types /pnl in a random group — must be blocked!
+            assert bot_mod.is_authorized(12345, chat_id=-100777666) is False
+        finally:
+            bot_mod.ALLOWED_IDS = original_ids
+            bot_mod.TELEGRAM_GROUP_ID = original_group
+
+    def test_no_group_configured_blocks_all_groups(self):
+        """If no TELEGRAM_GROUP_ID is set, only private DMs work."""
+        import bet_agent.interfaces.telegram_bot as bot_mod
+
+        original_ids = bot_mod.ALLOWED_IDS
+        original_group = bot_mod.TELEGRAM_GROUP_ID
+        try:
+            bot_mod.ALLOWED_IDS = {12345}
+            bot_mod.TELEGRAM_GROUP_ID = ""
+            # Any group → blocked
+            assert bot_mod.is_authorized(12345, chat_id=-100777666) is False
+            # Private DM → allowed
+            assert bot_mod.is_authorized(12345, chat_id=12345) is True
+        finally:
+            bot_mod.ALLOWED_IDS = original_ids
+            bot_mod.TELEGRAM_GROUP_ID = original_group
+
+    def test_backwards_compat_no_chat_id(self):
+        """If chat_id is not provided, fall back to user-only check."""
+        import bet_agent.interfaces.telegram_bot as bot_mod
+
+        original = bot_mod.ALLOWED_IDS
+        try:
+            bot_mod.ALLOWED_IDS = {12345}
+            assert bot_mod.is_authorized(12345) is True
+            assert bot_mod.is_authorized(99999) is False
         finally:
             bot_mod.ALLOWED_IDS = original
 

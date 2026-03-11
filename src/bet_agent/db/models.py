@@ -10,6 +10,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     Date,
     DateTime,
@@ -22,8 +23,12 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSON, UUID
+from sqlalchemy.dialects.postgresql import JSONB as PG_JSONB
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+# Use JSONB on PostgreSQL (binary, indexable) with JSON fallback on SQLite (tests).
+JSONB = JSON().with_variant(PG_JSONB, "postgresql")
 
 
 class Base(DeclarativeBase):
@@ -116,7 +121,7 @@ class Match(Base):
     match_period: Mapped[str | None] = mapped_column(String(32), nullable=True)
     home_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     away_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    live_stats: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    live_stats: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(
@@ -320,7 +325,7 @@ class TeamDailyStats(Base):
     stat_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
 
     # Sport-specific stats stored as JSONB for flexibility
-    stats: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    stats: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
     # Crawl metadata
     source_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -385,24 +390,24 @@ class HistoricalMatch(Base):
     # ice_hockey: {shots, pp_goals, pp_opps, faceoff_pct, hits, ...}
     # american_football: {overtime, playoff, neutral_venue}
     # tennis: {surface, round, best_of, w1-w5, l1-l5, wsets, lsets, ...}
-    match_stats: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    match_stats: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
     # Odds from multiple bookmakers (JSONB)
     # football: {b365_home, b365_draw, b365_away, bw_home, ...}
     # basketball: {moneyline_away, moneyline_home}
     # tennis: {b365_winner, b365_loser, ps_winner, ps_loser, ...}
-    odds: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    odds: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
     # Betting lines — spreads, totals, moneylines (JSONB)
     # basketball: {spread, total, h2_spread, h2_total}
     # ice_hockey: {spread, over_under, favorite_moneyline}
     # american_football: {home_line_open/min/max/close, total_open/...}
-    betting_lines: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    betting_lines: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
     # Rolling/advanced stats — mainly NHL (JSONB)
     # ice_hockey: {roll_3_*, roll_10_*, roll_30_*, opp_*, rest_days, ...}
     # tennis: {winner_rank, loser_rank, winner_pts, loser_pts}
-    advanced_stats: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    advanced_stats: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
     # Import metadata
     source: Mapped[str] = mapped_column(String(64), nullable=False)

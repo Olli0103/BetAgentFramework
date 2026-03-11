@@ -11,6 +11,7 @@ All members of the syndicate can interact with the system via:
 
 Security:
   - ALLOWED_TELEGRAM_IDS from .env enforces strict whitelist
+  - Chat context validation: only private DMs or the official TELEGRAM_GROUP_ID
   - Unauthorized users are blocked silently (logged for audit)
   - All interactions are logged with user identification
 
@@ -25,6 +26,7 @@ Env vars required:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timezone
@@ -60,16 +62,58 @@ ALLOWED_IDS: set[int] = parse_allowed_ids(ALLOWED_TELEGRAM_IDS_RAW)
 # ── Whitelist enforcement ────────────────────────────────────────────
 
 
-def is_authorized(user_id: int) -> bool:
-    """Check if a Telegram user is whitelisted.
+def is_authorized(user_id: int, chat_id: int | None = None) -> bool:
+    """Check if a Telegram interaction is authorized.
 
-    The Door-man: strict whitelist check. If ALLOWED_TELEGRAM_IDS is
-    empty, NO ONE is authorized (fail-closed, not fail-open).
+    The Door-man enforces TWO layers:
+      1. User whitelist — is the sender on ALLOWED_TELEGRAM_IDS?
+      2. Chat context   — is this a private DM or the official syndicate group?
+
+    If a whitelisted user types /pnl in a random public group, the bot
+    stays silent to prevent leaking fund data to strangers.
+
+    Args:
+        user_id: The Telegram user ID of the sender.
+        chat_id: The Telegram chat ID where the message was sent.
+                 If None, only user whitelist is checked (backwards compat).
     """
     if not ALLOWED_IDS:
         logger.warning("ALLOWED_TELEGRAM_IDS is empty — all access denied")
         return False
-    return user_id in ALLOWED_IDS
+
+    if user_id not in ALLOWED_IDS:
+        return False
+
+    # If no chat context provided, fall back to user-only check
+    if chat_id is None:
+        return True
+
+    # Private DM: chat_id == user_id (always allowed for whitelisted users)
+    if chat_id == user_id:
+        return True
+
+    # Group chat: only the official syndicate group is allowed
+    group_id = _parse_group_id()
+    if group_id is not None and chat_id == group_id:
+        return True
+
+    # Any other chat (random groups, channels) → BLOCK
+    logger.warning(
+        "Whitelisted user_id=%d attempted command in unauthorized chat_id=%d",
+        user_id, chat_id,
+    )
+    return False
+
+
+def _parse_group_id() -> int | None:
+    """Parse TELEGRAM_GROUP_ID into an int, returning None if not set."""
+    raw = TELEGRAM_GROUP_ID.strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 def get_user_display_name(user) -> str:
@@ -97,6 +141,70 @@ def _get_session():
 
     engine = create_engine(db_url, echo=False, pool_pre_ping=True)
     return sessionmaker(bind=engine)()
+
+
+# ── Sync DB wrappers (run in thread to avoid blocking event loop) ────
+
+
+def _sync_fetch_status():
+    """Synchronous: fetch portfolio summary and format text."""
+    from bet_agent.tools.master_analysis import (
+        fetch_portfolio_summary,
+        format_portfolio_text,
+    )
+    sess = _get_session()
+    try:
+        summary = fetch_portfolio_summary(sess)
+        return format_portfolio_text(summary)
+    finally:
+        sess.close()
+
+
+def _sync_fetch_pending():
+    """Synchronous: fetch pending bets and format text."""
+    from bet_agent.tools.master_analysis import (
+        fetch_pending_for_human,
+        format_pending_text,
+    )
+    sess = _get_session()
+    try:
+        pending = fetch_pending_for_human(sess)
+        return format_pending_text(pending)
+    finally:
+        sess.close()
+
+
+def _sync_fetch_pnl():
+    """Synchronous: fetch PnL and format text."""
+    from bet_agent.tools.master_analysis import format_pnl_text
+    sess = _get_session()
+    try:
+        return format_pnl_text(sess)
+    finally:
+        sess.close()
+
+
+def _sync_fetch_health():
+    """Synchronous: fetch model health reports."""
+    from bet_agent.tools.master_analysis import fetch_model_health
+    sess = _get_session()
+    try:
+        return fetch_model_health(sess)
+    finally:
+        sess.close()
+
+
+def _sync_place_bet(bet_id: str, user_name: str):
+    """Synchronous: mark bet as placed and commit."""
+    from bet_agent.tools.master_analysis import mark_bet_placed_by_user
+    sess = _get_session()
+    try:
+        result = mark_bet_placed_by_user(sess, bet_id, user_name)
+        if result.get("success"):
+            sess.commit()
+        return result
+    finally:
+        sess.close()
 
 
 # ── Master Agent bridge (NL routing) ────────────────────────────────
@@ -134,14 +242,24 @@ def set_master_bridge(bridge: MasterAgentBridge) -> None:
     _master_bridge = bridge
 
 
+# ── Auth helper for handlers ─────────────────────────────────────────
+
+
+def _check_auth(update) -> bool:
+    """Check user + chat authorization from an Update object."""
+    user = update.effective_user
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    return is_authorized(user.id, chat_id)
+
+
 # ── Command handlers ─────────────────────────────────────────────────
 
 
 async def cmd_start(update, context) -> None:
     """Handle /start — welcome message."""
-    user = update.effective_user
-    if not is_authorized(user.id):
-        logger.warning("Unauthorized /start from user_id=%d", user.id)
+    if not _check_auth(update):
+        logger.warning("Unauthorized /start from user_id=%d", update.effective_user.id)
         return  # Silent block
 
     await update.message.reply_text(
@@ -158,22 +276,12 @@ async def cmd_start(update, context) -> None:
 
 async def cmd_status(update, context) -> None:
     """Handle /status — daily portfolio summary."""
-    user = update.effective_user
-    if not is_authorized(user.id):
-        logger.warning("Unauthorized /status from user_id=%d", user.id)
+    if not _check_auth(update):
+        logger.warning("Unauthorized /status from user_id=%d", update.effective_user.id)
         return
 
     try:
-        sess = _get_session()
-        from bet_agent.tools.master_analysis import (
-            fetch_portfolio_summary,
-            format_portfolio_text,
-        )
-
-        summary = fetch_portfolio_summary(sess)
-        text = format_portfolio_text(summary)
-        sess.close()
-
+        text = await asyncio.to_thread(_sync_fetch_status)
         await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
     except Exception as e:
         logger.error("Error in /status: %s", e)
@@ -182,21 +290,11 @@ async def cmd_status(update, context) -> None:
 
 async def cmd_pending(update, context) -> None:
     """Handle /pending — bets waiting for human execution."""
-    user = update.effective_user
-    if not is_authorized(user.id):
+    if not _check_auth(update):
         return
 
     try:
-        sess = _get_session()
-        from bet_agent.tools.master_analysis import (
-            fetch_pending_for_human,
-            format_pending_text,
-        )
-
-        pending = fetch_pending_for_human(sess)
-        text = format_pending_text(pending)
-        sess.close()
-
+        text = await asyncio.to_thread(_sync_fetch_pending)
         await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
     except Exception as e:
         logger.error("Error in /pending: %s", e)
@@ -205,17 +303,11 @@ async def cmd_pending(update, context) -> None:
 
 async def cmd_pnl(update, context) -> None:
     """Handle /pnl — current balance and P&L."""
-    user = update.effective_user
-    if not is_authorized(user.id):
+    if not _check_auth(update):
         return
 
     try:
-        sess = _get_session()
-        from bet_agent.tools.master_analysis import format_pnl_text
-
-        text = format_pnl_text(sess)
-        sess.close()
-
+        text = await asyncio.to_thread(_sync_fetch_pnl)
         await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
     except Exception as e:
         logger.error("Error in /pnl: %s", e)
@@ -224,16 +316,11 @@ async def cmd_pnl(update, context) -> None:
 
 async def cmd_health(update, context) -> None:
     """Handle /health — model health overview."""
-    user = update.effective_user
-    if not is_authorized(user.id):
+    if not _check_auth(update):
         return
 
     try:
-        sess = _get_session()
-        from bet_agent.tools.master_analysis import fetch_model_health
-
-        reports = fetch_model_health(sess)
-        sess.close()
+        reports = await asyncio.to_thread(_sync_fetch_health)
 
         if not reports:
             await update.message.reply_text("No model metrics available yet.")
@@ -264,10 +351,10 @@ async def cmd_placed(update, context) -> None:
     When a syndicate member places a bet on a sportsbook, they trigger
     this command. The bot updates the DB and broadcasts to the team.
     """
-    user = update.effective_user
-    if not is_authorized(user.id):
+    if not _check_auth(update):
         return
 
+    user = update.effective_user
     args = context.args if context.args else []
     if not args:
         await update.message.reply_text(
@@ -280,18 +367,11 @@ async def cmd_placed(update, context) -> None:
     user_name = get_user_display_name(user)
 
     try:
-        sess = _get_session()
-        from bet_agent.tools.master_analysis import mark_bet_placed_by_user
-
-        result = mark_bet_placed_by_user(sess, bet_id, user_name)
+        result = await asyncio.to_thread(_sync_place_bet, bet_id, user_name)
 
         if "error" in result:
-            sess.close()
             await update.message.reply_text(f"Error: {result['error']}")
             return
-
-        sess.commit()
-        sess.close()
 
         # Confirmation to the user who placed
         await update.message.reply_text(
@@ -341,11 +421,12 @@ async def cmd_placed(update, context) -> None:
 
 async def handle_message(update, context) -> None:
     """Handle free-text messages — route to Master Agent via NL bridge."""
-    user = update.effective_user
-    if not is_authorized(user.id):
+    if not _check_auth(update):
+        user = update.effective_user
         logger.warning(
-            "Unauthorized message from user_id=%d: %s",
-            user.id, (update.message.text or "")[:50],
+            "Unauthorized message from user_id=%d in chat_id=%d: %s",
+            user.id, update.effective_chat.id if update.effective_chat else 0,
+            (update.message.text or "")[:50],
         )
         return  # Silent block
 
@@ -353,12 +434,13 @@ async def handle_message(update, context) -> None:
     if not text:
         return
 
+    user = update.effective_user
     user_name = get_user_display_name(user)
     logger.info("NL query from %s (id=%d): %s", user_name, user.id, text[:100])
 
-    # Route to Master Agent
+    # Route to Master Agent (bridge.query may be slow — run in thread)
     try:
-        response = _master_bridge.query(text, user_name)
+        response = await asyncio.to_thread(_master_bridge.query, text, user_name)
         await update.message.reply_text(response)
     except Exception as e:
         logger.error("Master Agent bridge error: %s", e)
