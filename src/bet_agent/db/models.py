@@ -1,0 +1,236 @@
+"""SQLAlchemy ORM models for the BetAgent Multi-Agent System.
+
+6 tables: matches, odds_markets, bankroll_ledger, placed_bets,
+model_metrics, team_aliases.
+"""
+
+import enum
+import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import (
+    Boolean,
+    Date,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+)
+from sqlalchemy.dialects.postgresql import JSON, UUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+# ── Enums ──────────────────────────────────────────────────────────────
+
+
+class Sport(str, enum.Enum):
+    FOOTBALL = "football"
+    TENNIS = "tennis"
+    ICE_HOCKEY = "ice_hockey"
+    BASKETBALL = "basketball"
+    DARTS = "darts"
+    AMERICAN_FOOTBALL = "american_football"
+
+
+class MarketType(str, enum.Enum):
+    MATCH_WINNER = "match_winner"
+    OVER_UNDER = "over_under"
+    BTTS = "btts"
+    SPREAD = "spread"
+
+
+class LedgerType(str, enum.Enum):
+    REAL = "real"
+    PAPER = "paper"
+
+
+class BetStatus(str, enum.Enum):
+    PENDING = "pending"
+    WON = "won"
+    LOST = "lost"
+    VOID = "void"
+    PUSHED_TO_HUMAN = "pushed_to_human"
+
+
+# ── Helpers ────────────────────────────────────────────────────────────
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _new_uuid() -> uuid.UUID:
+    return uuid.uuid4()
+
+
+# ── Tables ─────────────────────────────────────────────────────────────
+
+
+class Match(Base):
+    """A sporting event (pre-match or live)."""
+
+    __tablename__ = "matches"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    sport: Mapped[Sport] = mapped_column(Enum(Sport, native_enum=False), nullable=False)
+    league: Mapped[str] = mapped_column(String(128), nullable=False)
+    home_team: Mapped[str] = mapped_column(String(128), nullable=False)
+    away_team: Mapped[str] = mapped_column(String(128), nullable=False)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # Live state
+    is_live: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    match_state: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, default="not_started"
+    )
+    match_period: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    home_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    away_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    live_stats: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    # Relationships
+    odds: Mapped[list["OddsMarket"]] = relationship(back_populates="match")
+    bets: Mapped[list["PlacedBet"]] = relationship(back_populates="match")
+
+
+class OddsMarket(Base):
+    """Scraped odds from a sportsbook for a specific market."""
+
+    __tablename__ = "odds_markets"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    match_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("matches.id"), nullable=False
+    )
+    sportsbook: Mapped[str] = mapped_column(String(64), nullable=False)
+    market_type: Mapped[MarketType] = mapped_column(
+        Enum(MarketType, native_enum=False), nullable=False
+    )
+    selection: Mapped[str] = mapped_column(String(64), nullable=False)
+    odds_decimal: Mapped[float] = mapped_column(Float, nullable=False)
+    is_live: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    scraped_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    # Relationships
+    match: Mapped["Match"] = relationship(back_populates="odds")
+
+
+class BankrollLedger(Base):
+    """Current bankroll balance for Real and Paper trading."""
+
+    __tablename__ = "bankroll_ledger"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    ledger_type: Mapped[LedgerType] = mapped_column(
+        Enum(LedgerType, native_enum=False), nullable=False, unique=True
+    )
+    balance: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    last_updated: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class PlacedBet(Base):
+    """A bet placed (or pushed to human) by the system."""
+
+    __tablename__ = "placed_bets"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    ledger_type: Mapped[LedgerType] = mapped_column(
+        Enum(LedgerType, native_enum=False), nullable=False
+    )
+    match_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("matches.id"), nullable=False
+    )
+    market_type: Mapped[MarketType] = mapped_column(
+        Enum(MarketType, native_enum=False), nullable=False
+    )
+    selection: Mapped[str] = mapped_column(String(64), nullable=False)
+    odds_at_placement: Mapped[float] = mapped_column(Float, nullable=False)
+    stake_eur: Mapped[float] = mapped_column(Float, nullable=False)
+    model_prob: Mapped[float] = mapped_column(Float, nullable=False)
+    ev_at_placement: Mapped[float] = mapped_column(Float, nullable=False)
+
+    # Parlay support
+    is_parlay: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    parlay_group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+
+    # Status & resolution
+    status: Mapped[BetStatus] = mapped_column(
+        Enum(BetStatus, native_enum=False), default=BetStatus.PENDING, nullable=False
+    )
+    is_live_bet: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    placed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    pnl_eur: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Relationships
+    match: Mapped["Match"] = relationship(back_populates="bets")
+
+
+class ModelMetrics(Base):
+    """Daily evaluation metrics for each prediction model."""
+
+    __tablename__ = "model_metrics"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    model_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    date: Mapped[datetime] = mapped_column(Date, nullable=False)
+    brier_score: Mapped[float] = mapped_column(Float, nullable=False)
+    roi_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    total_bets: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    record_win: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    record_loss: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    ledger_type: Mapped[LedgerType] = mapped_column(
+        Enum(LedgerType, native_enum=False), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("model_name", "date", "ledger_type", name="uq_model_date_ledger"),
+    )
+
+
+class TeamAlias(Base):
+    """Fuzzy name resolution: maps sportsbook-specific names to canonical names."""
+
+    __tablename__ = "team_aliases"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    canonical_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    alias: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
