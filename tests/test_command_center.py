@@ -396,19 +396,85 @@ class TestFetchPending:
 
 
 class TestMarkBetPlaced:
-    """Tests for mark_bet_placed_by_user (syndicate /placed command)."""
+    """Tests for mark_bet_placed_by_user (syndicate /placed command).
 
-    def test_marks_pending_bet(self, db_session):
+    The updated /placed flow captures actual odds/stake from the sportsbook,
+    recalculates EV, deducts stake from bankroll, and warns on -EV.
+    """
+
+    def test_marks_pending_bet_with_actual_values(self, db_session):
         from bet_agent.tools.master_analysis import mark_bet_placed_by_user
 
         match = _add_match(db_session)
-        bet = _add_bet(db_session, match, status=BetStatus.PENDING)
+        bet = _add_bet(db_session, match, status=BetStatus.PENDING,
+                       odds=Decimal("2.10"), stake=Decimal("10.00"))
+        _add_bankroll(db_session, LedgerType.REAL, Decimal("1000.00"))
 
-        result = mark_bet_placed_by_user(db_session, str(bet.id), "@olli")
+        result = mark_bet_placed_by_user(
+            db_session, str(bet.id), "@olli",
+            actual_odds=2.05, actual_stake=12.00,
+        )
 
         assert result.get("success") is True
         assert result["placed_by"] == "@olli"
+        assert result["odds"] == 2.05  # Actual odds stored
+        assert result["stake_eur"] == 12.00  # Actual stake stored
+        assert result["original_odds"] == 2.10  # Original for comparison
         assert bet.status == BetStatus.PUSHED_TO_HUMAN
+        assert float(bet.odds_at_placement) == 2.05
+        assert float(bet.stake_eur) == 12.00
+
+    def test_bankroll_deducted_on_placement(self, db_session):
+        from bet_agent.tools.master_analysis import mark_bet_placed_by_user
+
+        match = _add_match(db_session)
+        bet = _add_bet(db_session, match, status=BetStatus.PENDING, stake=Decimal("50.00"))
+        ledger = _add_bankroll(db_session, LedgerType.REAL, Decimal("1000.00"))
+
+        mark_bet_placed_by_user(
+            db_session, str(bet.id), "@olli",
+            actual_odds=2.10, actual_stake=50.00,
+        )
+        db_session.flush()
+
+        assert ledger.balance == Decimal("950.00")  # 1000 - 50
+
+    def test_warns_on_negative_ev(self, db_session):
+        from bet_agent.tools.master_analysis import mark_bet_placed_by_user
+
+        match = _add_match(db_session)
+        # model_prob=0.55, original odds=2.10 → EV = 0.55*(2.10-1) - 0.45 = +0.155
+        bet = _add_bet(db_session, match, status=BetStatus.PENDING,
+                       odds=Decimal("2.10"), model_prob=Decimal("0.55"))
+        _add_bankroll(db_session, LedgerType.REAL, Decimal("1000.00"))
+
+        # Odds dropped to 1.50 → EV = 0.55*(1.50-1) - 0.45 = -0.175 → NEGATIVE
+        result = mark_bet_placed_by_user(
+            db_session, str(bet.id), "@olli",
+            actual_odds=1.50, actual_stake=10.00,
+        )
+
+        assert result.get("success") is True
+        assert result["ev"] < 0  # Negative EV!
+        assert len(result["warnings"]) > 0
+        assert "NEGATIVE EV" in result["warnings"][0]
+
+    def test_no_warnings_on_positive_ev(self, db_session):
+        from bet_agent.tools.master_analysis import mark_bet_placed_by_user
+
+        match = _add_match(db_session)
+        bet = _add_bet(db_session, match, status=BetStatus.PENDING,
+                       odds=Decimal("2.10"), model_prob=Decimal("0.55"))
+        _add_bankroll(db_session, LedgerType.REAL, Decimal("1000.00"))
+
+        result = mark_bet_placed_by_user(
+            db_session, str(bet.id), "@olli",
+            actual_odds=2.10, actual_stake=10.00,
+        )
+
+        assert result.get("success") is True
+        assert result["ev"] > 0
+        assert len(result["warnings"]) == 0
 
     def test_rejects_already_settled(self, db_session):
         from bet_agent.tools.master_analysis import mark_bet_placed_by_user
@@ -430,6 +496,51 @@ class TestMarkBetPlaced:
 
         result = mark_bet_placed_by_user(db_session, str(uuid.uuid4()), "@olli")
         assert "error" in result
+
+
+class TestExpiryStaleBets:
+    """Tests for expire_stale_bets (auto-void old PENDING tickets)."""
+
+    def test_expires_old_pending_bet(self, db_session):
+        from bet_agent.tools.settlement_engine import expire_stale_bets
+
+        match = _add_match(db_session)
+        bet = _add_bet(db_session, match, status=BetStatus.PENDING, stake=Decimal("25.00"))
+        ledger = _add_bankroll(db_session, LedgerType.REAL, Decimal("975.00"))
+
+        # Fake the placed_at to 2 hours ago
+        bet.placed_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        db_session.flush()
+
+        expired = expire_stale_bets(db_session, max_age_minutes=60)
+
+        assert len(expired) == 1
+        assert expired[0]["bet_id"] == str(bet.id)
+        assert bet.status == BetStatus.VOID
+        assert bet.pnl_eur == Decimal("0.00")
+        # Stake refunded
+        assert ledger.balance == Decimal("1000.00")  # 975 + 25 refund
+
+    def test_does_not_expire_fresh_bets(self, db_session):
+        from bet_agent.tools.settlement_engine import expire_stale_bets
+
+        match = _add_match(db_session)
+        _add_bet(db_session, match, status=BetStatus.PENDING)
+        _add_bankroll(db_session)
+
+        expired = expire_stale_bets(db_session, max_age_minutes=60)
+        assert len(expired) == 0
+
+    def test_does_not_expire_settled_bets(self, db_session):
+        from bet_agent.tools.settlement_engine import expire_stale_bets
+
+        match = _add_match(db_session)
+        bet = _add_bet(db_session, match, status=BetStatus.WON, pnl=Decimal("10.00"))
+        bet.placed_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        db_session.flush()
+
+        expired = expire_stale_bets(db_session, max_age_minutes=60)
+        assert len(expired) == 0
 
 
 class TestFormatting:

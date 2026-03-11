@@ -239,7 +239,9 @@ def update_bankroll(
       - VOID: balance += stake          (refund)
     """
     ledger = session.execute(
-        select(BankrollLedger).where(BankrollLedger.ledger_type == ledger_type)
+        select(BankrollLedger)
+        .where(BankrollLedger.ledger_type == ledger_type)
+        .with_for_update()
     ).scalar_one_or_none()
 
     if ledger is None:
@@ -304,6 +306,66 @@ def settle_bet(
         pnl_eur=net,
         reason=f"{bet.selection} vs score {match.home_score}-{match.away_score}",
     )
+
+
+def expire_stale_bets(
+    session: Session,
+    max_age_minutes: int = 60,
+) -> list[dict]:
+    """Expire PENDING bets that are older than max_age_minutes.
+
+    When the HitL doesn't place a bet within the window, the line has
+    likely moved and the edge is gone.  We VOID these bets and refund
+    the stake that was deducted at placement time.
+
+    Args:
+        session: SQLAlchemy session.
+        max_age_minutes: How long a PENDING bet can sit before expiry.
+
+    Returns:
+        List of dicts describing each expired bet (for Telegram alerts).
+    """
+    cutoff = datetime.now(timezone.utc) - __import__("datetime").timedelta(minutes=max_age_minutes)
+
+    stale = list(
+        session.execute(
+            select(PlacedBet).where(
+                PlacedBet.status == BetStatus.PENDING,
+                PlacedBet.placed_at <= cutoff,
+            )
+        ).scalars().all()
+    )
+
+    if not stale:
+        return []
+
+    expired: list[dict] = []
+    for bet in stale:
+        # Refund the stake that was deducted at placement
+        update_bankroll(session, bet.ledger_type, bet.stake_eur)
+
+        bet.status = BetStatus.VOID
+        bet.pnl_eur = Decimal("0.00")
+        bet.resolved_at = datetime.now(timezone.utc)
+
+        match = bet.match if bet.match else session.get(Match, bet.match_id)
+        match_desc = f"{match.home_team} vs {match.away_team}" if match else "Unknown"
+
+        expired.append({
+            "bet_id": str(bet.id),
+            "match": match_desc,
+            "selection": bet.selection,
+            "stake_eur": float(bet.stake_eur),
+            "age_minutes": int((datetime.now(timezone.utc) - bet.placed_at).total_seconds() / 60),
+        })
+
+        logger.info(
+            "Expired stale bet %s (%s) — edge likely gone after %d minutes",
+            bet.id, match_desc, expired[-1]["age_minutes"],
+        )
+
+    session.flush()
+    return expired
 
 
 def settle_finished_matches(

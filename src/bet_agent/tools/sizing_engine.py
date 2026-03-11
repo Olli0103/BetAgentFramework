@@ -278,7 +278,9 @@ def deduct_stake_on_placement(
         New bankroll balance after deduction.
     """
     ledger = session.execute(
-        select(BankrollLedger).where(BankrollLedger.ledger_type == ledger_type)
+        select(BankrollLedger)
+        .where(BankrollLedger.ledger_type == ledger_type)
+        .with_for_update()
     ).scalar_one_or_none()
 
     if ledger is None:

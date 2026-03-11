@@ -170,12 +170,21 @@ def _sync_fetch_health():
         return fetch_model_health(sess)
 
 
-def _sync_place_bet(bet_id: str, user_name: str):
-    """Synchronous: mark bet as placed and commit."""
+def _sync_place_bet(
+    bet_id: str,
+    user_name: str,
+    actual_odds: float | None = None,
+    actual_stake: float | None = None,
+):
+    """Synchronous: mark bet as placed with actual sportsbook values."""
     from bet_agent.db.session import get_session
     from bet_agent.tools.master_analysis import mark_bet_placed_by_user
     with get_session() as sess:
-        result = mark_bet_placed_by_user(sess, bet_id, user_name)
+        result = mark_bet_placed_by_user(
+            sess, bet_id, user_name,
+            actual_odds=actual_odds,
+            actual_stake=actual_stake,
+        )
         # get_session() auto-commits on success
         return result
 
@@ -241,7 +250,7 @@ async def cmd_start(update, context) -> None:
         "/status  — Portfolio summary\n"
         "/pending — Bets awaiting execution\n"
         "/pnl     — Balance & P&L\n"
-        "/placed <bet_id> — Confirm bet placement\n"
+        "/placed <id> <odds> <stake> — Confirm placement\n"
         "/health  — Model health overview\n\n"
         "Or just type a question in natural language."
     )
@@ -319,41 +328,84 @@ async def cmd_health(update, context) -> None:
 
 
 async def cmd_placed(update, context) -> None:
-    """Handle /placed <bet_id> — confirm manual bet placement.
+    """Handle /placed <bet_id> <actual_odds> <actual_stake> — confirm manual bet placement.
 
-    When a syndicate member places a bet on a sportsbook, they trigger
-    this command. The bot updates the DB and broadcasts to the team.
+    The human MUST provide the actual odds and stake obtained at the
+    sportsbook. The system recalculates EV on the real numbers, warns
+    on -EV, and deducts the actual stake from the bankroll ledger.
     """
     if not _check_auth(update):
         return
 
     user = update.effective_user
     args = context.args if context.args else []
-    if not args:
+    if len(args) < 3:
         await update.message.reply_text(
-            "Usage: /placed <bet_id>\n\n"
+            "Usage: /placed <bet_id> <actual_odds> <actual_stake>\n\n"
+            "Example: /placed 1234abcd 1.85 45.00\n\n"
+            "You MUST provide the real odds and stake from the sportsbook.\n"
             "Use /pending to see available bet IDs."
         )
         return
 
     bet_id = args[0]
+
+    # Parse actual odds and stake
+    try:
+        actual_odds = float(args[1])
+    except ValueError:
+        await update.message.reply_text(f"Invalid odds: {args[1]} — must be a number (e.g. 1.85)")
+        return
+
+    try:
+        actual_stake = float(args[2])
+    except ValueError:
+        await update.message.reply_text(f"Invalid stake: {args[2]} — must be a number (e.g. 45.00)")
+        return
+
+    if actual_odds <= 1.0:
+        await update.message.reply_text("Odds must be > 1.00")
+        return
+    if actual_stake <= 0:
+        await update.message.reply_text("Stake must be > 0")
+        return
+
     user_name = get_user_display_name(user)
 
     try:
-        result = await asyncio.to_thread(_sync_place_bet, bet_id, user_name)
+        result = await asyncio.to_thread(
+            _sync_place_bet, bet_id, user_name, actual_odds, actual_stake,
+        )
 
         if "error" in result:
             await update.message.reply_text(f"Error: {result['error']}")
             return
 
-        # Confirmation to the user who placed
-        await update.message.reply_text(
-            f"\u2705 Bet confirmed as placed!\n\n"
-            f"Match: {result['match']}\n"
-            f"Selection: {result['selection']}\n"
-            f"Stake: {result['stake_eur']:.2f} EUR @ {result['odds']:.2f}\n"
-            f"Placed by: {user_name}"
-        )
+        # Build confirmation message
+        ev_str = f"{result['ev']:+.4f}"
+        ev_emoji = "\u2705" if result["ev"] >= 0 else "\u26a0\ufe0f"
+        lines = [
+            f"{ev_emoji} Bet confirmed as placed!",
+            "",
+            f"Match: {result['match']}",
+            f"Selection: {result['selection']}",
+            f"Stake: {result['stake_eur']:.2f} EUR @ {result['odds']:.2f}",
+            f"EV at actual odds: {ev_str}",
+            f"Placed by: {user_name}",
+        ]
+
+        # Show slippage if odds changed
+        if result.get("original_odds") and abs(result["odds"] - result["original_odds"]) > 0.001:
+            lines.append(
+                f"\nOriginal model odds: {result['original_odds']:.2f} "
+                f"-> Actual: {result['odds']:.2f}"
+            )
+
+        # Append warnings
+        for warning in result.get("warnings", []):
+            lines.append(f"\n\u26a0\ufe0f {warning}")
+
+        await update.message.reply_text("\n".join(lines))
 
         # Broadcast to the group (if configured)
         if TELEGRAM_GROUP_ID and context.bot:
@@ -362,6 +414,7 @@ async def cmd_placed(update, context) -> None:
                 f"Match: {result['match']}\n"
                 f"Selection: {result['selection']}\n"
                 f"Stake: {result['stake_eur']:.2f} EUR @ {result['odds']:.2f}\n"
+                f"EV: {ev_str}\n"
                 f"ID: {bet_id[:8]}..."
             )
             try:
@@ -381,7 +434,8 @@ async def cmd_placed(update, context) -> None:
                         text=(
                             f"\U0001f4e2 {user_name} placed: "
                             f"{result['match']} — {result['selection']} "
-                            f"@ {result['odds']:.2f} ({result['stake_eur']:.2f} EUR)"
+                            f"@ {result['odds']:.2f} ({result['stake_eur']:.2f} EUR) "
+                            f"EV: {ev_str}"
                         ),
                     )
                 except Exception:

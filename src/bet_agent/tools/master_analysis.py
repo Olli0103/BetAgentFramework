@@ -527,11 +527,25 @@ def mark_bet_placed_by_user(
     session: Session,
     bet_id: str,
     placed_by: str,
+    actual_odds: float | None = None,
+    actual_stake: float | None = None,
 ) -> dict:
     """Mark a pending bet as placed by a syndicate member.
 
-    Updates status to PUSHED_TO_HUMAN (confirming manual execution).
-    Returns a dict with the bet details for broadcasting.
+    Captures the ACTUAL odds and stake from the sportsbook (which may differ
+    from the model's original values due to line movement or manual sizing).
+    Recalculates EV on the actual odds and warns if the bet is now -EV.
+    Deducts the actual stake from the bankroll ledger.
+
+    Args:
+        session: SQLAlchemy session.
+        bet_id: UUID string of the bet.
+        placed_by: Display name of the person who placed.
+        actual_odds: The real odds obtained at the sportsbook.
+        actual_stake: The real stake placed (EUR).
+
+    Returns:
+        Dict with bet details, EV assessment, and any warnings.
     """
     import uuid as _uuid
     try:
@@ -543,14 +557,49 @@ def mark_bet_placed_by_user(
     if bet is None:
         return {"error": f"Bet {bet_id} not found"}
 
-    if bet.status != BetStatus.PENDING:
+    if bet.status not in (BetStatus.PENDING, BetStatus.PUSHED_TO_HUMAN):
         return {"error": f"Bet {bet_id} is already {bet.status.value}"}
 
+    # Capture original values for comparison
+    original_odds = float(bet.odds_at_placement)
+    original_stake = float(bet.stake_eur)
+
+    # Override with actual values from the sportsbook
+    if actual_odds is not None:
+        bet.odds_at_placement = Decimal(str(actual_odds))
+    if actual_stake is not None:
+        bet.stake_eur = Decimal(str(actual_stake))
+
+    # Recalculate EV on the actual odds
+    model_prob = float(bet.model_prob)
+    used_odds = float(bet.odds_at_placement)
+    new_ev = (model_prob * (used_odds - 1.0)) - (1.0 - model_prob)
+    bet.ev_at_placement = Decimal(str(round(new_ev, 6)))
+
+    # Deduct actual stake from bankroll
+    from bet_agent.tools.sizing_engine import deduct_stake_on_placement
+    deduct_stake_on_placement(session, bet.stake_eur, bet.ledger_type)
+
+    # Mark as placed
     bet.status = BetStatus.PUSHED_TO_HUMAN
     session.flush()
 
     match = bet.match if bet.match else session.get(Match, bet.match_id)
     match_desc = f"{match.home_team} vs {match.away_team}" if match else "Unknown"
+
+    # Build warnings
+    warnings = []
+    if new_ev < 0:
+        warnings.append(
+            f"NEGATIVE EV ({new_ev:+.4f})! "
+            f"Quote dropped from {original_odds:.2f} to {used_odds:.2f}. "
+            f"This bet has negative expected value at the actual odds."
+        )
+    if actual_odds is not None and actual_odds < original_odds * 0.95:
+        warnings.append(
+            f"Significant slippage: model assumed {original_odds:.2f}, "
+            f"you got {actual_odds:.2f} ({(actual_odds/original_odds - 1)*100:+.1f}%)"
+        )
 
     return {
         "success": True,
@@ -559,7 +608,11 @@ def mark_bet_placed_by_user(
         "selection": bet.selection,
         "stake_eur": float(bet.stake_eur),
         "odds": float(bet.odds_at_placement),
+        "original_odds": original_odds,
+        "original_stake": original_stake,
+        "ev": round(new_ev, 4),
         "placed_by": placed_by,
+        "warnings": warnings,
     }
 
 
@@ -613,7 +666,7 @@ def format_pending_text(pending: list[dict]) -> str:
         )
 
     lines.append("")
-    lines.append("Use /placed <bet_id> to confirm execution.")
+    lines.append("Use /placed <bet_id> <actual_odds> <actual_stake> to confirm.")
     return "\n".join(lines)
 
 
