@@ -65,18 +65,35 @@ agents:
     soul_file: agents/scout/SOUL.md
     description: >
       Web scraper for pre-match odds and live score/odds APIs.
-      Detects match states (halftime, intermission) to trigger
-      the asynchronous live betting workflow.
+      Runs the daily Cloudflare morning crawl at 04:00 UTC for
+      all 5 major sports. Detects match states (halftime,
+      intermission) to trigger the asynchronous live betting workflow.
     tools:
       - fetch_pre_match_odds
       - poll_live_scores
       - poll_live_odds
       - detect_match_state
       - update_match_record
+      - run_morning_crawl
+      - hand_off_crawl_results
     reports_to: master
     schedule:
-      pre_match_scan: "0 */2 * * *"   # Every 2 hours
+      morning_crawl: "0 4 * * *"       # Daily at 04:00 UTC — Cloudflare stats
+      pre_match_scan: "0 */2 * * *"    # Every 2 hours
       live_polling: see in_play_trigger
+    cloudflare_crawl:
+      enabled: true
+      max_crawls_per_day: 5
+      max_pages_per_crawl: 100
+      render: false  # Fast HTML-only (free during beta)
+      sports:
+        - american_football
+        - basketball
+        - ice_hockey
+        - football
+        - tennis
+      retry_on_failure: true
+      retry_backoff_seconds: 60
     in_play_trigger:
       enabled: true
       poll_interval_seconds: 30
@@ -112,6 +129,8 @@ agents:
       - resolve_alias
       - clean_odds_data
       - merge_live_stats
+      - process_crawl_results
+      - upsert_daily_stats
     reports_to: master
     schedule: null  # Triggered by scout output
 

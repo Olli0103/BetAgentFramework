@@ -1,7 +1,7 @@
 """SQLAlchemy ORM models for the BetAgent Multi-Agent System.
 
-6 tables: matches, odds_markets, bankroll_ledger, placed_bets,
-model_metrics, team_aliases.
+7 tables: matches, odds_markets, bankroll_ledger, placed_bets,
+model_metrics, team_aliases, team_daily_stats.
 """
 
 import enum
@@ -286,3 +286,54 @@ class TeamAlias(Base):
 
     def __repr__(self) -> str:
         return f"<TeamAlias '{self.alias}' -> '{self.canonical_name}'>"
+
+
+class TeamDailyStats(Base):
+    """Daily rolling statistics scraped from public sources.
+
+    One row per team per date per sport. The stats JSONB column holds
+    sport-specific metrics:
+      - football: xG, xGA, possession, shots, passes
+      - basketball: pace, off_rtg, def_rtg, net_rtg, FG%, 3P%
+      - ice_hockey: corsi_for%, fenwick_for%, pp%, pk%, sv%
+      - american_football: off_epa, def_epa, yards_per_play, turnovers
+      - tennis: ace%, 1st_serve%, bp_saved% (stored per player, not team)
+    """
+
+    __tablename__ = "team_daily_stats"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    sport: Mapped[Sport] = mapped_column(
+        Enum(Sport, native_enum=False), nullable=False, index=True
+    )
+    team_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    league: Mapped[str] = mapped_column(String(128), nullable=False)
+    stat_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+
+    # Sport-specific stats stored as JSONB for flexibility
+    stats: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+    # Crawl metadata
+    source_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    crawl_job_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "sport", "team_name", "stat_date",
+            name="uq_team_daily_stat",
+        ),
+        Index("ix_daily_stats_sport_date", "sport", "stat_date"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<TeamDailyStats {self.team_name} ({self.sport.value}) {self.stat_date}>"

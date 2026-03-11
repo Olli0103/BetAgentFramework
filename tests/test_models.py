@@ -47,6 +47,7 @@ class TestTableCreation:
             "placed_bets",
             "model_metrics",
             "team_aliases",
+            "team_daily_stats",
         }
         assert expected == set(tables)
 
