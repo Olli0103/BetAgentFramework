@@ -205,6 +205,27 @@ def _sync_place_bet(
         return result
 
 
+def _sync_check_bet_status(bet_id: str) -> str | None:
+    """Quick status check for syndicate double-click guard.
+
+    Returns the current bet status string, or None if bet not found.
+    """
+    from bet_agent.db.session import get_session
+    from bet_agent.db.models import PlacedBet
+    import uuid as _uuid
+
+    try:
+        uid = _uuid.UUID(bet_id)
+    except ValueError:
+        return None
+
+    with get_session() as sess:
+        bet = sess.get(PlacedBet, uid)
+        if bet is None:
+            return None
+        return bet.status.value
+
+
 def _sync_check_ev(bet_id: str, custom_odds: float) -> dict:
     """Synchronous: pre-check EV at custom odds WITHOUT placing the bet.
 
@@ -508,6 +529,13 @@ async def handle_callback_query(update, context) -> None:
     # ── Standard placement (model values) ────────────────────────────
     if data.startswith(CALLBACK_PLACE_STD):
         bet_id = data[len(CALLBACK_PLACE_STD):]
+
+        # Fast pre-check: reject if already placed (syndicate double-click guard)
+        pre_check = await asyncio.to_thread(_sync_check_bet_status, bet_id)
+        if pre_check and pre_check != "pending":
+            await query.answer(f"Already {pre_check}!", show_alert=True)
+            return
+
         await query.answer("Placing bet...")
 
         try:

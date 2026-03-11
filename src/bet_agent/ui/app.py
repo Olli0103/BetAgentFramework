@@ -81,6 +81,81 @@ from bet_agent.db.models import (
 )
 from bet_agent.db.session import get_session
 
+
+# ── Cached data loaders ──────────────────────────────────────────────
+# Streamlit re-runs the entire script on every interaction (tab switch,
+# button click, auto-refresh). @st.cache_data keeps expensive DB queries
+# in RAM for `ttl` seconds so the UI stays responsive at scale.
+
+
+@st.cache_data(ttl=60)
+def _cached_pnl_timeseries(days: int, ledger_type_value: str | None) -> list[dict]:
+    from bet_agent.tools.master_analysis import fetch_pnl_timeseries
+    lt = LedgerType(ledger_type_value) if ledger_type_value else None
+    with get_session() as sess:
+        return fetch_pnl_timeseries(sess, days=days, ledger_type=lt)
+
+
+@st.cache_data(ttl=60)
+def _cached_sport_exposure() -> list[dict]:
+    from bet_agent.tools.master_analysis import fetch_sport_exposure
+    with get_session() as sess:
+        results = fetch_sport_exposure(sess)
+        # Convert dataclasses to dicts for Streamlit serialization
+        return [
+            {"sport": e.sport, "pending_count": e.pending_count,
+             "total_stake": float(e.total_stake), "avg_odds": float(e.avg_odds),
+             "avg_ev": float(e.avg_ev)}
+            for e in results
+        ]
+
+
+@st.cache_data(ttl=60)
+def _cached_model_health(sport: str | None) -> list[dict]:
+    from bet_agent.tools.master_analysis import fetch_model_health
+    with get_session() as sess:
+        results = fetch_model_health(sess, sport=sport)
+        return [
+            {"model_name": r.model_name, "latest_brier": r.latest_brier,
+             "latest_roi": r.latest_roi, "record_win": r.record_win,
+             "record_loss": r.record_loss, "total_bets": r.total_bets,
+             "trend": r.trend, "is_degraded": r.is_degraded}
+            for r in results
+        ]
+
+
+@st.cache_data(ttl=30)
+def _cached_recent_activity() -> dict:
+    from bet_agent.tools.master_analysis import fetch_recent_activity
+    with get_session() as sess:
+        a = fetch_recent_activity(sess)
+        return {
+            "predictions_today": a.predictions_today,
+            "settled_today": a.settled_today,
+            "last_settlement_pnl": float(a.last_settlement_pnl),
+            "approved_today": a.approved_today,
+            "vetoed_today": a.vetoed_today,
+            "placed_today": a.placed_today,
+        }
+
+
+@st.cache_data(ttl=60)
+def _cached_brier_history(days: int) -> list[dict]:
+    with get_session() as sess:
+        metrics = list(
+            sess.execute(
+                select(ModelMetrics)
+                .where(ModelMetrics.date >= date.today() - timedelta(days=days))
+                .order_by(ModelMetrics.date)
+            ).scalars().all()
+        )
+        return [
+            {"model_name": m.model_name, "date": m.date.isoformat(),
+             "brier_score": float(m.brier_score)}
+            for m in metrics
+        ]
+
+
 # ── Plotly dark theme helper ─────────────────────────────────────────
 
 _PLOTLY_LAYOUT = dict(
@@ -271,139 +346,134 @@ with tab_portfolio:
     st.header("Portfolio & PnL")
 
     try:
-        with get_session() as sess:
-            # PnL time-series
-            from bet_agent.tools.master_analysis import fetch_pnl_timeseries
+        col_days, col_ledger = st.columns(2)
+        with col_days:
+            lookback = st.selectbox("Lookback", [7, 14, 30, 60, 90], index=2)
+        with col_ledger:
+            ledger_filter = st.selectbox("Ledger", ["Both", "REAL", "PAPER"])
 
-            col_days, col_ledger = st.columns(2)
-            with col_days:
-                lookback = st.selectbox("Lookback", [7, 14, 30, 60, 90], index=2)
-            with col_ledger:
-                ledger_filter = st.selectbox("Ledger", ["Both", "REAL", "PAPER"])
+        lt_val = None
+        if ledger_filter == "REAL":
+            lt_val = LedgerType.REAL.value
+        elif ledger_filter == "PAPER":
+            lt_val = LedgerType.PAPER.value
 
-            lt = None
-            if ledger_filter == "REAL":
-                lt = LedgerType.REAL
-            elif ledger_filter == "PAPER":
-                lt = LedgerType.PAPER
+        ts_data = _cached_pnl_timeseries(lookback, lt_val)
 
-            ts_data = fetch_pnl_timeseries(sess, days=lookback, ledger_type=lt)
+        if ts_data:
+            dates = [d["date"] for d in ts_data]
+            daily_pnl = [d["pnl"] for d in ts_data]
+            cumulative = [d["cumulative_pnl"] for d in ts_data]
+            counts = [d["bets_count"] for d in ts_data]
 
-            if ts_data:
-                dates = [d["date"] for d in ts_data]
-                daily_pnl = [d["pnl"] for d in ts_data]
-                cumulative = [d["cumulative_pnl"] for d in ts_data]
-                counts = [d["bets_count"] for d in ts_data]
+            # ── Cumulative PnL chart ────────────────────────────
+            st.subheader("Cumulative PnL")
 
-                # ── Cumulative PnL chart ────────────────────────────
-                st.subheader("Cumulative PnL")
-
-                if HAS_PLOTLY:
-                    fig_cum = go.Figure()
-                    fig_cum.add_trace(go.Scatter(
-                        x=dates,
-                        y=cumulative,
-                        mode="lines",
-                        fill="tozeroy",
-                        fillcolor="rgba(0, 200, 83, 0.15)",
-                        line=dict(color="#00c853", width=2),
-                        name="Cumulative PnL",
-                        hovertemplate="%{x}<br>PnL: %{y:+.2f} EUR<extra></extra>",
-                    ))
-                    fig_cum.add_hline(
-                        y=0, line_dash="dash", line_color="rgba(255,255,255,0.3)",
+            if HAS_PLOTLY:
+                fig_cum = go.Figure()
+                fig_cum.add_trace(go.Scatter(
+                    x=dates,
+                    y=cumulative,
+                    mode="lines",
+                    fill="tozeroy",
+                    fillcolor="rgba(0, 200, 83, 0.15)",
+                    line=dict(color="#00c853", width=2),
+                    name="Cumulative PnL",
+                    hovertemplate="%{x}<br>PnL: %{y:+.2f} EUR<extra></extra>",
+                ))
+                fig_cum.add_hline(
+                    y=0, line_dash="dash", line_color="rgba(255,255,255,0.3)",
+                )
+                fig_cum.update_layout(
+                    **_plotly_layout(
+                        yaxis_title="EUR",
+                        xaxis_title="",
+                        height=350,
                     )
-                    fig_cum.update_layout(
-                        **_plotly_layout(
-                            yaxis_title="EUR",
-                            xaxis_title="",
-                            height=350,
-                        )
-                    )
-                    st.plotly_chart(fig_cum, use_container_width=True)
-                else:
-                    chart_data = {d["date"]: d["cumulative_pnl"] for d in ts_data}
-                    st.line_chart(chart_data)
-
-                # ── Daily PnL bar chart ─────────────────────────────
-                st.subheader("Daily PnL")
-
-                if HAS_PLOTLY:
-                    colors = [
-                        "#00c853" if v >= 0 else "#ff1744" for v in daily_pnl
-                    ]
-                    fig_daily = go.Figure()
-                    fig_daily.add_trace(go.Bar(
-                        x=dates,
-                        y=daily_pnl,
-                        marker_color=colors,
-                        name="Daily PnL",
-                        hovertemplate="%{x}<br>PnL: %{y:+.2f} EUR<extra></extra>",
-                    ))
-                    fig_daily.add_hline(
-                        y=0, line_dash="dash", line_color="rgba(255,255,255,0.3)",
-                    )
-                    fig_daily.update_layout(
-                        **_plotly_layout(
-                            yaxis_title="EUR",
-                            xaxis_title="",
-                            height=300,
-                        )
-                    )
-                    st.plotly_chart(fig_daily, use_container_width=True)
-                else:
-                    bar_data = {d["date"]: d["pnl"] for d in ts_data}
-                    st.bar_chart(bar_data)
-
-                # Summary metrics
-                total_pnl = sum(daily_pnl)
-                total_bets = sum(counts)
-                best_day = max(daily_pnl) if daily_pnl else 0
-                worst_day = min(daily_pnl) if daily_pnl else 0
-
-                mc1, mc2, mc3, mc4 = st.columns(4)
-                mc1.metric("Total PnL", f"{total_pnl:+.2f} EUR")
-                mc2.metric("Total Bets", total_bets)
-                mc3.metric("Best Day", f"{best_day:+.2f} EUR")
-                mc4.metric("Worst Day", f"{worst_day:+.2f} EUR")
+                )
+                st.plotly_chart(fig_cum, use_container_width=True)
             else:
-                st.info("No settled bets in the selected period.")
+                chart_data = {d["date"]: d["cumulative_pnl"] for d in ts_data}
+                st.line_chart(chart_data)
 
-            # Sport exposure
-            st.subheader("Exposure by Sport")
-            from bet_agent.tools.master_analysis import fetch_sport_exposure
+            # ── Daily PnL bar chart ─────────────────────────────
+            st.subheader("Daily PnL")
 
-            exposure = fetch_sport_exposure(sess)
-            if exposure:
-                if HAS_PLOTLY:
-                    sports = [e.sport for e in exposure]
-                    stakes = [float(e.total_stake) for e in exposure]
-                    fig_exp = go.Figure()
-                    fig_exp.add_trace(go.Bar(
-                        x=sports,
-                        y=stakes,
-                        marker_color="#42a5f5",
-                        hovertemplate="%{x}<br>Stake: %{y:.2f} EUR<extra></extra>",
-                    ))
-                    fig_exp.update_layout(
-                        **_plotly_layout(
-                            yaxis_title="EUR Staked",
-                            height=300,
-                        )
+            if HAS_PLOTLY:
+                colors = [
+                    "#00c853" if v >= 0 else "#ff1744" for v in daily_pnl
+                ]
+                fig_daily = go.Figure()
+                fig_daily.add_trace(go.Bar(
+                    x=dates,
+                    y=daily_pnl,
+                    marker_color=colors,
+                    name="Daily PnL",
+                    hovertemplate="%{x}<br>PnL: %{y:+.2f} EUR<extra></extra>",
+                ))
+                fig_daily.add_hline(
+                    y=0, line_dash="dash", line_color="rgba(255,255,255,0.3)",
+                )
+                fig_daily.update_layout(
+                    **_plotly_layout(
+                        yaxis_title="EUR",
+                        xaxis_title="",
+                        height=300,
                     )
-                    st.plotly_chart(fig_exp, use_container_width=True)
-                else:
-                    exp_data = {e.sport: float(e.total_stake) for e in exposure}
-                    st.bar_chart(exp_data)
-
-                for e in exposure:
-                    st.markdown(
-                        f"**{e.sport}**: {e.pending_count} bets | "
-                        f"{e.total_stake:.2f} EUR staked | "
-                        f"Avg odds: {e.avg_odds:.2f} | Avg EV: {e.avg_ev:.4f}"
-                    )
+                )
+                st.plotly_chart(fig_daily, use_container_width=True)
             else:
-                st.info("No pending exposure.")
+                bar_data = {d["date"]: d["pnl"] for d in ts_data}
+                st.bar_chart(bar_data)
+
+            # Summary metrics
+            total_pnl = sum(daily_pnl)
+            total_bets = sum(counts)
+            best_day = max(daily_pnl) if daily_pnl else 0
+            worst_day = min(daily_pnl) if daily_pnl else 0
+
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric("Total PnL", f"{total_pnl:+.2f} EUR")
+            mc2.metric("Total Bets", total_bets)
+            mc3.metric("Best Day", f"{best_day:+.2f} EUR")
+            mc4.metric("Worst Day", f"{worst_day:+.2f} EUR")
+        else:
+            st.info("No settled bets in the selected period.")
+
+        # Sport exposure
+        st.subheader("Exposure by Sport")
+
+        exposure = _cached_sport_exposure()
+        if exposure:
+            if HAS_PLOTLY:
+                sports = [e["sport"] for e in exposure]
+                stakes = [e["total_stake"] for e in exposure]
+                fig_exp = go.Figure()
+                fig_exp.add_trace(go.Bar(
+                    x=sports,
+                    y=stakes,
+                    marker_color="#42a5f5",
+                    hovertemplate="%{x}<br>Stake: %{y:.2f} EUR<extra></extra>",
+                ))
+                fig_exp.update_layout(
+                    **_plotly_layout(
+                        yaxis_title="EUR Staked",
+                        height=300,
+                    )
+                )
+                st.plotly_chart(fig_exp, use_container_width=True)
+            else:
+                exp_data = {e["sport"]: e["total_stake"] for e in exposure}
+                st.bar_chart(exp_data)
+
+            for e in exposure:
+                st.markdown(
+                    f"**{e['sport']}**: {e['pending_count']} bets | "
+                    f"{e['total_stake']:.2f} EUR staked | "
+                    f"Avg odds: {e['avg_odds']:.2f} | Avg EV: {e['avg_ev']:.4f}"
+                )
+        else:
+            st.info("No pending exposure.")
 
     except Exception as e:
         st.error(f"Portfolio query failed: {e}")
@@ -417,106 +487,97 @@ with tab_mlops:
     st.header("MLOps & Model Health")
 
     try:
-        with get_session() as sess:
-            from bet_agent.tools.master_analysis import fetch_model_health
+        sport_filter = st.selectbox(
+            "Filter by Sport",
+            ["All"] + [s.value for s in Sport],
+        )
+        sf = None if sport_filter == "All" else sport_filter
 
-            sport_filter = st.selectbox(
-                "Filter by Sport",
-                ["All"] + [s.value for s in Sport],
-            )
-            sf = None if sport_filter == "All" else sport_filter
+        health_reports = _cached_model_health(sf)
 
-            health_reports = fetch_model_health(sess, sport=sf)
-
-            if health_reports:
-                # Killswitch alert
-                degraded = [r for r in health_reports if r.is_degraded]
-                if degraded:
-                    st.error(
-                        f"\U0001f6a8 **KILLSWITCH ACTIVE** — "
-                        f"{len(degraded)} model(s) degraded: "
-                        + ", ".join(f"`{r.model_name}`" for r in degraded)
-                        + "\n\nBetting HALTED for these models until human retraining approval."
-                    )
-
-                # Model cards
-                for report in health_reports:
-                    status_icon = "\U0001f534" if report.is_degraded else "\U0001f7e2"
-                    trend_icon = {
-                        "improving": "\u2197\ufe0f",
-                        "stable": "\u27a1\ufe0f",
-                        "declining": "\u2198\ufe0f",
-                    }.get(report.trend, "\u2753")
-
-                    with st.expander(
-                        f"{status_icon} {report.model_name} | "
-                        f"Brier: {report.latest_brier:.4f} | "
-                        f"ROI: {report.latest_roi:+.1f}% | "
-                        f"{trend_icon} {report.trend}",
-                        expanded=report.is_degraded,
-                    ):
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("Brier Score", f"{report.latest_brier:.4f}",
-                                  delta="DEGRADED" if report.latest_brier > 0.22 else "OK",
-                                  delta_color="inverse" if report.latest_brier > 0.22 else "normal")
-                        c2.metric("ROI", f"{report.latest_roi:+.1f}%",
-                                  delta="DEGRADED" if report.latest_roi < -5 else "OK",
-                                  delta_color="inverse" if report.latest_roi < -5 else "normal")
-                        c3.metric("Record", f"{report.record_win}W-{report.record_loss}L")
-                        c4.metric("Total Bets", report.total_bets)
-
-                # Brier score history chart
-                st.subheader("Brier Score History")
-                metrics = list(
-                    sess.execute(
-                        select(ModelMetrics)
-                        .where(ModelMetrics.date >= date.today() - timedelta(days=30))
-                        .order_by(ModelMetrics.date)
-                    ).scalars().all()
+        if health_reports:
+            # Killswitch alert
+            degraded = [r for r in health_reports if r["is_degraded"]]
+            if degraded:
+                st.error(
+                    f"\U0001f6a8 **KILLSWITCH ACTIVE** — "
+                    f"{len(degraded)} model(s) degraded: "
+                    + ", ".join(f"`{r['model_name']}`" for r in degraded)
+                    + "\n\nBetting HALTED for these models until human retraining approval."
                 )
 
-                if metrics:
-                    if HAS_PLOTLY:
-                        # Group by model_name
-                        model_series: dict[str, tuple[list, list]] = {}
-                        for m in metrics:
-                            if m.model_name not in model_series:
-                                model_series[m.model_name] = ([], [])
-                            model_series[m.model_name][0].append(m.date.isoformat())
-                            model_series[m.model_name][1].append(float(m.brier_score))
+            # Model cards
+            for report in health_reports:
+                status_icon = "\U0001f534" if report["is_degraded"] else "\U0001f7e2"
+                trend_icon = {
+                    "improving": "\u2197\ufe0f",
+                    "stable": "\u27a1\ufe0f",
+                    "declining": "\u2198\ufe0f",
+                }.get(report["trend"], "\u2753")
 
-                        fig_brier = go.Figure()
-                        for model_name, (dates_b, scores) in model_series.items():
-                            fig_brier.add_trace(go.Scatter(
-                                x=dates_b, y=scores,
-                                mode="lines+markers",
-                                name=model_name,
-                                hovertemplate="%{x}<br>Brier: %{y:.4f}<extra></extra>",
-                            ))
+                with st.expander(
+                    f"{status_icon} {report['model_name']} | "
+                    f"Brier: {report['latest_brier']:.4f} | "
+                    f"ROI: {report['latest_roi']:+.1f}% | "
+                    f"{trend_icon} {report['trend']}",
+                    expanded=report["is_degraded"],
+                ):
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Brier Score", f"{report['latest_brier']:.4f}",
+                              delta="DEGRADED" if report["latest_brier"] > 0.22 else "OK",
+                              delta_color="inverse" if report["latest_brier"] > 0.22 else "normal")
+                    c2.metric("ROI", f"{report['latest_roi']:+.1f}%",
+                              delta="DEGRADED" if report["latest_roi"] < -5 else "OK",
+                              delta_color="inverse" if report["latest_roi"] < -5 else "normal")
+                    c3.metric("Record", f"{report['record_win']}W-{report['record_loss']}L")
+                    c4.metric("Total Bets", report["total_bets"])
 
-                        # Degradation threshold line
-                        fig_brier.add_hline(
-                            y=0.22, line_dash="dash", line_color="#ff1744",
-                            annotation_text="Degradation threshold (0.22)",
-                            annotation_position="top right",
+            # Brier score history chart
+            st.subheader("Brier Score History")
+            metrics = _cached_brier_history(30)
+
+            if metrics:
+                if HAS_PLOTLY:
+                    # Group by model_name
+                    model_series: dict[str, tuple[list, list]] = {}
+                    for m in metrics:
+                        if m["model_name"] not in model_series:
+                            model_series[m["model_name"]] = ([], [])
+                        model_series[m["model_name"]][0].append(m["date"])
+                        model_series[m["model_name"]][1].append(m["brier_score"])
+
+                    fig_brier = go.Figure()
+                    for model_name, (dates_b, scores) in model_series.items():
+                        fig_brier.add_trace(go.Scatter(
+                            x=dates_b, y=scores,
+                            mode="lines+markers",
+                            name=model_name,
+                            hovertemplate="%{x}<br>Brier: %{y:.4f}<extra></extra>",
+                        ))
+
+                    # Degradation threshold line
+                    fig_brier.add_hline(
+                        y=0.22, line_dash="dash", line_color="#ff1744",
+                        annotation_text="Degradation threshold (0.22)",
+                        annotation_position="top right",
+                    )
+                    fig_brier.update_layout(
+                        **_plotly_layout(
+                            yaxis_title="Brier Score",
+                            height=350,
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02),
                         )
-                        fig_brier.update_layout(
-                            **_plotly_layout(
-                                yaxis_title="Brier Score",
-                                height=350,
-                                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                            )
-                        )
-                        st.plotly_chart(fig_brier, use_container_width=True)
-                    else:
-                        chart: dict[str, dict[str, float]] = defaultdict(dict)
-                        for m in metrics:
-                            chart[m.date.isoformat()][m.model_name] = float(m.brier_score)
-                        st.line_chart(chart)
+                    )
+                    st.plotly_chart(fig_brier, use_container_width=True)
+                else:
+                    chart: dict[str, dict[str, float]] = defaultdict(dict)
+                    for m in metrics:
+                        chart[m["date"]][m["model_name"]] = m["brier_score"]
+                    st.line_chart(chart)
 
-                    st.caption("Degradation threshold: Brier > 0.22 (red zone)")
-            else:
-                st.info("No model metrics yet. Run the Auditor morning audit first.")
+                st.caption("Degradation threshold: Brier > 0.22 (red zone)")
+        else:
+            st.info("No model metrics yet. Run the Auditor morning audit first.")
 
     except Exception as e:
         st.error(f"MLOps query failed: {e}")
@@ -562,18 +623,15 @@ with tab_logs:
         # Fallback: show recent DB activity
         st.subheader("Recent Database Activity (fallback)")
         try:
-            with get_session() as sess:
-                from bet_agent.tools.master_analysis import fetch_recent_activity
+            activity = _cached_recent_activity()
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Predictions Today", activity["predictions_today"])
+            c2.metric("Settled Today", activity["settled_today"])
+            c3.metric("Settlement PnL", f"{activity['last_settlement_pnl']:+.2f} EUR")
 
-                activity = fetch_recent_activity(sess)
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Predictions Today", activity.predictions_today)
-                c2.metric("Settled Today", activity.settled_today)
-                c3.metric("Settlement PnL", f"{activity.last_settlement_pnl:+.2f} EUR")
-
-                c4, c5, c6 = st.columns(3)
-                c4.metric("Approved", activity.approved_today)
-                c5.metric("Vetoed", activity.vetoed_today)
-                c6.metric("Placed", activity.placed_today)
+            c4, c5, c6 = st.columns(3)
+            c4.metric("Approved", activity["approved_today"])
+            c5.metric("Vetoed", activity["vetoed_today"])
+            c6.metric("Placed", activity["placed_today"])
         except Exception as e:
             st.error(f"Activity query failed: {e}")

@@ -352,11 +352,21 @@ class TestTennisIngester:
 
             model = ingester.row_to_model(rows[0], str(path))
             assert model.sport == Sport.TENNIS
-            assert model.home_team == "Sinner"  # winner = home
-            assert model.away_team == "Djokovic"  # loser = away
-            assert model.home_score == 3  # 3 sets won
-            assert model.away_score == 0
-            assert model.result == "H"
+            # Home/away is randomized to prevent positional bias.
+            # Both players must be assigned, and result must be consistent.
+            assert {model.home_team, model.away_team} == {"Sinner", "Djokovic"}
+            assert model.home_score + model.away_score == 3  # 3+0 sets
+            if model.home_team == "Sinner":
+                assert model.result == "H"
+                assert model.home_score == 3
+                assert model.away_score == 0
+            else:
+                assert model.result == "A"
+                assert model.home_score == 0
+                assert model.away_score == 3
+            # Original winner always preserved in match_stats
+            assert model.match_stats["actual_winner"] == "Sinner"
+            assert model.match_stats["actual_loser"] == "Djokovic"
             assert model.match_stats["tournament"] == "Australian Open"
             assert model.match_stats["surface"] == "Hard"
             assert model.advanced_stats["winner_ace"] == 12

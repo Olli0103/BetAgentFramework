@@ -548,12 +548,23 @@ def mark_bet_placed_by_user(
         Dict with bet details, EV assessment, and any warnings.
     """
     import uuid as _uuid
+    from sqlalchemy import select as _select
+
     try:
         uid = _uuid.UUID(bet_id)
     except ValueError:
         return {"error": f"Invalid bet_id: {bet_id}"}
 
-    bet = session.get(PlacedBet, uid)
+    # Pessimistic lock: SELECT ... FOR UPDATE prevents two syndicate members
+    # from placing the same bet concurrently. The first caller acquires the
+    # row lock; the second blocks until the first commits, then sees the
+    # updated status and gets the "already placed" error.
+    bet = session.execute(
+        _select(PlacedBet)
+        .where(PlacedBet.id == uid)
+        .with_for_update()
+    ).scalar_one_or_none()
+
     if bet is None:
         return {"error": f"Bet {bet_id} not found"}
 

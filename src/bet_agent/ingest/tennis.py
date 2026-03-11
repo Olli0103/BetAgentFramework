@@ -8,11 +8,19 @@ Supports two formats:
    tourney_id, tourney_name, surface, draw_size, tourney_level, tourney_date,
    match_num, winner_*, loser_*, score, best_of, round, minutes,
    w_ace, w_df, w_svpt, w_1stIn, w_1stWon, w_2ndWon, ...
+
+CRITICAL: Tennis has no home/away. Source files list Winner first (or higher
+ranked player first). If we naively assign Winner=home, the ML model learns
+a fake "home advantage" bias because home_team always wins in training data.
+We randomize the assignment: each match has a 50/50 chance of winner being
+home or away, eliminating the positional bias and forcing the model to rely
+on actual features (serve %, Elo, surface stats).
 """
 
 from __future__ import annotations
 
 import logging
+import random
 from pathlib import Path
 
 from bet_agent.db.models import HistoricalMatch, Sport
@@ -141,38 +149,63 @@ class TennisIngester(BaseIngester):
             if val >= 0:
                 advanced_stats[key] = val
 
-        # Odds
-        odds: dict = {}
+        # Odds (stored relative to winner/loser, mapped to home/away below)
+        odds_winner: dict = {}
+        odds_loser: dict = {}
         for book, (w_col, l_col) in XLSX_BOOK_COLS.items():
             w = safe_float(row.get(w_col))
             l = safe_float(row.get(l_col))
             if w is not None:
-                odds[f"{book}_winner"] = w
+                odds_winner[f"{book}"] = w
             if l is not None:
-                odds[f"{book}_loser"] = l
+                odds_loser[f"{book}"] = l
 
-        # Aggregate odds
         for key, col in [
-            ("max_winner", "MaxW"), ("max_loser", "MaxL"),
-            ("avg_winner", "AvgW"), ("avg_loser", "AvgL"),
+            ("max", "MaxW"), ("avg", "AvgW"),
         ]:
             val = safe_float(row.get(col))
             if val is not None:
-                odds[key] = val
+                odds_winner[key] = val
+        for key, col in [
+            ("max", "MaxL"), ("avg", "AvgL"),
+        ]:
+            val = safe_float(row.get(col))
+            if val is not None:
+                odds_loser[key] = val
 
         location = (row.get("Location") or row.get("Tournament") or "").strip()
         division = f"{self.tour}_{location}" if location else self.tour
+
+        # CRITICAL: Randomize home/away assignment to prevent positional bias.
+        # Tennis has no home team — source files list winner first, which would
+        # create a fake "home advantage" if always mapped to home_team.
+        if random.random() < 0.5:
+            home, away = winner, loser
+            home_score, away_score = wsets, lsets
+            result = "H"  # home = winner
+            odds = {f"{k}_home": v for k, v in odds_winner.items()}
+            odds.update({f"{k}_away": v for k, v in odds_loser.items()})
+        else:
+            home, away = loser, winner
+            home_score, away_score = lsets, wsets
+            result = "A"  # away = winner
+            odds = {f"{k}_home": v for k, v in odds_loser.items()}
+            odds.update({f"{k}_away": v for k, v in odds_winner.items()})
+
+        # Store original winner in match_stats so we never lose information
+        match_stats["actual_winner"] = winner
+        match_stats["actual_loser"] = loser
 
         return HistoricalMatch(
             sport=Sport.TENNIS,
             season=str(match_date.year),
             division=division,
             match_date=match_date,
-            home_team=winner,   # winner = "home" in our schema
-            away_team=loser,    # loser = "away"
-            home_score=wsets,
-            away_score=lsets,
-            result="H",  # winner always wins
+            home_team=home,
+            away_team=away,
+            home_score=home_score,
+            away_score=away_score,
+            result=result,
             match_stats=match_stats,
             odds=odds,
             betting_lines={},
@@ -249,16 +282,29 @@ class TennisIngester(BaseIngester):
         tourney_name = (row.get("tourney_name") or "").strip()
         division = f"{self.tour}_{tourney_name}" if tourney_name else self.tour
 
+        # CRITICAL: Randomize home/away assignment (see _xlsx_to_model docstring)
+        match_stats["actual_winner"] = winner
+        match_stats["actual_loser"] = loser
+
+        if random.random() < 0.5:
+            home, away = winner, loser
+            home_score, away_score = wsets, lsets
+            result = "H"
+        else:
+            home, away = loser, winner
+            home_score, away_score = lsets, wsets
+            result = "A"
+
         return HistoricalMatch(
             sport=Sport.TENNIS,
             season=str(match_date.year),
             division=division,
             match_date=match_date,
-            home_team=winner,
-            away_team=loser,
-            home_score=wsets,
-            away_score=lsets,
-            result="H",
+            home_team=home,
+            away_team=away,
+            home_score=home_score,
+            away_score=away_score,
+            result=result,
             match_stats=match_stats,
             odds={},
             betting_lines={},
