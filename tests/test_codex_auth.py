@@ -214,7 +214,7 @@ class TestCodexAuthLLMIntegration:
             api_key="initial-stale",
             _token_fn=fresh_token,
         )
-        tier = TierConfig("test", primary=prov)
+        tier = TierConfig("test", providers=[prov])
         client = LLMClient(tier=tier)
 
         with patch("bet_agent.llm.client.requests.post") as mock_post:
@@ -242,7 +242,7 @@ class TestCodexAuthLLMIntegration:
             model="gemini",
             api_key="static-key-123",
         )
-        tier = TierConfig("test", primary=prov)
+        tier = TierConfig("test", providers=[prov])
         client = LLMClient(tier=tier)
 
         with patch("bet_agent.llm.client.requests.post") as mock_post:

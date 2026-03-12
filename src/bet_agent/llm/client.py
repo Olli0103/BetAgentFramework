@@ -1,14 +1,13 @@
-"""Tier-aware LLM client with OpenClaw → Gemini fallback.
+"""Tier-aware LLM client with ordered provider fallback chain.
 
 Reads ``config/llm_tiers.yaml`` and corresponding env vars, then exposes a
-simple ``chat()`` function that tries the primary provider first and
-transparently falls back to the secondary when the primary is unavailable
-(missing credentials, timeout, HTTP error).
+simple ``chat()`` function that tries providers in order and transparently
+falls back when one is unavailable (missing credentials, timeout, HTTP error).
 
 Design decisions:
-  * Uses raw ``requests`` — no vendor SDK required.  Both OpenClaw and
-    Gemini expose OpenAI-compatible ``/chat/completions`` endpoints (Gemini
-    via its OpenAI-compatible gateway ``generativelanguage.googleapis.com``).
+  * Uses raw ``requests`` — no vendor SDK required.  All providers expose
+    OpenAI-compatible ``/chat/completions`` endpoints.
+  * Provider chain: OpenClaw → OpenRouter → Gemini (configurable via YAML).
   * One ``LLMClient`` instance per tier; the module-level ``chat()``
     convenience function targets **tier1_heavy_reasoning** by default.
   * Stateless — each call is an independent HTTP request.
@@ -52,17 +51,26 @@ class ProviderConfig:
 
 @dataclass
 class TierConfig:
-    """Primary + optional fallback for one tier."""
+    """Ordered list of providers for one tier."""
 
     tier_name: str
-    primary: ProviderConfig | None = None
-    fallback: ProviderConfig | None = None
+    providers: list[ProviderConfig] = field(default_factory=list)
+
+    # Backward-compat properties for code that reads .primary / .fallback
+    @property
+    def primary(self) -> ProviderConfig | None:
+        return self.providers[0] if self.providers else None
+
+    @property
+    def fallback(self) -> ProviderConfig | None:
+        return self.providers[1] if len(self.providers) > 1 else None
 
 
 # ── Provider URL builders ─────────────────────────────────────────────
 
 _PROVIDER_URLS: dict[str, str] = {
     "openclaw": "https://api.openclaw.ai/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
     "google": "https://generativelanguage.googleapis.com/v1beta/openai",
     "ollama": "",  # filled from env
 }
@@ -130,7 +138,11 @@ def _resolve_provider(cfg: dict[str, Any]) -> ProviderConfig | None:
 def load_tier_configs(
     config_path: Path | str = _CONFIG_PATH,
 ) -> dict[str, TierConfig]:
-    """Parse ``llm_tiers.yaml`` and return a mapping of tier name → config."""
+    """Parse ``llm_tiers.yaml`` and return a mapping of tier name → config.
+
+    Supports both the new ``providers`` list format and the legacy
+    ``primary`` / ``fallback`` format for backward compatibility.
+    """
     path = Path(config_path)
     if not path.exists():
         logger.warning("LLM tier config not found at %s", path)
@@ -139,13 +151,28 @@ def load_tier_configs(
     raw = yaml.safe_load(path.read_text())
     tiers: dict[str, TierConfig] = {}
     for tier_name, tier_data in (raw.get("tiers") or {}).items():
-        primary = _resolve_provider(tier_data.get("primary") or {})
-        fallback_raw = tier_data.get("fallback")
-        fallback = _resolve_provider(fallback_raw) if fallback_raw else None
+        resolved: list[ProviderConfig] = []
+
+        # New format: ordered providers list
+        if "providers" in tier_data:
+            for prov_cfg in tier_data["providers"]:
+                p = _resolve_provider(prov_cfg)
+                if p:
+                    resolved.append(p)
+        else:
+            # Legacy format: primary + fallback
+            primary = _resolve_provider(tier_data.get("primary") or {})
+            if primary:
+                resolved.append(primary)
+            fallback_raw = tier_data.get("fallback")
+            if fallback_raw:
+                fb = _resolve_provider(fallback_raw)
+                if fb:
+                    resolved.append(fb)
+
         tiers[tier_name] = TierConfig(
             tier_name=tier_name,
-            primary=primary,
-            fallback=fallback,
+            providers=resolved,
         )
     return tiers
 
@@ -167,10 +194,7 @@ class LLMClient:
     _providers: list[ProviderConfig] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
-        if self.tier.primary:
-            self._providers.append(self.tier.primary)
-        if self.tier.fallback:
-            self._providers.append(self.tier.fallback)
+        self._providers = list(self.tier.providers)
 
     # ── Factory ───────────────────────────────────────────────────────
 
@@ -206,7 +230,8 @@ class LLMClient:
         if not self._providers:
             raise RuntimeError(
                 f"No LLM providers available for tier '{self.tier.tier_name}'. "
-                f"Set OPENCLAW_OAUTH_TOKEN or GEMINI_API_KEY in your environment."
+                f"Set OPENCLAW_OAUTH_TOKEN, OPENROUTER_API_KEY, or GEMINI_API_KEY "
+                f"in your environment."
             )
 
         last_err: Exception | None = None
