@@ -217,33 +217,44 @@ def test_reddit_oauth_token_success():
     assert mod._reddit_token == "abc123"
 
 
-def test_reddit_oauth_search_uses_oauth_url():
-    """When OAuth token is available, search uses oauth.reddit.com."""
+def test_reddit_oauth_search_supplements_rss():
+    """When OAuth is configured and RSS returns nothing, JSON search is tried."""
     import bet_agent.tools.search_backends as mod
     mod._reddit_token = "test_token"
     mod._reddit_token_expires = float("inf")
 
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = {"data": {"children": []}}
+    # RSS returns empty (no matching posts), JSON returns results
+    rss_resp = MagicMock()
+    rss_resp.status_code = 200
+    rss_resp.content = b'<feed xmlns="http://www.w3.org/2005/Atom"></feed>'
+
+    json_resp = MagicMock()
+    json_resp.status_code = 200
+    json_resp.json.return_value = {
+        "data": {"children": [{"data": {
+            "title": "From OAuth", "selftext": "", "permalink": "/r/nfl/x/"
+        }}]}
+    }
+
+    def side_effect(url, **kwargs):
+        if ".rss" in url:
+            return rss_resp
+        return json_resp
 
     with patch.dict("os.environ", {"REDDIT_CLIENT_ID": "id", "REDDIT_CLIENT_SECRET": "secret"}), \
-         patch("requests.get", return_value=mock_resp) as mock_get:
+         patch("requests.get", side_effect=side_effect) as mock_get:
         backend = RedditRSSSearch(subreddits=["nfl"])
-        backend.search("test")
+        results = backend.search("test query")
 
-    call_url = mock_get.call_args[0][0]
-    assert "oauth.reddit.com" in call_url
-    auth_header = mock_get.call_args[1]["headers"]["Authorization"]
-    assert auth_header == "Bearer test_token"
+    assert len(results) == 1
+    assert results[0]["title"] == "From OAuth"
+    # Verify OAuth URL was called
+    oauth_calls = [c for c in mock_get.call_args_list if "oauth.reddit.com" in c[0][0]]
+    assert len(oauth_calls) > 0
 
 
 def test_reddit_403_handled():
     """403 response is handled gracefully (endpoint blocked)."""
-    import bet_agent.tools.search_backends as mod
-    mod._reddit_token = None
-    mod._reddit_token_expires = 0.0
-
     mock_resp = MagicMock()
     mock_resp.status_code = 403
 
@@ -289,27 +300,25 @@ def test_reddit_subreddits_for_sport():
     assert "tennis" in RedditRSSSearch.subreddits_for_sport("tennis")
 
 
-def test_reddit_search_success():
-    """Mocked Reddit JSON response is parsed correctly."""
-    import bet_agent.tools.search_backends as mod
-    mod._reddit_token = None
-    mod._reddit_token_expires = 0.0
+def test_reddit_rss_search_success():
+    """Mocked Reddit Atom RSS feed is parsed correctly."""
+    atom_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <title>Mahomes questionable for Sunday</title>
+        <content type="html">Per Schefter, Mahomes has ankle issues and may miss the game</content>
+        <link href="https://www.reddit.com/r/nfl/comments/abc123/mahomes/"/>
+      </entry>
+      <entry>
+        <title>Unrelated post about cooking</title>
+        <content type="html">Best recipe for pasta</content>
+        <link href="https://www.reddit.com/r/nfl/comments/xyz/cooking/"/>
+      </entry>
+    </feed>"""
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = {
-        "data": {
-            "children": [
-                {
-                    "data": {
-                        "title": "Mahomes questionable for Sunday",
-                        "selftext": "Per Schefter, Mahomes has ankle issues...",
-                        "permalink": "/r/nfl/comments/abc123/mahomes/",
-                    }
-                },
-            ]
-        }
-    }
+    mock_resp.content = atom_xml
 
     with patch.dict("os.environ", {}, clear=True), \
          patch("requests.get", return_value=mock_resp):
@@ -323,12 +332,8 @@ def test_reddit_search_success():
     assert results[0]["source"] == "reddit/r/nfl"
 
 
-def test_reddit_search_rate_limited():
+def test_reddit_rss_rate_limited():
     """429 response is handled gracefully."""
-    import bet_agent.tools.search_backends as mod
-    mod._reddit_token = None
-    mod._reddit_token_expires = 0.0
-
     mock_resp = MagicMock()
     mock_resp.status_code = 429
 
@@ -340,16 +345,47 @@ def test_reddit_search_rate_limited():
     assert results == []
 
 
-def test_reddit_search_network_error():
+def test_reddit_rss_network_error():
     """Network errors are handled gracefully."""
-    import bet_agent.tools.search_backends as mod
-    mod._reddit_token = None
-    mod._reddit_token_expires = 0.0
-
     with patch.dict("os.environ", {}, clear=True), \
          patch("requests.get", side_effect=Exception("connection refused")):
         backend = RedditRSSSearch(subreddits=["nfl"])
         results = backend.search("test")
+
+    assert results == []
+
+
+def test_reddit_extract_keywords():
+    """Keywords are extracted correctly (3+ chars, no stopwords)."""
+    backend = RedditRSSSearch()
+    kw = backend._extract_keywords("Mahomes injury report for the NFL")
+    assert "mahomes" in kw
+    assert "injury" in kw
+    assert "report" in kw
+    assert "nfl" in kw
+    assert "the" not in kw
+    assert "for" not in kw
+
+
+def test_reddit_rss_no_keyword_match():
+    """RSS posts that don't match any query keyword are filtered out."""
+    atom_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <title>Best pizza recipe</title>
+        <content type="html">How to make pizza at home</content>
+        <link href="https://www.reddit.com/r/nfl/comments/xyz/pizza/"/>
+      </entry>
+    </feed>"""
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.content = atom_xml
+
+    with patch.dict("os.environ", {}, clear=True), \
+         patch("requests.get", return_value=mock_resp):
+        backend = RedditRSSSearch(subreddits=["nfl"])
+        results = backend.search("Mahomes injury")
 
     assert results == []
 

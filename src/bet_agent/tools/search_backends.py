@@ -1,16 +1,20 @@
 """Search backends for the Devil's Advocate veto engine.
 
 Provides pluggable news search implementations with cascading fallback:
-  Priority 1: RedditSearch   — free with OAuth (~60 req/min), or
-                                unauthenticated (~10 req/min, may be unreliable)
-  Priority 2: TavilySearch   — best quality, 1000 req/month free tier
-  Priority 3: BraveSearch    — good quality, 2000 req/month free tier
+  Priority 1: RedditRSSSearch — free, no API key, uses /r/{sub}/.rss feeds
+                                 with local keyword filtering
+  Priority 2: TavilySearch    — best quality, 1000 req/month free tier
+  Priority 3: BraveSearch     — good quality, 2000 req/month free tier
   Priority 4: DefaultNewsSearch — stub (regex-only veto path)
 
-Reddit OAuth setup (recommended):
-  1. Create a Reddit "script" app at https://www.reddit.com/prefs/apps/
-  2. Set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET env vars
-  3. This gives 60 req/min (vs 10 req/min unauthenticated)
+Reddit uses public Atom/RSS feeds (/r/{sub}/.rss) which:
+  - Need NO API key, NO OAuth, NO account
+  - Have generous rate limits (public RSS, no documented cap)
+  - Are stable (RSS is a web standard, unlike Reddit's JSON API)
+  - Return the latest ~25 posts per subreddit
+
+Optional: Set REDDIT_CLIENT_ID + REDDIT_CLIENT_SECRET for OAuth-powered
+  search (60 req/min) which adds full-text search capability on top of RSS.
 
 Budget management:
   Each paid backend tracks its own monthly usage via file-based counters.
@@ -25,8 +29,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import threading
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -155,24 +161,25 @@ def _get_reddit_oauth_token() -> str | None:
 
 
 class RedditRSSSearch:
-    """News backend using Reddit's JSON search endpoints.
+    """News backend using Reddit's public RSS/Atom feeds.
 
-    Two modes of operation:
-      - **OAuth** (recommended): Set REDDIT_CLIENT_ID + REDDIT_CLIENT_SECRET.
-        Uses ``oauth.reddit.com`` → 60 req/min, reliable.
-      - **Unauthenticated fallback**: No credentials needed.
-        Uses ``www.reddit.com/.json`` → ~10 req/min, may be throttled.
+    Primary mode: Fetches ``/r/{sub}/.rss`` (Atom XML) and filters
+    locally by query keywords. No API key, no OAuth, no account needed.
 
-    Searches sport subreddits via ``/r/{sub}/search.json`` with
-    ``restrict_sr=on`` and ``sort=new``.
+    Optional OAuth mode: If REDDIT_CLIENT_ID + REDDIT_CLIENT_SECRET are
+    set, also tries ``oauth.reddit.com/r/{sub}/search.json`` for
+    full-text search (60 req/min). RSS results are tried first.
     """
+
+    # Atom namespace used in Reddit RSS feeds
+    _ATOM_NS = "{http://www.w3.org/2005/Atom}"
 
     def __init__(self, subreddits: list[str] | None = None) -> None:
         self._subreddits = subreddits or _ALL_SPORT_SUBS
 
     @property
     def available(self) -> bool:
-        return True  # Always available — unauthenticated fallback exists
+        return True  # Always available — RSS needs no credentials
 
     @property
     def has_oauth(self) -> bool:
@@ -183,29 +190,105 @@ class RedditRSSSearch:
         )
 
     def search(self, query: str, max_results: int = 5) -> list[dict]:
-        """Search Reddit for recent posts matching the query."""
+        """Search Reddit for recent posts matching the query.
+
+        Strategy:
+          1. Fetch RSS feeds and filter locally by query keywords
+          2. If OAuth is configured and RSS didn't find enough, try JSON search
+        """
+        results = self._search_rss(query, max_results)
+
+        # If RSS found enough, return early
+        if len(results) >= max_results:
+            return results[:max_results]
+
+        # Try OAuth JSON search as supplement if configured
+        if self.has_oauth:
+            json_results = self._search_json_oauth(query, max_results - len(results))
+            # Deduplicate by URL
+            seen_urls = {r["url"] for r in results}
+            for r in json_results:
+                if r["url"] not in seen_urls:
+                    results.append(r)
+                    seen_urls.add(r["url"])
+                    if len(results) >= max_results:
+                        break
+
+        return results[:max_results]
+
+    def _search_rss(self, query: str, max_results: int) -> list[dict]:
+        """Fetch RSS feeds and filter posts by query keywords."""
         import requests as _requests
 
         results: list[dict] = []
         subs_to_search = self._pick_subreddits(query)
+        keywords = self._extract_keywords(query)
 
-        token = _get_reddit_oauth_token()
-        if token:
-            base_url = "https://oauth.reddit.com"
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "User-Agent": "BetAgent/1.0 (sports research bot)",
-            }
-        else:
-            base_url = "https://www.reddit.com"
-            headers = {"User-Agent": "BetAgent/1.0 (sports research bot)"}
-            if self.has_oauth:
-                logger.warning("Reddit OAuth configured but token fetch failed — using unauthenticated")
-
-        for sub in subs_to_search[:3]:  # Cap at 3 subs to stay fast
+        for sub in subs_to_search[:3]:
             try:
                 resp = _requests.get(
-                    f"{base_url}/r/{sub}/search.json",
+                    f"https://www.reddit.com/r/{sub}/.rss",
+                    headers={"User-Agent": "BetAgent/1.0 (sports research bot)"},
+                    timeout=8,
+                )
+                if resp.status_code in (429, 403):
+                    logger.debug("Reddit RSS returned %d for r/%s — skipping", resp.status_code, sub)
+                    continue
+                resp.raise_for_status()
+            except Exception as exc:
+                logger.debug("Reddit RSS fetch failed for r/%s: %s", sub, exc)
+                continue
+
+            try:
+                root = ET.fromstring(resp.content)
+            except ET.ParseError as exc:
+                logger.debug("Reddit RSS parse failed for r/%s: %s", sub, exc)
+                continue
+
+            for entry in root.findall(f"{self._ATOM_NS}entry"):
+                title_el = entry.find(f"{self._ATOM_NS}title")
+                title = title_el.text if title_el is not None and title_el.text else ""
+
+                content_el = entry.find(f"{self._ATOM_NS}content")
+                content = content_el.text if content_el is not None and content_el.text else ""
+                # Strip HTML tags for a clean snippet
+                snippet = re.sub(r"<[^>]+>", "", content)[:300] if content else title
+
+                link_el = entry.find(f"{self._ATOM_NS}link")
+                url = link_el.get("href", "") if link_el is not None else ""
+
+                # Filter: at least one keyword must appear in title or content
+                text_lower = f"{title} {snippet}".lower()
+                if keywords and not any(kw in text_lower for kw in keywords):
+                    continue
+
+                results.append({
+                    "title": title,
+                    "snippet": snippet,
+                    "url": url,
+                    "source": f"reddit/r/{sub}",
+                })
+
+                if len(results) >= max_results:
+                    return results
+
+        return results
+
+    def _search_json_oauth(self, query: str, max_results: int) -> list[dict]:
+        """Search via OAuth JSON API (requires credentials)."""
+        import requests as _requests
+
+        token = _get_reddit_oauth_token()
+        if not token:
+            return []
+
+        results: list[dict] = []
+        subs_to_search = self._pick_subreddits(query)
+
+        for sub in subs_to_search[:3]:
+            try:
+                resp = _requests.get(
+                    f"https://oauth.reddit.com/r/{sub}/search.json",
                     params={
                         "q": query,
                         "restrict_sr": "on",
@@ -213,19 +296,19 @@ class RedditRSSSearch:
                         "t": "week",
                         "limit": max_results,
                     },
-                    headers=headers,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "User-Agent": "BetAgent/1.0 (sports research bot)",
+                    },
                     timeout=8,
                 )
-                if resp.status_code == 429:
-                    logger.debug("Reddit rate-limited on r/%s — skipping", sub)
-                    continue
-                if resp.status_code == 403:
-                    logger.warning("Reddit returned 403 for r/%s — endpoint may be blocked", sub)
+                if resp.status_code in (429, 403):
+                    logger.debug("Reddit OAuth search %d for r/%s — skipping", resp.status_code, sub)
                     continue
                 resp.raise_for_status()
                 data = resp.json()
             except Exception as exc:
-                logger.debug("Reddit search failed for r/%s: %s", sub, exc)
+                logger.debug("Reddit OAuth search failed for r/%s: %s", sub, exc)
                 continue
 
             for post in data.get("data", {}).get("children", []):
@@ -247,6 +330,14 @@ class RedditRSSSearch:
                     return results
 
         return results
+
+    @staticmethod
+    def _extract_keywords(query: str) -> list[str]:
+        """Extract meaningful keywords from query (lowercase, 3+ chars)."""
+        stopwords = {"the", "and", "for", "are", "but", "not", "you", "all",
+                     "can", "has", "her", "was", "one", "our", "out", "with"}
+        words = query.lower().split()
+        return [w for w in words if len(w) >= 3 and w not in stopwords]
 
     def _pick_subreddits(self, query: str) -> list[str]:
         """Pick the most relevant subreddits based on query keywords."""
@@ -498,7 +589,9 @@ def create_search_backend() -> CascadingSearch:
     """
     backends: list = []
 
-    # Reddit RSS — always available, no API key needed
+    # Reddit RSS — always available, no API key needed.
+    # Uses /r/{sub}/.rss feeds with local keyword filtering.
+    # Optionally enhanced with OAuth JSON search if credentials are set.
     backends.append(RedditRSSSearch())
 
     tavily_key = os.environ.get("TAVILY_API_KEY", "")
