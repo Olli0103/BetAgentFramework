@@ -12,6 +12,8 @@ Design decisions:
   * One ``LLMClient`` instance per tier; the module-level ``chat()``
     convenience function targets **tier1_heavy_reasoning** by default.
   * Stateless — each call is an independent HTTP request.
+  * OpenClaw / Codex OAuth tokens are auto-refreshed via ``codex_auth``
+    when ``auth: codex_cli`` is set in the tier config.
 """
 
 from __future__ import annotations
@@ -43,6 +45,9 @@ class ProviderConfig:
     max_tokens: int = 8192
     temperature: float = 0.2
     timeout: int = 60
+    # When set, called instead of using ``api_key`` directly.
+    # Returns a fresh token string each time (for OAuth auto-refresh).
+    _token_fn: Any = None  # Callable[[], str] | None
 
 
 @dataclass
@@ -67,15 +72,34 @@ def _resolve_provider(cfg: dict[str, Any]) -> ProviderConfig | None:
     """Build a ``ProviderConfig`` from a raw YAML dict, or *None* if
     credentials are missing."""
     provider = cfg.get("provider", "")
+    auth_mode = cfg.get("auth", "")
+    token_fn = None
 
-    # Resolve API key / OAuth token from env
-    api_key = ""
-    if "auth_env" in cfg:
-        api_key = os.environ.get(cfg["auth_env"], "")
-    elif "api_key_env" in cfg:
-        api_key = os.environ.get(cfg["api_key_env"], "")
+    # ── Codex CLI auto-refresh (reads ~/.codex/auth.json) ────────
+    if auth_mode == "codex_cli":
+        try:
+            from bet_agent.llm.codex_auth import get_access_token
 
-    if not api_key:
+            # Verify that auth.json exists and is readable
+            test_token = get_access_token()
+            api_key = test_token  # initial value
+            token_fn = get_access_token
+            logger.info("Codex CLI auth active — tokens auto-refresh from ~/.codex/auth.json")
+        except Exception as exc:
+            logger.debug("Codex CLI auth unavailable (%s) — trying env fallback", exc)
+            # Fall through to env-based auth below
+            token_fn = None
+            api_key = ""
+
+    # ── Standard env-based auth ──────────────────────────────────
+    if token_fn is None:
+        api_key = ""
+        if "auth_env" in cfg:
+            api_key = os.environ.get(cfg["auth_env"], "")
+        elif "api_key_env" in cfg:
+            api_key = os.environ.get(cfg["api_key_env"], "")
+
+    if not api_key and token_fn is None:
         logger.debug("No credentials for provider %s — skipping", provider)
         return None
 
@@ -96,6 +120,7 @@ def _resolve_provider(cfg: dict[str, Any]) -> ProviderConfig | None:
         max_tokens=cfg.get("max_tokens", 8192),
         temperature=cfg.get("temperature", 0.2),
         timeout=cfg.get("timeout_seconds", 60),
+        _token_fn=token_fn,
     )
 
 
@@ -223,9 +248,12 @@ class LLMClient:
             "temperature": temperature if temperature is not None else prov.temperature,
         }
 
+        # Use dynamic token if available (Codex auto-refresh), else static key
+        token = prov._token_fn() if prov._token_fn else prov.api_key
+
         url = f"{prov.base_url}/chat/completions"
         headers = {
-            "Authorization": f"Bearer {prov.api_key}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
 

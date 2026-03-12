@@ -9,8 +9,8 @@ tiers:
     primary:
       provider: openclaw
       model: openclaw/codex
-      auth: oauth
-      auth_env: OPENCLAW_OAUTH_TOKEN
+      auth: codex_cli              # Auto-refresh from ~/.codex/auth.json
+      auth_env: OPENCLAW_OAUTH_TOKEN  # Fallback if ~/.codex/auth.json missing
       max_tokens: 8192
       temperature: 0.2
       timeout_seconds: 60
