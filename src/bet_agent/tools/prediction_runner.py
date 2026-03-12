@@ -601,6 +601,37 @@ def get_positive_ev_predictions(
     return list(session.execute(query).scalars().all())
 
 
+def get_todays_actionable_predictions(
+    session: Session,
+    prediction_date: date | None = None,
+) -> list[Prediction]:
+    """Query today's APPROVED and PLACED predictions for daily summary.
+
+    Unlike get_positive_ev_predictions (which defaults to PENDING),
+    this returns predictions that have already passed the veto+sizing pipeline
+    and are ready for or have been executed.
+    """
+    if prediction_date is None:
+        prediction_date = date.today()
+
+    day_start = datetime.combine(prediction_date, time.min, tzinfo=timezone.utc)
+    day_end = datetime.combine(prediction_date, time.max, tzinfo=timezone.utc)
+
+    query = (
+        select(Prediction)
+        .join(Match)
+        .where(
+            Prediction.status.in_([PredictionStatus.APPROVED, PredictionStatus.PLACED]),
+            Prediction.ev > Decimal("0"),
+            Match.scheduled_at >= day_start,
+            Match.scheduled_at <= day_end,
+        )
+        .order_by(Prediction.ev.desc())
+    )
+
+    return list(session.execute(query).scalars().all())
+
+
 def update_prediction_status(
     session: Session,
     prediction_id,

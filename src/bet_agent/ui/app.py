@@ -1,16 +1,17 @@
 """OpenClaw Quant Command Center — Streamlit WebUI.
 
-Institutional-grade read-only dashboard for the BetAgent MAS.
+Institutional-grade Control Tower dashboard for the BetAgent MAS.
 Accessible on the local network via http://<mac-mini-ip>:8501
 
 Launch:
     streamlit run src/bet_agent/ui/app.py --server.address 0.0.0.0
 
 Tabs:
-    1. Pipeline     — Kanban view of today's prediction flow
-    2. Portfolio     — Time-series PnL, bankroll growth, sport exposure
-    3. MLOps         — Model health, Brier Scores, ROI, killswitch indicators
-    4. Agent Logs    — Live tail of agent execution logs
+    1. Command Center — KPI bar + Kanban pipeline with full team names
+    2. Portfolio       — Time-series PnL, bankroll growth, sport exposure
+    3. MLOps           — Model health, Brier Scores, ROI, killswitch indicators
+    4. Agent Status    — Live health cards for all 9 agents
+    5. Bet Execution   — Pending bets to place, with clear instructions
 
 Charts: Plotly with dark theme, hover tooltips, fill-to-zero.
 Auto-refresh: streamlit-autorefresh (proper component, no meta-refresh hack).
@@ -40,7 +41,7 @@ try:
 except ImportError:
     HAS_AUTOREFRESH = False
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 # ── Page config (must be first Streamlit call) ───────────────────────
 st.set_page_config(
@@ -80,13 +81,24 @@ from bet_agent.db.models import (
     Sport,
 )
 from bet_agent.db.session import get_session
+from bet_agent.ui.helpers import SPORT_EMOJI, get_match_display, resolve_display_name
+
+
+# ── Working window: 07:00 UTC → 07:00 UTC next day ──────────────────
+
+def _get_working_window() -> tuple[datetime, datetime]:
+    """Return the current working window (07:00 UTC to 07:00 UTC next day)."""
+    now = datetime.now(timezone.utc)
+    today_7am = datetime.combine(now.date(), time(7, 0), tzinfo=timezone.utc)
+
+    if now >= today_7am:
+        return today_7am, today_7am + timedelta(days=1)
+    else:
+        yesterday_7am = today_7am - timedelta(days=1)
+        return yesterday_7am, today_7am
 
 
 # ── Cached data loaders ──────────────────────────────────────────────
-# Streamlit re-runs the entire script on every interaction (tab switch,
-# button click, auto-refresh). @st.cache_data keeps expensive DB queries
-# in RAM for `ttl` seconds so the UI stays responsive at scale.
-
 
 @st.cache_data(ttl=60)
 def _cached_pnl_timeseries(days: int, ledger_type_value: str | None) -> list[dict]:
@@ -101,7 +113,6 @@ def _cached_sport_exposure() -> list[dict]:
     from bet_agent.tools.master_analysis import fetch_sport_exposure
     with get_session() as sess:
         results = fetch_sport_exposure(sess)
-        # Convert dataclasses to dicts for Streamlit serialization
         return [
             {"sport": e.sport, "pending_count": e.pending_count,
              "total_stake": float(e.total_stake), "avg_odds": float(e.avg_odds),
@@ -195,44 +206,51 @@ except Exception:
     st.sidebar.warning("DB not reachable")
 
 st.sidebar.divider()
+
+# Working window info
+w_start, w_end = _get_working_window()
+st.sidebar.caption(
+    f"Working window: {w_start.strftime('%H:%M')} \u2013 {w_end.strftime('%H:%M')} UTC\n\n"
+    f"({w_start.strftime('%Y-%m-%d')} \u2013 {w_end.strftime('%Y-%m-%d')})"
+)
+
 if HAS_AUTOREFRESH:
-    st.sidebar.caption("Auto-refreshes every 30s (streamlit-autorefresh)")
+    st.sidebar.caption("Auto-refreshes every 30s")
 else:
     st.sidebar.caption("Install streamlit-autorefresh for auto-refresh")
 
 # ── Tab layout ───────────────────────────────────────────────────────
 
-tab_pipeline, tab_portfolio, tab_mlops, tab_logs = st.tabs([
-    "\U0001f4cb Pipeline",
+tab_cmd, tab_portfolio, tab_mlops, tab_agents, tab_execution = st.tabs([
+    "\U0001f3af Command Center",
     "\U0001f4c8 Portfolio & PnL",
     "\U0001f9e0 MLOps & Health",
-    "\U0001f4dc Agent Logs",
+    "\U0001f916 Agent Status",
+    "\U0001f4b0 Bet Execution",
 ])
 
 
 # ══════════════════════════════════════════════════════════════════════
-# TAB 1: PIPELINE — Kanban view of today's prediction flow
+# TAB 1: COMMAND CENTER — KPI bar + Pipeline Kanban
 # ══════════════════════════════════════════════════════════════════════
 
-with tab_pipeline:
-    st.header("Today's Pipeline")
+with tab_cmd:
+    st.header("Command Center")
 
-    today_start = datetime.combine(date.today(), time.min, tzinfo=timezone.utc)
-    today_end = datetime.combine(date.today(), time.max, tzinfo=timezone.utc)
+    w_start, w_end = _get_working_window()
 
     try:
         with get_session() as sess:
-            # Get today's matches
+            # Get matches in working window
             matches = list(
                 sess.execute(
                     select(Match).where(
-                        Match.scheduled_at >= today_start,
-                        Match.scheduled_at <= today_end,
+                        Match.scheduled_at >= w_start,
+                        Match.scheduled_at <= w_end,
                     ).order_by(Match.scheduled_at)
                 ).scalars().all()
             )
 
-            # Get predictions for today's matches
             match_ids = [m.id for m in matches]
             predictions = []
             if match_ids:
@@ -242,12 +260,45 @@ with tab_pipeline:
                     ).scalars().all()
                 )
 
-            # Group predictions by status
+            # ── KPI bar ──────────────────────────────────────────
+            n_matches = len(matches)
+            n_predictions = len(predictions)
+            n_pending = sum(1 for p in predictions if p.status == PredictionStatus.PENDING)
+            n_approved = sum(1 for p in predictions if p.status == PredictionStatus.APPROVED)
+            n_vetoed = sum(1 for p in predictions if p.status == PredictionStatus.VETOED)
+            n_placed = sum(1 for p in predictions if p.status == PredictionStatus.PLACED)
+
+            # Count settled bets
+            settled_bets = []
+            if match_ids:
+                settled_bets = list(
+                    sess.execute(
+                        select(PlacedBet).where(
+                            PlacedBet.match_id.in_(match_ids),
+                            PlacedBet.status.in_([BetStatus.WON, BetStatus.LOST, BetStatus.VOID]),
+                        )
+                    ).scalars().all()
+                )
+            n_settled = len(settled_bets)
+            settled_pnl = sum(float(b.pnl_eur or 0) for b in settled_bets)
+
+            k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
+            k1.metric("Matches", n_matches)
+            k2.metric("Predictions", n_predictions)
+            k3.metric("Pending", n_pending)
+            k4.metric("Approved", n_approved, delta=f"{n_approved}" if n_approved else None)
+            k5.metric("Vetoed", n_vetoed)
+            k6.metric("Placed", n_placed)
+            k7.metric("Settled", n_settled, delta=f"{settled_pnl:+.2f} EUR" if settled_bets else None)
+
+            st.divider()
+
+            # ── Kanban pipeline ──────────────────────────────────
             kanban: dict[str, list] = {
                 "NOT STARTED": [],
                 "PENDING ML": [],
                 "VETOED": [],
-                "APPROVED & SIZED": [],
+                "APPROVED": [],
                 "SETTLED": [],
             }
 
@@ -266,7 +317,6 @@ with tab_pipeline:
                 elif p.status == PredictionStatus.VETOED:
                     kanban["VETOED"].append(entry)
                 elif p.status in (PredictionStatus.APPROVED, PredictionStatus.PLACED):
-                    # Check if bet is settled
                     bet = sess.execute(
                         select(PlacedBet).where(
                             PlacedBet.match_id == p.match_id,
@@ -279,7 +329,7 @@ with tab_pipeline:
                         entry["bet"] = bet
                         kanban["SETTLED"].append(entry)
                     else:
-                        kanban["APPROVED & SIZED"].append(entry)
+                        kanban["APPROVED"].append(entry)
 
             # Render Kanban columns
             cols = st.columns(5)
@@ -293,19 +343,21 @@ with tab_pipeline:
                     st.divider()
 
                     items = kanban[header]
-                    for item in items[:20]:  # Cap display
+                    for item in items[:20]:
                         if header == "NOT STARTED":
                             m = item
+                            disp = get_match_display(sess, m)
                             st.markdown(
-                                f"**{m.home_team}** vs **{m.away_team}**\n\n"
-                                f"`{m.sport.value}` | {m.league}\n\n"
-                                f"Kickoff: {m.scheduled_at.strftime('%H:%M')}"
+                                f"{disp['sport_emoji']} **{disp['home']}** vs **{disp['away']}**\n\n"
+                                f"`{disp['sport']}` | {disp['league']}\n\n"
+                                f"Kickoff: {disp['kickoff']}"
                             )
                         elif header == "VETOED":
                             p = item["prediction"]
                             m = item["match"]
+                            disp = get_match_display(sess, m)
                             st.markdown(
-                                f"**{m.home_team}** vs **{m.away_team}**\n\n"
+                                f"{disp['sport_emoji']} **{disp['home']}** vs **{disp['away']}**\n\n"
                                 f"`{p.selection}` | EV: {p.ev:.4f}\n\n"
                                 f"Reason: _{p.veto_reason or 'N/A'}_"
                             )
@@ -313,6 +365,7 @@ with tab_pipeline:
                             p = item["prediction"]
                             m = item["match"]
                             b = item["bet"]
+                            disp = get_match_display(sess, m)
                             pnl_str = f"{b.pnl_eur:+.2f}" if b.pnl_eur else "0.00"
                             status_icon = {
                                 BetStatus.WON: "\U0001f7e2",
@@ -320,17 +373,20 @@ with tab_pipeline:
                                 BetStatus.VOID: "\u26aa",
                             }.get(b.status, "\u2753")
                             st.markdown(
-                                f"{status_icon} **{m.home_team}** vs **{m.away_team}**\n\n"
+                                f"{status_icon} **{disp['home']}** vs **{disp['away']}**\n\n"
                                 f"`{p.selection}` @ {b.odds_at_placement:.2f}\n\n"
                                 f"PnL: **{pnl_str} EUR** | {b.status.value.upper()}"
                             )
                         else:
+                            # PENDING ML or APPROVED
                             p = item["prediction"]
                             m = item["match"]
+                            disp = get_match_display(sess, m)
+                            ev_color = "green" if p.ev > 0 else "red"
                             st.markdown(
-                                f"**{m.home_team}** vs **{m.away_team}**\n\n"
-                                f"`{p.selection}` | EV: {p.ev:.4f}\n\n"
-                                f"Model: {p.model_source} | Prob: {p.model_prob:.1%}"
+                                f"{disp['sport_emoji']} **{disp['home']}** vs **{disp['away']}**\n\n"
+                                f"`{p.selection}` | EV: :{ev_color}[{p.ev:.4f}]\n\n"
+                                f"Prob: {p.model_prob:.1%} | {p.model_source}"
                             )
                         st.divider()
 
@@ -467,8 +523,9 @@ with tab_portfolio:
                 st.bar_chart(exp_data)
 
             for e in exposure:
+                emoji = SPORT_EMOJI.get(e["sport"], "\U0001f3c6")
                 st.markdown(
-                    f"**{e['sport']}**: {e['pending_count']} bets | "
+                    f"{emoji} **{e['sport']}**: {e['pending_count']} bets | "
                     f"{e['total_stake']:.2f} EUR staked | "
                     f"Avg odds: {e['avg_odds']:.2f} | Avg EV: {e['avg_ev']:.4f}"
                 )
@@ -500,7 +557,7 @@ with tab_mlops:
             degraded = [r for r in health_reports if r["is_degraded"]]
             if degraded:
                 st.error(
-                    f"\U0001f6a8 **KILLSWITCH ACTIVE** — "
+                    f"\U0001f6a8 **KILLSWITCH ACTIVE** \u2014 "
                     f"{len(degraded)} model(s) degraded: "
                     + ", ".join(f"`{r['model_name']}`" for r in degraded)
                     + "\n\nBetting HALTED for these models until human retraining approval."
@@ -538,7 +595,6 @@ with tab_mlops:
 
             if metrics:
                 if HAS_PLOTLY:
-                    # Group by model_name
                     model_series: dict[str, tuple[list, list]] = {}
                     for m in metrics:
                         if m["model_name"] not in model_series:
@@ -555,7 +611,6 @@ with tab_mlops:
                             hovertemplate="%{x}<br>Brier: %{y:.4f}<extra></extra>",
                         ))
 
-                    # Degradation threshold line
                     fig_brier.add_hline(
                         y=0.22, line_dash="dash", line_color="#ff1744",
                         annotation_text="Degradation threshold (0.22)",
@@ -584,54 +639,222 @@ with tab_mlops:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# TAB 4: AGENT LOGS
+# TAB 4: AGENT STATUS — Health cards for all 9 agents
 # ══════════════════════════════════════════════════════════════════════
 
-with tab_logs:
-    st.header("Agent Activity Logs")
+AGENT_DEFS = [
+    {"id": "master", "name": "Master Agent", "role": "Portfolio Manager & Concierge",
+     "emoji": "\U0001f451", "tier": "Tier 1"},
+    {"id": "scout", "name": "Scout Agent", "role": "Data Gatherer & Live Monitor",
+     "emoji": "\U0001f50d", "tier": "Tier 2"},
+    {"id": "data_janitor", "name": "Data Janitor", "role": "ETL & Name Resolution",
+     "emoji": "\U0001f9f9", "tier": "Tier 2"},
+    {"id": "quant", "name": "Quant Agent", "role": "Probability & ML Engine",
+     "emoji": "\U0001f4ca", "tier": "Tier 2"},
+    {"id": "devils_advocate", "name": "Devil's Advocate", "role": "Veto Power",
+     "emoji": "\U0001f608", "tier": "Tier 1"},
+    {"id": "line_shopper", "name": "Line Shopper", "role": "Odds Maximizer",
+     "emoji": "\U0001f6d2", "tier": "Tier 2"},
+    {"id": "risk_manager", "name": "Risk Manager", "role": "Bankroll Sizing",
+     "emoji": "\U0001f6e1\ufe0f", "tier": "Tier 2"},
+    {"id": "moonshot", "name": "Moonshot Architect", "role": "Parlay Builder",
+     "emoji": "\U0001f680", "tier": "Tier 1"},
+    {"id": "auditor", "name": "Auditor", "role": "Performance Evaluator",
+     "emoji": "\U0001f4d1", "tier": "Tier 1"},
+]
 
-    log_file = os.getenv("BETAGENT_LOG_FILE", "logs/betagent.log")
+with tab_agents:
+    st.header("Agent Status")
 
-    if Path(log_file).exists():
-        num_lines = st.slider("Tail lines", 50, 500, 100)
-
-        try:
-            with open(log_file, "r") as f:
-                lines = f.readlines()
-                tail = lines[-num_lines:]
-
-            # Color-code log levels
-            for line in tail:
-                if "ERROR" in line or "CRITICAL" in line:
-                    st.markdown(f":red[{line.rstrip()}]")
-                elif "WARNING" in line or "DEGRADED" in line:
-                    st.markdown(f":orange[{line.rstrip()}]")
-                elif "Settlement" in line or "Settled" in line:
-                    st.markdown(f":green[{line.rstrip()}]")
-                else:
-                    st.text(line.rstrip())
-
-        except Exception as e:
-            st.error(f"Failed to read log file: {e}")
-    else:
-        st.info(
-            f"Log file not found at `{log_file}`.\n\n"
-            f"Set `BETAGENT_LOG_FILE` env var or ensure logging is configured.\n\n"
-            f"Example: `export BETAGENT_LOG_FILE=logs/betagent.log`"
-        )
-
-        # Fallback: show recent DB activity
-        st.subheader("Recent Database Activity (fallback)")
-        try:
+    try:
+        with get_session() as sess:
             activity = _cached_recent_activity()
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Predictions Today", activity["predictions_today"])
-            c2.metric("Settled Today", activity["settled_today"])
-            c3.metric("Settlement PnL", f"{activity['last_settlement_pnl']:+.2f} EUR")
 
-            c4, c5, c6 = st.columns(3)
-            c4.metric("Approved", activity["approved_today"])
-            c5.metric("Vetoed", activity["vetoed_today"])
-            c6.metric("Placed", activity["placed_today"])
-        except Exception as e:
-            st.error(f"Activity query failed: {e}")
+            # Build per-agent activity heuristics from DB
+            agent_activity = {}
+
+            # Scout: check recent matches with odds
+            recent_matches_with_odds = sess.execute(
+                select(func.count(Match.id)).where(
+                    Match.scheduled_at >= w_start,
+                    Match.scheduled_at <= w_end,
+                )
+            ).scalar() or 0
+            agent_activity["scout"] = {
+                "status": "active" if recent_matches_with_odds > 0 else "idle",
+                "detail": f"{recent_matches_with_odds} matches in window",
+            }
+
+            # Quant: predictions today
+            agent_activity["quant"] = {
+                "status": "active" if activity["predictions_today"] > 0 else "idle",
+                "detail": f"{activity['predictions_today']} predictions today",
+            }
+
+            # Devil's Advocate: vetoed today
+            agent_activity["devils_advocate"] = {
+                "status": "active" if activity["vetoed_today"] > 0 else "idle",
+                "detail": f"{activity['vetoed_today']} vetoed today",
+            }
+
+            # Risk Manager: approved/sized today
+            agent_activity["risk_manager"] = {
+                "status": "active" if activity["approved_today"] > 0 else "idle",
+                "detail": f"{activity['approved_today']} sized today",
+            }
+
+            # Auditor: settled today
+            agent_activity["auditor"] = {
+                "status": "active" if activity["settled_today"] > 0 else "idle",
+                "detail": f"{activity['settled_today']} settled today",
+            }
+
+            # Master: always active
+            agent_activity["master"] = {
+                "status": "active",
+                "detail": "Orchestrating pipeline",
+            }
+
+            # Line Shopper: check if any predictions have best_odds
+            approved_with_odds = sess.execute(
+                select(func.count(Prediction.id)).where(
+                    Prediction.status == PredictionStatus.APPROVED,
+                    Prediction.best_odds.isnot(None),
+                )
+            ).scalar() or 0
+            agent_activity["line_shopper"] = {
+                "status": "active" if approved_with_odds > 0 else "idle",
+                "detail": f"{approved_with_odds} lines shopped",
+            }
+
+            # Data Janitor: inferred from scout activity
+            agent_activity["data_janitor"] = {
+                "status": "active" if recent_matches_with_odds > 0 else "idle",
+                "detail": "Processing crawl data" if recent_matches_with_odds > 0 else "Waiting for data",
+            }
+
+            # Moonshot: check parlays (if any placed bets are parlays)
+            agent_activity["moonshot"] = {
+                "status": "idle",
+                "detail": "Waiting for approved singles",
+            }
+
+        # Render agent cards in 3x3 grid
+        for row_start in range(0, len(AGENT_DEFS), 3):
+            row_agents = AGENT_DEFS[row_start:row_start + 3]
+            cols = st.columns(len(row_agents))
+
+            for col, agent_def in zip(cols, row_agents):
+                with col:
+                    aid = agent_def["id"]
+                    info = agent_activity.get(aid, {"status": "idle", "detail": ""})
+                    status_dot = "\U0001f7e2" if info["status"] == "active" else "\u26aa"
+
+                    st.markdown(
+                        f"### {agent_def['emoji']} {agent_def['name']}\n\n"
+                        f"{status_dot} **{info['status'].upper()}** | {agent_def['tier']}\n\n"
+                        f"_{agent_def['role']}_\n\n"
+                        f"{info['detail']}"
+                    )
+                    st.divider()
+
+    except Exception as e:
+        st.error(f"Agent status query failed: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TAB 5: BET EXECUTION — Pending bets with clear placement instructions
+# ══════════════════════════════════════════════════════════════════════
+
+with tab_execution:
+    st.header("Bet Execution")
+    st.caption(
+        "Approved bets awaiting manual placement. "
+        "Place the bet on the listed sportsbook, then mark as placed."
+    )
+
+    try:
+        with get_session() as sess:
+            # Get APPROVED predictions not yet placed
+            approved_preds = list(
+                sess.execute(
+                    select(Prediction).where(
+                        Prediction.status == PredictionStatus.APPROVED,
+                    ).order_by(Prediction.created_at.desc())
+                ).scalars().all()
+            )
+
+            if not approved_preds:
+                st.info("No bets awaiting execution. All clear.")
+            else:
+                st.success(f"\U0001f4b0 **{len(approved_preds)} bet(s) ready to place**")
+
+                for pred in approved_preds:
+                    match = sess.get(Match, pred.match_id)
+                    if not match:
+                        continue
+
+                    disp = get_match_display(sess, match)
+                    emoji = disp["sport_emoji"]
+
+                    # Get best odds info
+                    odds_display = f"{pred.best_odds:.2f}" if pred.best_odds else "N/A"
+                    book_display = pred.best_bookmaker or "Check line shopper"
+                    stake_display = f"{pred.stake_eur:.2f} EUR" if pred.stake_eur else "Not sized"
+                    ev_display = f"{pred.ev:.4f}" if pred.ev else "N/A"
+                    ledger_display = pred.ledger_type.value.upper() if pred.ledger_type else "TBD"
+
+                    with st.container():
+                        st.markdown(f"---")
+                        st.markdown(
+                            f"### {emoji} {disp['home']} vs {disp['away']}\n\n"
+                            f"**Kickoff:** {disp['kickoff']} UTC | "
+                            f"**League:** {disp['league']}"
+                        )
+
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Selection", pred.selection)
+                        c2.metric("Best Odds", odds_display)
+                        c3.metric("Stake", stake_display)
+                        c4.metric("EV", ev_display)
+
+                        bc1, bc2 = st.columns(2)
+                        bc1.markdown(f"**Sportsbook:** `{book_display}`")
+                        bc2.markdown(f"**Ledger:** `{ledger_display}`")
+
+                        st.markdown(
+                            f"**Model:** {pred.model_source} | "
+                            f"**Prob:** {pred.model_prob:.1%} | "
+                            f"**Market:** {pred.market_type.value if pred.market_type else 'N/A'}"
+                        )
+
+            # Also show recently placed (for confirmation)
+            st.divider()
+            st.subheader("Recently Placed")
+
+            placed_preds = list(
+                sess.execute(
+                    select(Prediction).where(
+                        Prediction.status == PredictionStatus.PLACED,
+                    ).order_by(Prediction.created_at.desc())
+                    .limit(10)
+                ).scalars().all()
+            )
+
+            if placed_preds:
+                for pred in placed_preds:
+                    match = sess.get(Match, pred.match_id)
+                    if not match:
+                        continue
+                    disp = get_match_display(sess, match)
+                    odds_str = f"@ {pred.best_odds:.2f}" if pred.best_odds else ""
+                    st.markdown(
+                        f"\u2705 **{disp['vs']}** \u2014 `{pred.selection}` {odds_str} "
+                        f"| {pred.stake_eur:.2f} EUR" if pred.stake_eur else
+                        f"\u2705 **{disp['vs']}** \u2014 `{pred.selection}` {odds_str}"
+                    )
+            else:
+                st.caption("No recently placed bets.")
+
+    except Exception as e:
+        st.error(f"Execution query failed: {e}")

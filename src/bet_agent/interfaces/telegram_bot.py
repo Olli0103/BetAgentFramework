@@ -107,8 +107,9 @@ def is_authorized(user_id: int, chat_id: int | None = None) -> bool:
 
     # Any other chat (random groups, channels) → BLOCK
     logger.warning(
-        "Whitelisted user_id=%d attempted command in unauthorized chat_id=%d",
-        user_id, chat_id,
+        "Whitelisted user_id=%d attempted command in unauthorized chat_id=%d. "
+        "To authorize this group, set TELEGRAM_GROUP_ID=%d in your .env file.",
+        user_id, chat_id, chat_id,
     )
     return False
 

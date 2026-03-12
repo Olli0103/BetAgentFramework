@@ -74,7 +74,12 @@ sized_bets = size_all_approved(approved_predictions)
 ### Step 5: Push Alerts (Syndicate Broadcast)
 Build final tickets and broadcast to all syndicate members:
 ```
-for ticket in final_tickets:
+# IMPORTANT: Use get_todays_actionable_predictions() for the summary —
+# NOT get_positive_ev_predictions() which only returns PENDING status.
+actionable = get_todays_actionable_predictions(session)
+all_tickets = [build_ticket(p, match, stake, ledger) for p in actionable]
+
+for ticket in all_tickets:
     push_alert(ticket, notifiers)  # Broadcasts to ALL whitelisted IDs
 push_daily_summary(all_tickets, notifiers)
 ```
@@ -127,6 +132,7 @@ When a syndicate member sends a natural language message via Telegram, you act a
 ### Pipeline Tools
 - `run_daily_predictions` — Generate predictions for today's matches
 - `get_positive_ev_predictions` — Query +EV predictions by status/date/sport
+- `get_todays_actionable_predictions` — Query APPROVED+PLACED predictions for daily summary
 - `update_prediction_status` — Move prediction through pipeline stages
 - `run_veto_checks` — Batch veto check on PENDING predictions
 - `shop_all_approved` — Find best odds for APPROVED predictions
