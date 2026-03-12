@@ -44,31 +44,52 @@ _ROLL_WINDOWS = (5, 10)
 _BUFFER_STATS = ("points_for", "points_against", "margin", "total_points")
 
 
+def _derive_nba_season(match_date) -> str:
+    """Derive NBA season string from match date.
+
+    NBA season runs Oct → Jun, so a game in Jan 2025 belongs to "2024-25".
+    """
+    year = match_date.year
+    month = match_date.month
+    if month >= 10:
+        return f"{year}-{(year + 1) % 100:02d}"
+    elif month <= 6:
+        return f"{year - 1}-{year % 100:02d}"
+    else:
+        # Jul-Sep: preseason/summer league for upcoming season
+        return f"{year}-{(year + 1) % 100:02d}"
+
+
 def _parse_season(raw: str | None, match_date=None) -> str:
     """Robustly parse season from CSV value.
 
     Handles:
-      - Integer: 2024 → "2024"
-      - Float string: "2024.0" → "2024"
-      - Plain string: "2024" → "2024"
-      - Empty/None → derived from match_date year
+      - Cross-year string: "2024-25" → "2024-25" (pass through)
+      - Integer: 2024 → "2024-25" (interpreted as season start year)
+      - Float string: "2024.0" → "2024-25"
+      - Plain string: "2024" → "2024-25"
+      - Empty/None → derived from match_date
     """
     if not raw or not str(raw).strip():
         if match_date is not None:
-            return str(match_date.year)
+            return _derive_nba_season(match_date)
         return "unknown"
 
     s = str(raw).strip()
 
-    # Handle float-like strings: "2024.0" → "2024", reject NaN/Inf
+    # Already in cross-year format: "2024-25"
+    if "-" in s and len(s) >= 7:
+        return s
+
+    # Handle float-like strings: "2024.0" → 2024, reject NaN/Inf
     try:
         val = float(s)
         if val != val or val == float("inf") or val == float("-inf"):
-            # NaN or Inf — treat as missing
             if match_date is not None:
-                return str(match_date.year)
+                return _derive_nba_season(match_date)
             return "unknown"
-        return str(int(val))
+        start = int(val)
+        return f"{start}-{(start + 1) % 100:02d}"
     except (ValueError, TypeError, OverflowError):
         pass
 

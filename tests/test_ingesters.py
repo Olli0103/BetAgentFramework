@@ -180,6 +180,39 @@ class TestNBAIngester:
             model = ingester.row_to_model(ingester.parse_file(path)[0], str(path))
             assert model.result == "A"
 
+    def test_season_cross_year_format(self):
+        """NBA season stored as cross-year: 2025 → '2025-26'."""
+        from bet_agent.ingest.nba import NBAIngester
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_csv(
+                Path(tmp), "nba.csv",
+                ["season", "date", "away", "home", "score_away", "score_home"],
+                [["2025", "2026-01-15", "Lakers", "Celtics", "108", "120"]],
+            )
+            ingester = NBAIngester()
+            model = ingester.row_to_model(ingester.parse_file(path)[0], str(path))
+            assert model.season == "2025-26"
+
+    def test_season_derived_from_date_when_missing(self):
+        """When CSV has no season, derive from date."""
+        from bet_agent.ingest.nba import NBAIngester, _derive_nba_season
+
+        # Jan 2026 → "2025-26"
+        assert _derive_nba_season(date(2026, 1, 15)) == "2025-26"
+        # Oct 2025 → "2025-26"
+        assert _derive_nba_season(date(2025, 10, 20)) == "2025-26"
+        # Jun 2026 → "2025-26"
+        assert _derive_nba_season(date(2026, 6, 15)) == "2025-26"
+        # Aug 2025 → "2025-26" (preseason)
+        assert _derive_nba_season(date(2025, 8, 1)) == "2025-26"
+
+    def test_season_passthrough_if_already_cross_year(self):
+        """If CSV already has '2025-26', pass through unchanged."""
+        from bet_agent.ingest.nba import _parse_season
+
+        assert _parse_season("2025-26") == "2025-26"
+
 
 # ── NHL Ingester ─────────────────────────────────────────────────────
 
@@ -363,16 +396,19 @@ class TestNFLIngester:
         from bet_agent.ingest.nfl import NFLIngester
 
         ingester = NFLIngester()
-        assert ingester._derive_season("nfl_2025.xlsx", date(2026, 1, 15)) == "2025"
+        # Single year in filename → cross-year format
+        assert ingester._derive_season("nfl_2025.xlsx", date(2026, 1, 15)) == "2025-26"
+        # Cross-year already in filename
+        assert ingester._derive_season("nfl_2025-26.xlsx", date(2026, 1, 15)) == "2025-26"
 
     def test_season_derivation_from_date(self):
         from bet_agent.ingest.nfl import NFLIngester
 
         ingester = NFLIngester()
         # Feb game → previous year's season
-        assert ingester._derive_season("games.xlsx", date(2026, 2, 1)) == "2025"
+        assert ingester._derive_season("games.xlsx", date(2026, 2, 1)) == "2025-26"
         # Sep game → current year
-        assert ingester._derive_season("games.xlsx", date(2025, 9, 7)) == "2025"
+        assert ingester._derive_season("games.xlsx", date(2025, 9, 7)) == "2025-26"
 
 
 # ── Tennis Ingester ──────────────────────────────────────────────────

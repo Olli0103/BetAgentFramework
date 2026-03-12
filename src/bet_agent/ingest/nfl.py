@@ -375,13 +375,26 @@ class NFLIngester(BaseIngester):
         )
 
     def _derive_season(self, source_file: str, match_date) -> str:
-        """NFL season: Aug-Feb spans two calendar years."""
+        """NFL season: Aug-Feb spans two calendar years → '2024-25' format.
+
+        Tries filename first (e.g. 'nfl_2024.csv' → '2024-25'),
+        then falls back to match date logic.
+        """
         name = Path(source_file).stem
+        # Try cross-year pattern in filename first: "2024-25" or "2024_25"
+        m = re.search(r"(20\d{2})[-_](\d{2})", name)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}"
+        # Single year in filename: "nfl_2024.csv" → "2024-25"
         m = re.search(r"(20\d{2})", name)
         if m:
-            return m.group(1)
+            start = int(m.group(1))
+            return f"{start}-{(start + 1) % 100:02d}"
+        # Derive from match date
         year = match_date.year
         month = match_date.month
         if month <= 6:
-            return str(year - 1)
-        return str(year)
+            # Jan-Jun: season started previous year
+            return f"{year - 1}-{year % 100:02d}"
+        # Jul-Dec: season starts this year
+        return f"{year}-{(year + 1) % 100:02d}"
