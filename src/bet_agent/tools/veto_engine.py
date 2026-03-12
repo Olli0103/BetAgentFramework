@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
@@ -41,7 +42,7 @@ logger = logging.getLogger(__name__)
 class VetoResult:
     """Result of a qualitative veto check."""
 
-    prediction_id: object  # UUID
+    prediction_id: uuid.UUID
     decision: str  # "APPROVE" or "VETO"
     reason: str
     risk_factors: list[str] = field(default_factory=list)

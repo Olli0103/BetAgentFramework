@@ -463,7 +463,7 @@ def process_crawl_results(
 
         sport_enum = Sport(sport)
         resolver = IroncladAliasResolver(session, sport_enum)
-    except (ValueError, Exception) as exc:
+    except (ValueError, ImportError) as exc:
         logger.warning(
             "Could not init alias resolver for %s: %s — raw names will be used",
             sport, exc,

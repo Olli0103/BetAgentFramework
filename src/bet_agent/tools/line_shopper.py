@@ -9,6 +9,7 @@ Compares apples to apples: same market_type AND same selection string.
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 class ShoppedLine:
     """Result of shopping a single prediction across sportsbooks."""
 
-    prediction_id: object  # UUID
+    prediction_id: uuid.UUID
     market_type: MarketType
     selection: str
     best_odds: Decimal

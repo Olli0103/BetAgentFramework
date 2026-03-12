@@ -10,6 +10,7 @@ Golden Rule #2: STATEFUL MEMORY — all settlements go to PostgreSQL.
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -37,7 +38,7 @@ logger = logging.getLogger(__name__)
 class SettlementResult:
     """Result of settling a single bet."""
 
-    bet_id: object  # UUID
+    bet_id: uuid.UUID
     old_status: BetStatus
     new_status: BetStatus
     pnl_eur: Decimal
@@ -93,6 +94,7 @@ def determine_outcome(
         return _settle_spread(selection, home, away)
 
     # Unknown market type → push to human
+    logger.warning("Unknown market_type '%s' for bet — pushing to human", bet.market_type)
     return BetStatus.PUSHED_TO_HUMAN
 
 
@@ -104,6 +106,7 @@ def _settle_match_winner(selection: str, home: int, away: int) -> BetStatus:
         return BetStatus.WON if away > home else BetStatus.LOST
     elif selection == "draw":
         return BetStatus.WON if home == away else BetStatus.LOST
+    logger.warning("Unknown match_winner selection '%s' — pushing to human", selection)
     return BetStatus.PUSHED_TO_HUMAN
 
 
@@ -116,12 +119,14 @@ def _settle_over_under(selection: str, home: int, away: int) -> BetStatus:
 
     parts = selection.split("_", 1)
     if len(parts) != 2:
+        logger.warning("Cannot parse over/under selection '%s' — pushing to human", selection)
         return BetStatus.PUSHED_TO_HUMAN
 
     direction = parts[0]
     try:
         line = float(parts[1])
     except ValueError:
+        logger.warning("Invalid over/under line in '%s' — pushing to human", selection)
         return BetStatus.PUSHED_TO_HUMAN
 
     if direction == "over":

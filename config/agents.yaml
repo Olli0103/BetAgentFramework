@@ -126,6 +126,7 @@ agents:
         basketball: basketball_nba
         ice_hockey: icehockey_nhl
         tennis: tennis_atp_french_open,tennis_atp_us_open,tennis_atp_wimbledon
+        darts: darts_pdc_world_championship
     api_sports:
       provider: api-sports.io
       api_key_env: API_SPORTS_KEY     # Same key for all sport APIs

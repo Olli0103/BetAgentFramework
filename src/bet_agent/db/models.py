@@ -139,6 +139,9 @@ class Match(Base):
     bets: Mapped[list["PlacedBet"]] = relationship(
         back_populates="match", cascade="all, delete-orphan"
     )
+    predictions: Mapped[list["Prediction"]] = relationship(
+        back_populates="match", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         UniqueConstraint(
@@ -491,7 +494,7 @@ class Prediction(Base):
     )
 
     # Relationships
-    match: Mapped["Match"] = relationship()
+    match: Mapped["Match"] = relationship(back_populates="predictions")
 
     __table_args__ = (
         UniqueConstraint(

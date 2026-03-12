@@ -404,7 +404,7 @@ async def cmd_status(update, context) -> None:
         text = await asyncio.to_thread(_sync_fetch_status)
         await _safe_reply(update.message, f"```\n{text}\n```", parse_mode="Markdown")
     except Exception as e:
-        logger.error("Error in /status: %s", e)
+        logger.exception("Error in /status")
         await update.message.reply_text(f"Error fetching status: {e}")
 
 
@@ -459,7 +459,7 @@ async def cmd_pending(update, context) -> None:
             )
 
     except Exception as e:
-        logger.error("Error in /pending: %s", e)
+        logger.exception("Error in /pending")
         await update.message.reply_text(f"Error: {e}")
 
 
@@ -472,7 +472,7 @@ async def cmd_pnl(update, context) -> None:
         text = await asyncio.to_thread(_sync_fetch_pnl)
         await _safe_reply(update.message, f"```\n{text}\n```", parse_mode="Markdown")
     except Exception as e:
-        logger.error("Error in /pnl: %s", e)
+        logger.exception("Error in /pnl")
         await update.message.reply_text(f"Error: {e}")
 
 
@@ -503,7 +503,7 @@ async def cmd_health(update, context) -> None:
             update.message, f"```\n{chr(10).join(lines)}\n```", parse_mode="Markdown"
         )
     except Exception as e:
-        logger.error("Error in /health: %s", e)
+        logger.exception("Error in /health")
         await update.message.reply_text(f"Error: {e}")
 
 
@@ -560,7 +560,7 @@ async def cmd_placed(update, context) -> None:
         )
         await _send_placement_confirmation(update.message, context, result, bet_id, user_name, user)
     except Exception as e:
-        logger.error("Error in /placed: %s", e)
+        logger.exception("Error in /placed")
         await update.message.reply_text(f"Error: {e}")
 
 
@@ -904,7 +904,8 @@ async def _broadcast_placement(context, result, bet_id, user_name, user):
 
 # ── Alert digest / batching (thread-safe asyncio.Queue) ─────────────
 
-_alert_queue: asyncio.Queue[str] = asyncio.Queue()
+_MAX_ALERT_QUEUE_SIZE = 500
+_alert_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=_MAX_ALERT_QUEUE_SIZE)
 _DIGEST_INTERVAL_SECONDS = 600  # 10 minutes
 
 

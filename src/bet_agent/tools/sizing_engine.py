@@ -10,6 +10,7 @@ Golden Rule #3: Paper First — new models run on Paper until Auditor promotes.
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
@@ -29,11 +30,36 @@ from bet_agent.tools.kelly_calculator import KellyResult, calculate_quarter_kell
 
 logger = logging.getLogger(__name__)
 
-# Risk limits (must match agents.yaml)
-MAX_SINGLE_BET_PCT = 5.0
-MAX_DAILY_LOSS_PCT = 10.0
-MAX_WEEKLY_LOSS_PCT = 20.0
-MOONSHOT_HARD_CAP_EUR = 1.00
+# Risk limits — loaded from agents.yaml at startup, with safe defaults.
+def _load_risk_limits() -> dict:
+    """Load risk limits from agents.yaml, falling back to safe defaults."""
+    import os
+    from pathlib import Path
+    defaults = {
+        "max_single_bet_pct": 5.0,
+        "max_daily_loss_pct": 10.0,
+        "max_weekly_loss_pct": 20.0,
+        "moonshot_hard_cap_eur": 1.00,
+    }
+    try:
+        import yaml
+        config_path = Path(os.environ.get("AGENTS_YAML", "config/agents.yaml"))
+        if config_path.exists():
+            data = yaml.safe_load(config_path.read_text())
+            for agent in data.get("agents", []):
+                if agent.get("id") == "risk_manager":
+                    limits = agent.get("risk_limits", {})
+                    defaults.update({k: float(v) for k, v in limits.items() if k in defaults})
+                    break
+    except Exception as exc:
+        logger.warning("Could not load risk limits from agents.yaml: %s — using defaults", exc)
+    return defaults
+
+_RISK_LIMITS = _load_risk_limits()
+MAX_SINGLE_BET_PCT = _RISK_LIMITS["max_single_bet_pct"]
+MAX_DAILY_LOSS_PCT = _RISK_LIMITS["max_daily_loss_pct"]
+MAX_WEEKLY_LOSS_PCT = _RISK_LIMITS["max_weekly_loss_pct"]
+MOONSHOT_HARD_CAP_EUR = _RISK_LIMITS["moonshot_hard_cap_eur"]
 
 # Models considered "proven" (run on REAL ledger)
 # Others go to PAPER until Auditor promotes them
@@ -44,7 +70,7 @@ _PROVEN_MODEL_PREFIXES = {"analytical_", "xgboost_"}
 class SizedBet:
     """A fully sized bet ready for alert or placement."""
 
-    prediction_id: object  # UUID
+    prediction_id: uuid.UUID
     ledger_type: LedgerType
     stake_eur: float
     odds: float

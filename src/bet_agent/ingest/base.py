@@ -194,10 +194,22 @@ class BaseIngester(ABC):
 
 
 def read_csv(file_path: Path, encoding: str = "utf-8") -> list[dict]:
-    """Read a CSV file into a list of dicts (header row = keys)."""
+    """Read a CSV file into a list of dicts (header row = keys).
+
+    Uses errors='replace' to handle malformed characters — logs a warning
+    if replacement characters (U+FFFD) are detected in the output.
+    """
     with open(file_path, newline="", encoding=encoding, errors="replace") as f:
-        reader = csv.DictReader(f)
-        return list(reader)
+        content = f.read()
+    if "\ufffd" in content:
+        logger.warning(
+            "Encoding issues in %s — some characters replaced with U+FFFD. "
+            "Consider re-encoding the file as UTF-8.",
+            file_path.name,
+        )
+    import io
+    reader = csv.DictReader(io.StringIO(content))
+    return list(reader)
 
 
 def safe_int(val: str | None, default: int = 0) -> int:

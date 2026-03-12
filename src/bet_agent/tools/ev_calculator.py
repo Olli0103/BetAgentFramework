@@ -69,6 +69,10 @@ def calculate_live_ev(
     updated_prob = model.live_update(pre_match_prob, live_score, live_time, live_stats)
 
     # Clamp to valid probability range (defense-in-depth)
+    import math
+    if math.isnan(updated_prob) or math.isinf(updated_prob):
+        logger.warning("live_update returned %s for %s — falling back to pre_match_prob", updated_prob, sport)
+        updated_prob = pre_match_prob
     updated_prob = max(0.0, min(1.0, updated_prob))
 
     # EV calculation (deterministic math)

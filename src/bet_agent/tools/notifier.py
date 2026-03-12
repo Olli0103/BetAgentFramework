@@ -17,6 +17,7 @@ import logging
 import os
 import platform
 import subprocess
+import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
 
@@ -41,7 +42,7 @@ _SPORT_EMOJI = {
 class BetTicket:
     """A final, human-readable bet ticket ready for notification."""
 
-    prediction_id: object  # UUID
+    prediction_id: uuid.UUID
     sport: str
     match_description: str  # "Zverev vs Alcaraz"
     league: str
