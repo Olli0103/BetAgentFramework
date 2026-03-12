@@ -1097,7 +1097,8 @@ async def _broadcast_placement(context, result, bet_id, user_name, user):
     """Broadcast placement to group and individual syndicate members."""
     ev_str = f"{result['ev']:+.4f}"
 
-    if TELEGRAM_GROUP_ID and context.bot:
+    group_id = _parse_group_id()
+    if group_id is not None and context.bot:
         broadcast_msg = (
             f"\U0001f4e2 BET PLACED by {user_name}\n\n"
             f"Match: {result['match']}\n"
@@ -1108,14 +1109,14 @@ async def _broadcast_placement(context, result, bet_id, user_name, user):
         )
         try:
             await context.bot.send_message(
-                chat_id=TELEGRAM_GROUP_ID,
+                chat_id=group_id,
                 text=broadcast_msg,
             )
         except Exception as exc:
             logger.error("Group broadcast failed: %s", exc)
 
     for uid in ALLOWED_IDS:
-        if uid != user.id and uid != int(TELEGRAM_GROUP_ID or 0):
+        if uid != user.id and uid != group_id:
             try:
                 await context.bot.send_message(
                     chat_id=uid,
@@ -1174,14 +1175,15 @@ async def flush_alert_digest(context) -> None:
 
 async def _send_to_all(context, text: str) -> None:
     """Send a message to the group and all whitelisted users."""
-    if TELEGRAM_GROUP_ID and context.bot:
+    group_id = _parse_group_id()
+    if group_id is not None and context.bot:
         try:
-            await context.bot.send_message(chat_id=TELEGRAM_GROUP_ID, text=text)
+            await context.bot.send_message(chat_id=group_id, text=text)
         except Exception as exc:
             logger.error("Digest broadcast failed: %s", exc)
 
     for uid in ALLOWED_IDS:
-        if uid != int(TELEGRAM_GROUP_ID or 0):
+        if uid != group_id:
             try:
                 await context.bot.send_message(chat_id=uid, text=text)
             except Exception as exc:
