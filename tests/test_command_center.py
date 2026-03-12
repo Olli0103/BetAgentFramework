@@ -853,7 +853,8 @@ class TestMasterAgentBridge:
         fake_client = MagicMock(spec=LLMClient)
         fake_client.chat.return_value = "NHL xgboost Brier 0.19, ROI +2.1%"
 
-        with patch.object(bridge, "_get_llm", return_value=fake_client):
+        with patch.object(bridge, "_get_llm", return_value=fake_client), \
+             patch.object(bridge, "_build_context", return_value="--- PORTFOLIO ---\nREAL: 500.00 EUR"):
             response = bridge.query("How is our NHL model?", "@olli")
 
         assert "NHL" in response

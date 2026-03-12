@@ -375,7 +375,7 @@ def test_model_env_empty_uses_yaml_default(tier_yaml: Path) -> None:
 
 
 def test_master_bridge_calls_llm() -> None:
-    """MasterAgentBridge.query() routes through Tier-1 LLM."""
+    """MasterAgentBridge.query() routes through Tier-1 LLM with DB context."""
     from bet_agent.interfaces.telegram_bot import MasterAgentBridge
 
     bridge = MasterAgentBridge()
@@ -383,7 +383,8 @@ def test_master_bridge_calls_llm() -> None:
         tier=TierConfig("test", providers=[_make_provider("test")])
     )
 
-    with patch.object(bridge, "_get_llm", return_value=fake_client):
+    with patch.object(bridge, "_get_llm", return_value=fake_client), \
+         patch.object(bridge, "_build_context", return_value="--- PORTFOLIO ---\nREAL: 1000.00 EUR"):
         with patch("bet_agent.llm.client.requests.post") as mock_post:
             mock_post.return_value.status_code = 200
             mock_post.return_value.json.return_value = {
@@ -394,6 +395,10 @@ def test_master_bridge_calls_llm() -> None:
             result = bridge.query("How are we doing?", "alice")
 
     assert "Portfolio up 3.2%" in result
+    # System prompt now includes DB context
+    call_body = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
+    system_msg = call_body["messages"][0]["content"]
+    assert "PORTFOLIO" in system_msg
 
 
 def test_master_bridge_graceful_failure() -> None:
@@ -402,7 +407,30 @@ def test_master_bridge_graceful_failure() -> None:
 
     bridge = MasterAgentBridge()
 
-    with patch.object(bridge, "_get_llm", side_effect=RuntimeError("no providers")):
+    with patch.object(bridge, "_build_context", return_value=""), \
+         patch.object(bridge, "_get_llm", side_effect=RuntimeError("no providers")):
         result = bridge.query("test", "bob")
 
     assert "temporarily unable" in result
+
+
+# ── MasterAgentBridge intent detection ───────────────────────────────
+
+
+def test_bridge_detect_sport() -> None:
+    """_detect_sport correctly maps keywords to sport enums."""
+    from bet_agent.interfaces.telegram_bot import MasterAgentBridge
+
+    assert MasterAgentBridge._detect_sport("give me nba odds") == "basketball"
+    assert MasterAgentBridge._detect_sport("bundesliga spiele heute") == "football"
+    assert MasterAgentBridge._detect_sport("nhl lines tonight") == "ice_hockey"
+    assert MasterAgentBridge._detect_sport("how are we doing") is None
+
+
+def test_bridge_wants_odds() -> None:
+    """_wants_odds_or_matches triggers on odds/match keywords."""
+    from bet_agent.interfaces.telegram_bot import MasterAgentBridge
+
+    assert MasterAgentBridge._wants_odds_or_matches("give me odds for nba")
+    assert MasterAgentBridge._wants_odds_or_matches("what games today")
+    assert not MasterAgentBridge._wants_odds_or_matches("how is the portfolio")

@@ -37,7 +37,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 
 from bet_agent.db.models import Base
 
@@ -286,9 +286,26 @@ class MasterAgentBridge:
     """Bridge for routing natural language queries to the Master Agent.
 
     Uses the Tier-1 LLM (OpenClaw primary, Gemini fallback) to answer
-    syndicate members' questions in concierge mode.  The bridge is
-    injectable for testing purposes.
+    syndicate members' questions in concierge mode.  The bridge pre-loads
+    relevant DB context (odds, predictions, portfolio) so the LLM can
+    answer data-driven questions instead of saying "I don't have access".
     """
+
+    _SYSTEM_PROMPT = (
+        "You are the Master Agent — CEO and concierge of the BetAgent Quant "
+        "Trading Syndicate. You have FULL read access to the fund's database.\n\n"
+        "RULES:\n"
+        "- Answer concisely and professionally like a hedge fund manager.\n"
+        "- Always cite numbers from the DB context provided below.\n"
+        "- If the data section contains odds/matches, present them clearly.\n"
+        "- If the data section is empty for a category, say so and explain "
+        "when the next data refresh happens (Scout crawls at 04:00 UTC, "
+        "pre-match scans every 2h).\n"
+        "- Never reveal internal model weights or proprietary algorithms.\n"
+        "- Never speculate — only report what the data shows.\n"
+        "- For action requests (place bet, run pipeline), tell the user the "
+        "appropriate slash command (/pending, /status, etc.).\n"
+    )
 
     def __init__(self) -> None:
         self._llm: "LLMClient | None" = None
@@ -301,18 +318,21 @@ class MasterAgentBridge:
         return self._llm
 
     def query(self, message: str, user_name: str) -> str:
-        """Send a natural language query to the Master Agent via Tier-1 LLM."""
+        """Send a natural language query to the Master Agent via Tier-1 LLM.
+
+        Pre-loads relevant DB context (today's matches, odds, predictions,
+        portfolio summary) and injects it into the system prompt so the LLM
+        can answer data-driven questions.
+        """
         logger.info("NL query from %s: %s", user_name, message)
         try:
+            context = self._build_context(message)
+            system = self._SYSTEM_PROMPT + "\n" + context
+
             client = self._get_llm()
             return client.chat(
-                message,
-                system_prompt=(
-                    "You are the Master Agent concierge of a sports-betting "
-                    "quant syndicate. Answer concisely and professionally. "
-                    "Cite numbers when available. Never reveal internal model "
-                    "weights or proprietary algorithms."
-                ),
+                f"[{user_name}]: {message}",
+                system_prompt=system,
             )
         except Exception:
             logger.exception("Tier-1 LLM unavailable for concierge query")
@@ -320,6 +340,213 @@ class MasterAgentBridge:
                 "[Master Agent] I'm temporarily unable to process your query — "
                 "the LLM backend is unreachable. Please try again shortly."
             )
+
+    def _build_context(self, message: str) -> str:
+        """Query the DB for data relevant to the user's question."""
+        from bet_agent.db.session import get_session
+
+        sections: list[str] = []
+
+        try:
+            with get_session() as sess:
+                # Always include portfolio snapshot (lightweight)
+                sections.append(self._portfolio_context(sess))
+
+                # Detect sport/odds intent and include relevant data
+                msg_lower = message.lower()
+                sport_filter = self._detect_sport(msg_lower)
+                if self._wants_odds_or_matches(msg_lower):
+                    sections.append(self._odds_context(sess, sport_filter))
+                    sections.append(self._predictions_context(sess, sport_filter))
+                elif self._wants_predictions(msg_lower):
+                    sections.append(self._predictions_context(sess, sport_filter))
+                elif self._wants_health(msg_lower):
+                    sections.append(self._health_context(sess, sport_filter))
+        except Exception:
+            logger.exception("Failed to build DB context for concierge")
+            sections.append("--- DB CONTEXT ---\n[Database unavailable]")
+
+        return "\n\n".join(sections)
+
+    @staticmethod
+    def _detect_sport(msg: str) -> str | None:
+        """Detect which sport the user is asking about."""
+        sport_keywords = {
+            "nba": "basketball", "basketball": "basketball",
+            "nfl": "american_football", "american football": "american_football",
+            "nhl": "ice_hockey", "hockey": "ice_hockey", "eishockey": "ice_hockey",
+            "bundesliga": "football", "fußball": "football", "fussball": "football",
+            "football": "football", "soccer": "football",
+            "premier league": "football", "la liga": "football", "serie a": "football",
+            "champions league": "football", "uefa": "football",
+            "tennis": "tennis", "atp": "tennis", "wta": "tennis",
+            "darts": "darts", "pdc": "darts",
+        }
+        for keyword, sport in sport_keywords.items():
+            if keyword in msg:
+                return sport
+        return None
+
+    @staticmethod
+    def _wants_odds_or_matches(msg: str) -> bool:
+        return any(w in msg for w in [
+            "odds", "quoten", "lines", "match", "game", "spiel",
+            "today", "heute", "tonight", "morgen", "tomorrow",
+            "nba", "nfl", "nhl", "bundesliga", "tennis", "darts",
+        ])
+
+    @staticmethod
+    def _wants_predictions(msg: str) -> bool:
+        return any(w in msg for w in [
+            "predict", "pick", "bet", "wette", "tipp", "value",
+            "ev", "edge", "pending", "approved",
+        ])
+
+    @staticmethod
+    def _wants_health(msg: str) -> bool:
+        return any(w in msg for w in [
+            "health", "model", "brier", "roi", "performance", "degrad",
+        ])
+
+    @staticmethod
+    def _portfolio_context(sess) -> str:
+        """Compact portfolio snapshot."""
+        from bet_agent.tools.master_analysis import fetch_portfolio_summary
+        try:
+            s = fetch_portfolio_summary(sess)
+            return (
+                "--- PORTFOLIO ---\n"
+                f"REAL: {s.real_balance:.2f} EUR | PAPER: {s.paper_balance:.2f} EUR\n"
+                f"Open bets: {s.pending_bets_count} | Today: {s.today_bets_count}\n"
+                f"Today PnL: REAL {s.today_pnl_real:+.2f} / PAPER {s.today_pnl_paper:+.2f}\n"
+                f"7d win rate: {s.win_rate_7d:.1f}% ({s.total_bets_7d} bets)"
+            )
+        except Exception as e:
+            return f"--- PORTFOLIO ---\n[Error: {e}]"
+
+    @staticmethod
+    def _odds_context(sess, sport: str | None) -> str:
+        """Today's matches and latest odds from the DB."""
+        from sqlalchemy import select
+        from bet_agent.db.models import Match, OddsMarket, Sport
+
+        today_start = datetime.combine(
+            datetime.now(timezone.utc).date(), time.min, tzinfo=timezone.utc
+        )
+        tomorrow_end = datetime.combine(
+            datetime.now(timezone.utc).date() + timedelta(days=1),
+            time.max, tzinfo=timezone.utc,
+        )
+
+        query = (
+            select(Match)
+            .where(Match.scheduled_at >= today_start, Match.scheduled_at <= tomorrow_end)
+            .order_by(Match.scheduled_at)
+        )
+        if sport:
+            query = query.where(Match.sport == Sport(sport))
+
+        matches = list(sess.execute(query).scalars().all())
+
+        if not matches:
+            sport_label = sport or "all sports"
+            return (
+                f"--- TODAY'S MATCHES ({sport_label}) ---\n"
+                f"No matches found for today/tomorrow. "
+                f"Scout's next crawl may bring new data."
+            )
+
+        lines = [f"--- TODAY'S MATCHES ({len(matches)} found) ---"]
+        for m in matches[:20]:  # Cap to avoid token overflow
+            kickoff = m.scheduled_at.strftime("%H:%M UTC") if m.scheduled_at else "TBD"
+            line = f"{m.home_team} vs {m.away_team} | {m.sport.value} | {m.league} | {kickoff}"
+
+            # Fetch latest odds for this match
+            odds_q = (
+                select(OddsMarket)
+                .where(OddsMarket.match_id == m.id)
+                .order_by(OddsMarket.scraped_at.desc())
+            )
+            odds = list(sess.execute(odds_q).scalars().all())
+
+            if odds:
+                # Group by sportsbook, show best per selection
+                seen: dict[str, str] = {}
+                for o in odds:
+                    key = f"{o.market_type.value}:{o.selection}"
+                    if key not in seen:
+                        seen[key] = f"{o.selection}@{o.odds_decimal:.2f}({o.sportsbook})"
+                odds_str = " | ".join(seen.values())
+                line += f"\n  Odds: {odds_str}"
+
+            lines.append(line)
+
+        if len(matches) > 20:
+            lines.append(f"  ... and {len(matches) - 20} more matches")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _predictions_context(sess, sport: str | None) -> str:
+        """Today's predictions from the pipeline."""
+        from sqlalchemy import select
+        from bet_agent.db.models import Match, Prediction, Sport
+
+        today_start = datetime.combine(
+            datetime.now(timezone.utc).date(), time.min, tzinfo=timezone.utc
+        )
+
+        query = (
+            select(Prediction)
+            .where(Prediction.created_at >= today_start)
+            .order_by(Prediction.ev.desc())
+        )
+
+        preds = list(sess.execute(query).scalars().all())
+
+        if sport:
+            filtered = []
+            for p in preds:
+                match = sess.get(Match, p.match_id)
+                if match and match.sport == Sport(sport):
+                    filtered.append((p, match))
+            preds_with_match = filtered
+        else:
+            preds_with_match = []
+            for p in preds:
+                match = sess.get(Match, p.match_id)
+                if match:
+                    preds_with_match.append((p, match))
+
+        if not preds_with_match:
+            return "--- PREDICTIONS ---\nNo predictions generated today yet."
+
+        lines = [f"--- PREDICTIONS ({len(preds_with_match)} today) ---"]
+        for p, m in preds_with_match[:15]:
+            lines.append(
+                f"{m.home_team} vs {m.away_team} | {p.selection} | "
+                f"prob={float(p.model_prob):.1%} ev={float(p.ev):+.4f} | "
+                f"status={p.status.value}"
+            )
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _health_context(sess, sport: str | None) -> str:
+        """Model health metrics."""
+        from bet_agent.tools.master_analysis import fetch_model_health
+        reports = fetch_model_health(sess, sport)
+        if not reports:
+            return "--- MODEL HEALTH ---\nNo metrics available yet."
+
+        lines = ["--- MODEL HEALTH ---"]
+        for r in reports:
+            status = "DEGRADED" if r.is_degraded else "OK"
+            lines.append(
+                f"[{status}] {r.model_name} | Brier={r.latest_brier:.4f} "
+                f"ROI={r.latest_roi:+.1f}% | {r.record_win}W-{r.record_loss}L | {r.trend}"
+            )
+        return "\n".join(lines)
 
 
 # Default bridge (override in production)
