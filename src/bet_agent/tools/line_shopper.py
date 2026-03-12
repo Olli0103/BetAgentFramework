@@ -42,9 +42,12 @@ def _canonicalize_selection(selection: str) -> str:
     """
     s = selection.strip().lower()
 
-    # Normalize whitespace and common separators to underscore
-    s = re.sub(r"[\s\-–]+(?=\d)", "_", s)  # "over 2.5" or "over-2.5" → "over_2.5"
-    s = s.replace(" ", "_")
+    # Normalize whitespace to underscore (but NOT hyphens — they may be
+    # negative signs in spreads like "home_-1.5")
+    s = re.sub(r"[\s–]+", "_", s)  # "over 2.5" → "over_2.5"
+    # Convert standalone en-dash/hyphen between word and number: "over-2.5" → "over_2.5"
+    # but preserve minus sign after underscore: "home_-1.5" stays
+    s = re.sub(r"(?<=[a-z])-(?=\d)", "_", s)
 
     # 1X2 synonym mapping (common sportsbook formats)
     _SYNONYMS = {

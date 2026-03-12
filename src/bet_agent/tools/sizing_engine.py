@@ -95,13 +95,13 @@ class RiskCheckResult:
 def _default_initial_balance(ledger_type: LedgerType) -> Decimal:
     """Initial bankroll seeded when no ledger row exists.
 
-    Configurable via env: INITIAL_BANKROLL_REAL / INITIAL_BANKROLL_PAPER.
-    Defaults: REAL=50 EUR, PAPER=10000 EUR.
+    Configurable via env: BETAGENT_INITIAL_REAL_BANKROLL / BETAGENT_INITIAL_PAPER_BANKROLL.
+    Defaults: REAL=1000 EUR, PAPER=10000 EUR.
     """
     import os
     if ledger_type == LedgerType.REAL:
-        return Decimal(os.environ.get("INITIAL_BANKROLL_REAL", "50.00"))
-    return Decimal(os.environ.get("INITIAL_BANKROLL_PAPER", "10000.00"))
+        return Decimal(os.environ.get("BETAGENT_INITIAL_REAL_BANKROLL", "1000.00"))
+    return Decimal(os.environ.get("BETAGENT_INITIAL_PAPER_BANKROLL", "10000.00"))
 
 
 def get_bankroll(session: Session, ledger_type: LedgerType = LedgerType.REAL) -> Decimal:
@@ -118,7 +118,7 @@ def get_bankroll(session: Session, ledger_type: LedgerType = LedgerType.REAL) ->
         initial = _default_initial_balance(ledger_type)
         logger.warning(
             "No %s bankroll ledger found — auto-seeding with %.2f EUR. "
-            "Set INITIAL_BANKROLL_%s env var to override.",
+            "Set BETAGENT_INITIAL_%s_BANKROLL env var to override.",
             ledger_type.value, initial, ledger_type.value.upper(),
         )
         ledger = BankrollLedger(ledger_type=ledger_type, balance=initial)

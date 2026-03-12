@@ -31,6 +31,10 @@ _ODDS_FRESHNESS_MINUTES = 120
 # Minimum team name length to pass quality check
 _MIN_NAME_LEN = 4
 
+# Maximum edge (in percentage points) before we suspect data error.
+# e.g. model_prob=0.40 vs implied_prob=0.10 → edge=30pp → implausible.
+_MAX_EDGE_PP = float(os.environ.get("BETAGENT_MAX_EDGE_PCT", "15"))
+
 
 # ── Readiness gate ──────────────────────────────────────────────────
 
@@ -61,6 +65,7 @@ def check_bet_readiness(
       3. team_names_ok — home/away names are not abbreviations (>= 4 chars)
       4. stake_positive — stake > 0
       5. ev_positive — EV > 0
+      6. edge_plausible — model-vs-market edge within BETAGENT_MAX_EDGE_PCT
 
     Returns a ReadinessCheck. If not ready, the bet should be routed to
     PAPER ledger or flagged as DO_NOT_BET in the ticket.
@@ -88,6 +93,12 @@ def check_bet_readiness(
 
     # 5. EV positive
     checks["ev_positive"] = float(prediction.ev) > 0
+
+    # 6. Edge plausibility — block extreme model-vs-market divergences
+    model_prob = float(prediction.model_prob) if prediction.model_prob else 0.0
+    implied_prob = float(prediction.implied_prob) if prediction.implied_prob else 0.0
+    edge_pp = abs(model_prob - implied_prob) * 100.0
+    checks["edge_plausible"] = edge_pp <= _MAX_EDGE_PP
 
     is_ready = all(checks.values())
     failed = [k for k, v in checks.items() if not v]
@@ -265,24 +276,37 @@ class TelegramNotifier(NotificationBackend):
         self.chat_id = chat_id or os.environ.get("TELEGRAM_CHAT_ID", "")
 
     def _send_to_chat(self, chat_id: str, message: str) -> bool:
-        """Send a message to a specific Telegram chat_id."""
+        """Send a message to a specific Telegram chat_id.
+
+        Tries HTML parse_mode first; falls back to plain text if the API
+        returns an error (e.g. malformed HTML entities from emoji).
+        """
         import urllib.request
 
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        payload = json.dumps({
-            "chat_id": chat_id,
-            "text": message,
-            "parse_mode": "HTML",
-        }).encode("utf-8")
 
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status == 200
+        for parse_mode in ("HTML", None):
+            body: dict = {"chat_id": chat_id, "text": message}
+            if parse_mode:
+                body["parse_mode"] = parse_mode
+            payload = json.dumps(body).encode("utf-8")
+
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if resp.status == 200:
+                        return True
+            except Exception:
+                if parse_mode is None:
+                    raise  # Plain text also failed — let caller handle
+                logger.debug("HTML send failed for chat %s, retrying plain text", chat_id)
+                continue
+        return False
 
     def send(self, message: str, title: str = "BetAgent Alert") -> bool:
         if not self.bot_token or not self.chat_id:
@@ -329,6 +353,32 @@ class TelegramSyndicateBroadcaster(NotificationBackend):
 
         return targets
 
+    def _send_one(self, chat_id: str, message: str) -> bool:
+        """Send to one chat_id with HTML→plain text fallback."""
+        import urllib.request
+
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        for parse_mode in ("HTML", None):
+            body: dict = {"chat_id": chat_id, "text": message}
+            if parse_mode:
+                body["parse_mode"] = parse_mode
+            payload = json.dumps(body).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if resp.status == 200:
+                        return True
+            except Exception:
+                if parse_mode is None:
+                    raise
+                logger.debug("HTML send failed for %s, retrying plain text", chat_id)
+                continue
+        return False
+
     def send(self, message: str, title: str = "BetAgent Alert") -> bool:
         if not self.bot_token:
             logger.warning("Telegram bot token not configured for broadcast")
@@ -339,27 +389,11 @@ class TelegramSyndicateBroadcaster(NotificationBackend):
             logger.warning("No broadcast targets configured")
             return False
 
-        import urllib.request
-
         success_count = 0
         for chat_id in targets:
             try:
-                url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-                payload = json.dumps({
-                    "chat_id": chat_id,
-                    "text": message,
-                    "parse_mode": "HTML",
-                }).encode("utf-8")
-
-                req = urllib.request.Request(
-                    url,
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    if resp.status == 200:
-                        success_count += 1
+                if self._send_one(chat_id, message):
+                    success_count += 1
             except Exception as exc:
                 logger.warning("Broadcast to %s failed: %s", chat_id, exc)
 
