@@ -37,31 +37,63 @@ from bet_agent.db.models import (
 
 logger = logging.getLogger(__name__)
 
+# ── Probability clipping to prevent saturation (prob=0 or prob=1) ────
+_PROB_MIN = 1e-6
+_PROB_MAX = 1.0 - 1e-6
+
+
+def _clip_prob(p: float) -> float:
+    """Clip probability to safe range [1e-6, 1-1e-6]."""
+    return max(_PROB_MIN, min(p, _PROB_MAX))
+
+
 # ── Minimum team name length to reject obvious abbreviations ────────
 _MIN_TEAM_NAME_LEN = 4
+
+
+def _is_abbreviation(name: str) -> bool:
+    """Detect if a name is likely an abbreviation (all uppercase, < 5 chars)."""
+    stripped = name.strip()
+    if len(stripped) < _MIN_TEAM_NAME_LEN:
+        return True
+    # Pure uppercase abbreviation like "CHA", "BOS", "MEM" (3-4 chars, all caps)
+    if len(stripped) <= 4 and stripped.isupper():
+        return True
+    return False
 
 
 def validate_fixture(match: Match, odds_map: dict) -> tuple[bool, str]:
     """Validate a fixture is ready for prediction.
 
     Returns (is_valid, reason). Rejected fixtures are logged, not predicted.
+
+    Checks:
+      1. Team name quality (not abbreviations)
+      2. Valid scheduled_at
+      3. League populated
+      4. Odds completeness (match_winner home odds required)
+      5. Odds range sanity (> 1.0)
     """
-    # 1. Team name quality — reject obvious abbreviations (< 4 chars)
-    if len(match.home_team.strip()) < _MIN_TEAM_NAME_LEN:
-        return False, f"home_team too short: '{match.home_team}'"
-    if len(match.away_team.strip()) < _MIN_TEAM_NAME_LEN:
-        return False, f"away_team too short: '{match.away_team}'"
+    # 1. Team name quality — reject obvious abbreviations
+    if _is_abbreviation(match.home_team):
+        return False, f"home_team looks like abbreviation: '{match.home_team}'"
+    if _is_abbreviation(match.away_team):
+        return False, f"away_team looks like abbreviation: '{match.away_team}'"
 
     # 2. Valid scheduled_at
     if match.scheduled_at is None:
         return False, "missing scheduled_at"
 
-    # 3. Odds completeness — need at least match_winner home odds
+    # 3. League populated
+    if not match.league or not match.league.strip():
+        return False, "missing league"
+
+    # 4. Odds completeness — need at least match_winner home odds
     mw = odds_map.get("match_winner", {})
     if not mw or mw.get("home") is None:
         return False, "no match_winner odds available"
 
-    # 4. Odds range sanity (should be decimal > 1.0 after normalization)
+    # 5. Odds range sanity (should be decimal > 1.0 after normalization)
     for sel, val in mw.items():
         if val is not None and val <= 1.0:
             return False, f"invalid odds for {sel}: {val}"
@@ -221,7 +253,7 @@ def _try_ml_prediction(
             model_name=artifact.model_name,
             market_type=MarketType.MATCH_WINNER,
             selection=selection_map[market],
-            model_prob=Decimal(str(ev_result.updated_prob)),
+            model_prob=Decimal(str(_clip_prob(ev_result.updated_prob))),
             implied_prob=Decimal(str(ev_result.implied_prob)),
             prob_edge=Decimal(str(ev_result.prob_edge)),
             ev=Decimal(str(ev_result.ev)),
@@ -292,7 +324,7 @@ def _try_ml_over_under(
                 model_name=artifact.model_name,
                 market_type=MarketType.OVER_UNDER,
                 selection=f"over_{line}",
-                model_prob=Decimal(str(round(p_over, 6))),
+                model_prob=Decimal(str(round(_clip_prob(p_over), 6))),
                 implied_prob=Decimal(str(round(implied, 6))),
                 prob_edge=Decimal(str(round(edge, 6))),
                 ev=Decimal(str(round(ev, 6))),
@@ -311,7 +343,7 @@ def _try_ml_over_under(
                 model_name=artifact.model_name,
                 market_type=MarketType.OVER_UNDER,
                 selection=f"under_{line}",
-                model_prob=Decimal(str(round(p_under, 6))),
+                model_prob=Decimal(str(round(_clip_prob(p_under), 6))),
                 implied_prob=Decimal(str(round(implied, 6))),
                 prob_edge=Decimal(str(round(edge, 6))),
                 ev=Decimal(str(round(ev, 6))),
@@ -382,7 +414,7 @@ def _try_analytical_prediction(
             model_name=model_name,
             market_type=MarketType.MATCH_WINNER,
             selection=selection,
-            model_prob=Decimal(str(round(prob, 6))),
+            model_prob=Decimal(str(round(_clip_prob(prob), 6))),
             implied_prob=Decimal(str(round(implied, 6))),
             prob_edge=Decimal(str(round(edge, 6))),
             ev=Decimal(str(round(ev, 6))),
@@ -409,7 +441,7 @@ def _try_analytical_prediction(
                     model_name=model_name,
                     market_type=MarketType.OVER_UNDER,
                     selection=f"over_{line}",
-                    model_prob=Decimal(str(round(p_over, 6))),
+                    model_prob=Decimal(str(round(_clip_prob(p_over), 6))),
                     implied_prob=Decimal(str(round(implied, 6))),
                     prob_edge=Decimal(str(round(edge, 6))),
                     ev=Decimal(str(round(ev, 6))),
@@ -429,7 +461,7 @@ def _try_analytical_prediction(
                     model_name=model_name,
                     market_type=MarketType.OVER_UNDER,
                     selection=f"under_{line}",
-                    model_prob=Decimal(str(round(p_under, 6))),
+                    model_prob=Decimal(str(round(_clip_prob(p_under), 6))),
                     implied_prob=Decimal(str(round(implied, 6))),
                     prob_edge=Decimal(str(round(edge, 6))),
                     ev=Decimal(str(round(ev, 6))),
@@ -513,7 +545,12 @@ def _bulk_load_odds(
         odds_map: dict = {"match_winner": {}, "over_under": {}}
         for row in rows:
             sel = row.selection.lower()
-            odds = float(row.odds_decimal)
+            raw_odds = float(row.odds_decimal)
+            # Guard: reject invalid odds at read time (should not happen with CHECK constraint)
+            if raw_odds <= 1.0:
+                logger.warning("Skipping invalid odds %.4f for %s", raw_odds, sel)
+                continue
+            odds = raw_odds
 
             if row.market_type == MarketType.MATCH_WINNER:
                 if sel in ("home", "draw", "away") and sel not in odds_map["match_winner"]:

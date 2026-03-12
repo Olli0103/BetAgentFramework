@@ -496,7 +496,7 @@ class Prediction(Base):
     )  # "xgboost" or "analytical"
 
     # Veto / line-shopping metadata
-    veto_reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    veto_reason: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     best_odds: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
     best_sportsbook: Mapped[str | None] = mapped_column(String(64), nullable=True)
 

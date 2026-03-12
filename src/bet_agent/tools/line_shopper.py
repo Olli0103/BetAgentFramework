@@ -3,12 +3,13 @@
 Takes APPROVED predictions and scans odds_markets to find the highest
 decimal odds for the same market and selection across all sportsbooks.
 
-Compares apples to apples: same market_type AND same selection string.
+Compares apples to apples: same market_type AND canonicalized selection.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,6 +27,49 @@ from bet_agent.db.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _canonicalize_selection(selection: str) -> str:
+    """Canonicalize a selection string for apples-to-apples comparison.
+
+    Handles:
+      - Case folding: "Home" → "home"
+      - Whitespace/underscore normalization: "over 2.5" → "over_2.5"
+      - Trailing-zero stripping on lines: "over_2.50" → "over_2.5"
+      - Synonym mapping: "1" → "home", "x" → "draw", "2" → "away"
+      - BTTS: "yes"/"no" pass through
+      - Spread: "home_-1.5" keeps sign, strips trailing zeros
+    """
+    s = selection.strip().lower()
+
+    # Normalize whitespace and common separators to underscore
+    s = re.sub(r"[\s\-–]+(?=\d)", "_", s)  # "over 2.5" or "over-2.5" → "over_2.5"
+    s = s.replace(" ", "_")
+
+    # 1X2 synonym mapping (common sportsbook formats)
+    _SYNONYMS = {
+        "1": "home",
+        "x": "draw",
+        "2": "away",
+        "h": "home",
+        "d": "draw",
+        "a": "away",
+        "home_win": "home",
+        "away_win": "away",
+    }
+    if s in _SYNONYMS:
+        return _SYNONYMS[s]
+
+    # Strip trailing zeros on numeric lines: "over_2.50" → "over_2.5"
+    def _strip_trailing_zeros(m: re.Match) -> str:
+        num = m.group(0)
+        if "." in num:
+            return num.rstrip("0").rstrip(".")
+        return num
+
+    s = re.sub(r"\d+\.\d+", _strip_trailing_zeros, s)
+
+    return s
 
 
 @dataclass(frozen=True)
@@ -59,9 +103,8 @@ def shop_line(
     Returns:
         ShoppedLine with best odds found, or None if no odds available.
     """
-    # Normalize selection for over/under matching
-    # e.g., prediction selection might be "over_2.5" and odds selection "over_2.5"
-    selection = prediction.selection.lower()
+    # Canonicalize selection for robust matching across sportsbooks
+    canonical_sel = _canonicalize_selection(prediction.selection)
 
     # Query all pre-match odds for this match, market type, and selection
     odds_query = (
@@ -76,16 +119,17 @@ def shop_line(
 
     all_odds_rows = list(session.execute(odds_query).scalars().all())
 
-    # Filter to matching selection (case-insensitive)
+    # Filter to matching selection (canonicalized comparison)
     matching = [
         row for row in all_odds_rows
-        if row.selection.lower() == selection
+        if _canonicalize_selection(row.selection) == canonical_sel
     ]
 
     if not matching:
         logger.info(
-            "No odds found for prediction %s (%s %s)",
+            "No odds found for prediction %s (%s %s [canonical: %s])",
             prediction.id, prediction.market_type.value, prediction.selection,
+            canonical_sel,
         )
         return None
 

@@ -50,6 +50,12 @@ def calculate_quarter_kelly(
     # Normalize odds format (auto-detect American → Decimal)
     odds = normalize_odds(odds)
 
+    # Clip probability to safe range to prevent division-by-zero / overflow
+    _PROB_MIN = 1e-6
+    _PROB_MAX = 1.0 - 1e-6
+    if prob <= 0.0 or prob >= 1.0:
+        prob = max(_PROB_MIN, min(prob, _PROB_MAX))
+
     # Input validation
     if not 0.0 < prob < 1.0:
         raise ValueError(f"prob must be in (0, 1), got {prob}")

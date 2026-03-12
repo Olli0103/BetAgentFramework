@@ -38,14 +38,14 @@ class TestValidateFixture:
         odds = {"match_winner": {"home": 2.10}}
         ok, reason = validate_fixture(m, odds)
         assert ok is False
-        assert "home_team too short" in reason
+        assert "home_team" in reason and ("abbreviation" in reason or "too short" in reason)
 
     def test_away_team_too_short(self):
         m = _make_match(away_team="BOS")
         odds = {"match_winner": {"home": 2.10}}
         ok, reason = validate_fixture(m, odds)
         assert ok is False
-        assert "away_team too short" in reason
+        assert "away_team" in reason and ("abbreviation" in reason or "too short" in reason)
 
     def test_missing_scheduled_at(self):
         m = _make_match(scheduled_at=None)

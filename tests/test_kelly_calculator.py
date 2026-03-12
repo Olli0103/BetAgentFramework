@@ -42,13 +42,17 @@ class TestQuarterKelly:
         assert result.stake_eur == 0.0
         assert result.reason == "below_minimum_stake"
 
-    def test_invalid_prob_zero(self):
-        with pytest.raises(ValueError, match="prob"):
-            calculate_quarter_kelly(prob=0.0, odds=2.0, bankroll=1000.0)
+    def test_prob_zero_clipped(self):
+        # prob=0.0 is clipped to 1e-6 instead of raising — returns negative_ev
+        result = calculate_quarter_kelly(prob=0.0, odds=2.0, bankroll=1000.0)
+        assert result.stake_eur == 0.0
+        assert result.reason == "negative_ev"
 
-    def test_invalid_prob_one(self):
-        with pytest.raises(ValueError, match="prob"):
-            calculate_quarter_kelly(prob=1.0, odds=2.0, bankroll=1000.0)
+    def test_prob_one_clipped(self):
+        # prob=1.0 is clipped to 1-1e-6 instead of raising — returns valid result
+        result = calculate_quarter_kelly(prob=1.0, odds=2.0, bankroll=1000.0)
+        assert result.stake_eur > 0.0
+        assert result.reason is None
 
     def test_invalid_odds(self):
         with pytest.raises(ValueError, match="odds"):

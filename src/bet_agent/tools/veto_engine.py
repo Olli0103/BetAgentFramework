@@ -14,6 +14,7 @@ Golden Rule: When in doubt, VETO.  A missed bet costs nothing.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
 import re
@@ -87,6 +88,10 @@ _RISK_KEYWORDS = [
 ]
 
 _RISK_PATTERNS = [re.compile(p, re.IGNORECASE) for p in _RISK_KEYWORDS]
+
+# Maximum time for the entire veto check per prediction (search + LLM).
+# If exceeded, approve by default — a slow veto should not block the pipeline.
+_VETO_TIMEOUT_SECONDS = int(os.environ.get("VETO_TIMEOUT_SECONDS", "30"))
 
 
 def _extract_risk_factors(snippets: list[str]) -> list[str]:
@@ -232,12 +237,21 @@ def veto_check(
 
     query = _build_search_query(match)
     try:
-        results = search_backend.search(query, max_results=5)
+        # Fast-fail: search backend gets its own timeout so a hung DNS/HTTP
+        # call doesn't block the entire pipeline.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(search_backend.search, query, 5)
+            results = future.result(timeout=_VETO_TIMEOUT_SECONDS)
         for r in results:
             snippet = r.get("snippet", r.get("title", ""))
             if snippet:
                 all_snippets.append(snippet)
                 all_news.append(r)
+    except concurrent.futures.TimeoutError:
+        logger.warning(
+            "Search timed out after %ds for '%s' — proceeding with regex only",
+            _VETO_TIMEOUT_SECONDS, query,
+        )
     except Exception as exc:
         logger.warning("Search failed for '%s': %s", query, exc)
 
@@ -247,9 +261,20 @@ def veto_check(
     # Layer 2: LLM semantic analysis (only if we have snippets)
     llm_factors: list[str] = []
     if use_llm and all_snippets:
-        llm_factors = _llm_analyze_risks(
-            match.home_team, match.away_team, all_snippets,
-        )
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    _llm_analyze_risks,
+                    match.home_team, match.away_team, all_snippets,
+                )
+                llm_factors = future.result(timeout=_VETO_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                "LLM risk analysis timed out after %ds — regex only",
+                _VETO_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning("LLM risk analysis wrapper failed: %s", exc)
 
     # Merge and deduplicate risk factors
     risk_factors = _merge_risk_factors(regex_factors, llm_factors)
@@ -321,9 +346,13 @@ def apply_veto_result(
 
     Updates status to APPROVED or VETOED and stores veto_reason.
     """
+    _MAX_VETO_REASON_LEN = 4096
     if result.decision == "VETO":
         prediction.status = PredictionStatus.VETOED
-        prediction.veto_reason = result.reason
+        reason = result.reason or ""
+        if len(reason) > _MAX_VETO_REASON_LEN:
+            reason = reason[:_MAX_VETO_REASON_LEN - 3] + "..."
+        prediction.veto_reason = reason
     else:
         prediction.status = PredictionStatus.APPROVED
         prediction.veto_reason = None

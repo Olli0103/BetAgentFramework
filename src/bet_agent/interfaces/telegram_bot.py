@@ -125,6 +125,26 @@ def _parse_group_id() -> int | None:
         return None
 
 
+# Track IDs that return 400/403 so we don't spam retries every broadcast
+_DEAD_CHAT_IDS: set[int] = set()
+
+
+def _log_send_failure(chat_id: int, exc: Exception) -> None:
+    """Log Telegram send failures with actionable guidance for 400/403 errors."""
+    exc_str = str(exc)
+    if "400" in exc_str or "Forbidden" in exc_str or "403" in exc_str:
+        if chat_id not in _DEAD_CHAT_IDS:
+            _DEAD_CHAT_IDS.add(chat_id)
+            logger.error(
+                "Telegram send to chat_id=%d returned 400/403 — user likely "
+                "blocked the bot or never started a DM. Remove this ID from "
+                "ALLOWED_TELEGRAM_IDS to silence. Error: %s",
+                chat_id, exc_str[:200],
+            )
+    else:
+        logger.debug("Send to chat_id=%d failed: %s", chat_id, exc)
+
+
 _TELEGRAM_MAX_MSG_LEN = 4096
 
 
@@ -1128,7 +1148,7 @@ async def _broadcast_placement(context, result, bet_id, user_name, user):
                     ),
                 )
             except Exception as exc:
-                logger.debug("Broadcast to user %d failed: %s", uid, exc)
+                _log_send_failure(uid, exc)
 
 
 # ── Alert digest / batching (thread-safe asyncio.Queue) ─────────────
@@ -1187,7 +1207,7 @@ async def _send_to_all(context, text: str) -> None:
             try:
                 await context.bot.send_message(chat_id=uid, text=text)
             except Exception as exc:
-                logger.debug("Digest to user %d failed: %s", uid, exc)
+                _log_send_failure(uid, exc)
 
 
 # ── Bot builder ──────────────────────────────────────────────────────

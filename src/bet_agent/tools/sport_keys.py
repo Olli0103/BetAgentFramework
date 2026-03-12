@@ -123,3 +123,33 @@ def get_sport_keys_for(
         logger.warning("No sport key patterns for '%s' in config", sport)
         return []
     return match_sport_keys(patterns, available_keys)
+
+
+def get_all_sport_keys(
+    available_keys: list[str],
+    config_path: Path | str = _CONFIG_PATH,
+) -> dict[str, list[str]]:
+    """Expand all configured sport patterns against available keys.
+
+    This is the standard entry point for the Scout Agent's fetch loop.
+    Returns a dict mapping internal sport name → list of expanded API keys.
+
+    Args:
+        available_keys: Full list from the Odds API /sports endpoint.
+        config_path: Path to agents.yaml.
+
+    Returns:
+        Dict[sport_name, list[api_sport_keys]] for all configured sports.
+    """
+    mapping = load_sports_mapping(config_path)
+    result: dict[str, list[str]] = {}
+    total = 0
+    for sport, patterns in mapping.items():
+        keys = match_sport_keys(patterns, available_keys)
+        result[sport] = keys
+        total += len(keys)
+    logger.info(
+        "Sport key expansion complete: %d sports → %d total API keys",
+        len(result), total,
+    )
+    return result
