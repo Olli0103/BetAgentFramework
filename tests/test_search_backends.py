@@ -16,6 +16,7 @@ from bet_agent.tools.search_backends import (
     TavilySearch,
     _budget_remaining,
     _get_monthly_usage,
+    _get_reddit_oauth_token,
     _increment_usage,
     budget_remaining,
     create_search_backend,
@@ -178,6 +179,82 @@ def test_reddit_always_available():
     assert backend.available is True
 
 
+def test_reddit_has_oauth_false():
+    with patch.dict("os.environ", {}, clear=True):
+        backend = RedditRSSSearch()
+        assert backend.has_oauth is False
+
+
+def test_reddit_has_oauth_true():
+    with patch.dict("os.environ", {"REDDIT_CLIENT_ID": "id", "REDDIT_CLIENT_SECRET": "secret"}):
+        backend = RedditRSSSearch()
+        assert backend.has_oauth is True
+
+
+def test_reddit_oauth_token_no_creds():
+    """Without credentials, _get_reddit_oauth_token returns None."""
+    import bet_agent.tools.search_backends as mod
+    mod._reddit_token = None
+    mod._reddit_token_expires = 0.0
+    with patch.dict("os.environ", {}, clear=True):
+        assert _get_reddit_oauth_token() is None
+
+
+def test_reddit_oauth_token_success():
+    """With credentials, token is fetched and cached."""
+    import bet_agent.tools.search_backends as mod
+    mod._reddit_token = None
+    mod._reddit_token_expires = 0.0
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"access_token": "abc123", "expires_in": 3600}
+
+    with patch.dict("os.environ", {"REDDIT_CLIENT_ID": "id", "REDDIT_CLIENT_SECRET": "secret"}), \
+         patch("requests.post", return_value=mock_resp):
+        token = _get_reddit_oauth_token()
+
+    assert token == "abc123"
+    assert mod._reddit_token == "abc123"
+
+
+def test_reddit_oauth_search_uses_oauth_url():
+    """When OAuth token is available, search uses oauth.reddit.com."""
+    import bet_agent.tools.search_backends as mod
+    mod._reddit_token = "test_token"
+    mod._reddit_token_expires = float("inf")
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"data": {"children": []}}
+
+    with patch.dict("os.environ", {"REDDIT_CLIENT_ID": "id", "REDDIT_CLIENT_SECRET": "secret"}), \
+         patch("requests.get", return_value=mock_resp) as mock_get:
+        backend = RedditRSSSearch(subreddits=["nfl"])
+        backend.search("test")
+
+    call_url = mock_get.call_args[0][0]
+    assert "oauth.reddit.com" in call_url
+    auth_header = mock_get.call_args[1]["headers"]["Authorization"]
+    assert auth_header == "Bearer test_token"
+
+
+def test_reddit_403_handled():
+    """403 response is handled gracefully (endpoint blocked)."""
+    import bet_agent.tools.search_backends as mod
+    mod._reddit_token = None
+    mod._reddit_token_expires = 0.0
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 403
+
+    with patch.dict("os.environ", {}, clear=True), \
+         patch("requests.get", return_value=mock_resp):
+        backend = RedditRSSSearch(subreddits=["nfl"])
+        results = backend.search("test")
+
+    assert results == []
+
+
 def test_reddit_pick_subreddits_nfl():
     backend = RedditRSSSearch()
     subs = backend._pick_subreddits("NFL Chiefs injury report")
@@ -214,6 +291,10 @@ def test_reddit_subreddits_for_sport():
 
 def test_reddit_search_success():
     """Mocked Reddit JSON response is parsed correctly."""
+    import bet_agent.tools.search_backends as mod
+    mod._reddit_token = None
+    mod._reddit_token_expires = 0.0
+
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     mock_resp.json.return_value = {
@@ -230,7 +311,8 @@ def test_reddit_search_success():
         }
     }
 
-    with patch("requests.get", return_value=mock_resp):
+    with patch.dict("os.environ", {}, clear=True), \
+         patch("requests.get", return_value=mock_resp):
         backend = RedditRSSSearch(subreddits=["nfl"])
         results = backend.search("Mahomes injury")
 
@@ -243,10 +325,15 @@ def test_reddit_search_success():
 
 def test_reddit_search_rate_limited():
     """429 response is handled gracefully."""
+    import bet_agent.tools.search_backends as mod
+    mod._reddit_token = None
+    mod._reddit_token_expires = 0.0
+
     mock_resp = MagicMock()
     mock_resp.status_code = 429
 
-    with patch("requests.get", return_value=mock_resp):
+    with patch.dict("os.environ", {}, clear=True), \
+         patch("requests.get", return_value=mock_resp):
         backend = RedditRSSSearch(subreddits=["nfl"])
         results = backend.search("test")
 
@@ -255,7 +342,12 @@ def test_reddit_search_rate_limited():
 
 def test_reddit_search_network_error():
     """Network errors are handled gracefully."""
-    with patch("requests.get", side_effect=Exception("connection refused")):
+    import bet_agent.tools.search_backends as mod
+    mod._reddit_token = None
+    mod._reddit_token_expires = 0.0
+
+    with patch.dict("os.environ", {}, clear=True), \
+         patch("requests.get", side_effect=Exception("connection refused")):
         backend = RedditRSSSearch(subreddits=["nfl"])
         results = backend.search("test")
 

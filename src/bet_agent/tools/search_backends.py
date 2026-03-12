@@ -1,13 +1,16 @@
 """Search backends for the Devil's Advocate veto engine.
 
 Provides pluggable news search implementations with cascading fallback:
-  Priority 1: RedditRSS     — free, no API key, sport-subreddit search
+  Priority 1: RedditSearch   — free with OAuth (~60 req/min), or
+                                unauthenticated (~10 req/min, may be unreliable)
   Priority 2: TavilySearch   — best quality, 1000 req/month free tier
   Priority 3: BraveSearch    — good quality, 2000 req/month free tier
   Priority 4: DefaultNewsSearch — stub (regex-only veto path)
 
-Reddit RSS is always tried first since it's free and unlimited (~60 req/min).
-When Reddit returns no results, paid backends kick in.
+Reddit OAuth setup (recommended):
+  1. Create a Reddit "script" app at https://www.reddit.com/prefs/apps/
+  2. Set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET env vars
+  3. This gives 60 req/min (vs 10 req/min unauthenticated)
 
 Budget management:
   Each paid backend tracks its own monthly usage via file-based counters.
@@ -22,6 +25,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
+import threading
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -89,7 +94,7 @@ def budget_remaining() -> int:
     return _budget_remaining(_TAVILY_USAGE_FILE, _TAVILY_MONTHLY_BUDGET)
 
 
-# ── Reddit RSS backend (free, no API key) ────────────────────────────
+# ── Reddit search backend ─────────────────────────────────────────────
 
 # Subreddits per sport — curated for injury news, analysis, and discussion
 _REDDIT_SPORT_SUBS: dict[str, list[str]] = {
@@ -103,15 +108,63 @@ _REDDIT_SPORT_SUBS: dict[str, list[str]] = {
 # Flattened list of all sport subreddits for general queries
 _ALL_SPORT_SUBS = sorted({sub for subs in _REDDIT_SPORT_SUBS.values() for sub in subs})
 
+# Reddit OAuth token cache (thread-safe)
+_reddit_token_lock = threading.Lock()
+_reddit_token: str | None = None
+_reddit_token_expires: float = 0.0
+
+
+def _get_reddit_oauth_token() -> str | None:
+    """Obtain a Reddit OAuth token using client credentials (app-only).
+
+    Requires REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET env vars.
+    Returns None if credentials are not configured.
+    Token is cached and auto-refreshed when expired.
+    """
+    global _reddit_token, _reddit_token_expires  # noqa: PLW0603
+
+    client_id = os.environ.get("REDDIT_CLIENT_ID", "")
+    client_secret = os.environ.get("REDDIT_CLIENT_SECRET", "")
+    if not client_id or not client_secret:
+        return None
+
+    with _reddit_token_lock:
+        if _reddit_token and time.monotonic() < _reddit_token_expires:
+            return _reddit_token
+
+        import requests as _requests
+
+        try:
+            resp = _requests.post(
+                "https://www.reddit.com/api/v1/access_token",
+                auth=(client_id, client_secret),
+                data={"grant_type": "client_credentials"},
+                headers={"User-Agent": "BetAgent/1.0 (sports research bot)"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            _reddit_token = data["access_token"]
+            # Refresh 60s before expiry
+            _reddit_token_expires = time.monotonic() + data.get("expires_in", 3600) - 60
+            logger.info("Reddit OAuth token acquired (expires in %ds)", data.get("expires_in", 3600))
+            return _reddit_token
+        except Exception as exc:
+            logger.warning("Reddit OAuth token request failed: %s", exc)
+            return None
+
 
 class RedditRSSSearch:
-    """Free news backend using Reddit's public JSON search.
+    """News backend using Reddit's JSON search endpoints.
 
-    No API key needed.  Searches sport subreddits via
-    ``https://www.reddit.com/r/{sub}/search.json`` with
+    Two modes of operation:
+      - **OAuth** (recommended): Set REDDIT_CLIENT_ID + REDDIT_CLIENT_SECRET.
+        Uses ``oauth.reddit.com`` → 60 req/min, reliable.
+      - **Unauthenticated fallback**: No credentials needed.
+        Uses ``www.reddit.com/.json`` → ~10 req/min, may be throttled.
+
+    Searches sport subreddits via ``/r/{sub}/search.json`` with
     ``restrict_sr=on`` and ``sort=new``.
-
-    Rate limit: ~60 req/min without auth (plenty for our use case).
     """
 
     def __init__(self, subreddits: list[str] | None = None) -> None:
@@ -119,7 +172,15 @@ class RedditRSSSearch:
 
     @property
     def available(self) -> bool:
-        return True  # Always available — no API key needed
+        return True  # Always available — unauthenticated fallback exists
+
+    @property
+    def has_oauth(self) -> bool:
+        """Return True if Reddit OAuth credentials are configured."""
+        return bool(
+            os.environ.get("REDDIT_CLIENT_ID", "")
+            and os.environ.get("REDDIT_CLIENT_SECRET", "")
+        )
 
     def search(self, query: str, max_results: int = 5) -> list[dict]:
         """Search Reddit for recent posts matching the query."""
@@ -128,10 +189,23 @@ class RedditRSSSearch:
         results: list[dict] = []
         subs_to_search = self._pick_subreddits(query)
 
+        token = _get_reddit_oauth_token()
+        if token:
+            base_url = "https://oauth.reddit.com"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "BetAgent/1.0 (sports research bot)",
+            }
+        else:
+            base_url = "https://www.reddit.com"
+            headers = {"User-Agent": "BetAgent/1.0 (sports research bot)"}
+            if self.has_oauth:
+                logger.warning("Reddit OAuth configured but token fetch failed — using unauthenticated")
+
         for sub in subs_to_search[:3]:  # Cap at 3 subs to stay fast
             try:
                 resp = _requests.get(
-                    f"https://www.reddit.com/r/{sub}/search.json",
+                    f"{base_url}/r/{sub}/search.json",
                     params={
                         "q": query,
                         "restrict_sr": "on",
@@ -139,11 +213,14 @@ class RedditRSSSearch:
                         "t": "week",
                         "limit": max_results,
                     },
-                    headers={"User-Agent": "BetAgent/0.1 (sports research bot)"},
+                    headers=headers,
                     timeout=8,
                 )
                 if resp.status_code == 429:
                     logger.debug("Reddit rate-limited on r/%s — skipping", sub)
+                    continue
+                if resp.status_code == 403:
+                    logger.warning("Reddit returned 403 for r/%s — endpoint may be blocked", sub)
                     continue
                 resp.raise_for_status()
                 data = resp.json()
@@ -415,8 +492,9 @@ class CascadingSearch:
 def create_search_backend() -> CascadingSearch:
     """Create a cascading search backend: Reddit → Tavily → Brave → empty stub.
 
-    Reddit RSS is always first (free, no API key). Paid backends follow
-    as fallback when Reddit returns no results.
+    Reddit is first (free; set REDDIT_CLIENT_ID + REDDIT_CLIENT_SECRET
+    for OAuth 60 req/min, otherwise ~10 req/min unauthenticated).
+    Paid backends follow as fallback when Reddit returns no results.
     """
     backends: list = []
 
