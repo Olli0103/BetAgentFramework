@@ -130,32 +130,42 @@ agents:
       provider: api-sports.io
       api_key_env: API_SPORTS_KEY     # Same key for all sport APIs
       auth_header: x-apisports-key    # NOT Authorization: Bearer
-      # Each sport = separate API with its own subdomain + version
-      # 100 req/day free per API (shared across all sport APIs)
+      # Each sport = separate API with own subdomain, version, and quota
+      # Football: Pro plan (500 req/day), all others: Free (100 req/day each)
       apis:
         football:
           base_url: "https://v3.football.api-sports.io"
+          plan: pro                    # 500 req/day, expires 2026-04-06
+          daily_limit: 500
           endpoints: [fixtures, standings, injuries, predictions, odds, teams, players, statistics]
         basketball:
           base_url: "https://v1.basketball.api-sports.io"
+          plan: free                   # 100 req/day
+          daily_limit: 100
           endpoints: [games, standings, odds, teams, statistics]
         nba:
           base_url: "https://v2.nba.api-sports.io"
+          plan: free
+          daily_limit: 100
           endpoints: [games, standings, teams, players, statistics]
         hockey:
           base_url: "https://v1.hockey.api-sports.io"
+          plan: free
+          daily_limit: 100
           endpoints: [games, standings, odds, teams, statistics]
         nfl:
           base_url: "https://v1.american-football.api-sports.io"
+          plan: free
+          daily_limit: 100
           endpoints: [games, standings, teams, players, statistics, injuries]
         # Available but not yet used by our system:
-        # baseball:  https://v1.baseball.api-sports.io
-        # handball:  https://v1.handball.api-sports.io
-        # rugby:     https://v1.rugby.api-sports.io
-        # volleyball: https://v1.volleyball.api-sports.io
-        # mma:       https://v1.mma.api-sports.io
-        # formula1:  https://v1.formula-1.api-sports.io
-        # afl:       https://v1.afl.api-sports.io
+        # baseball:    https://v1.baseball.api-sports.io     (free, 100/day)
+        # handball:    https://v1.handball.api-sports.io     (free, 100/day)
+        # rugby:       https://v1.rugby.api-sports.io        (free, 100/day)
+        # volleyball:  https://v1.volleyball.api-sports.io   (free, 100/day)
+        # mma:         https://v1.mma.api-sports.io          (free, 100/day)
+        # formula1:    https://v1.formula-1.api-sports.io    (free, 100/day)
+        # afl:         https://v1.afl.api-sports.io          (free, 100/day)
     cloudflare_crawl:
       enabled: true
       max_crawls_per_day: 5
