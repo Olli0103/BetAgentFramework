@@ -32,7 +32,7 @@ SAMPLE_TIER_YAML = textwrap.dedent("""\
             temperature: 0.2
             timeout_seconds: 60
           - provider: openrouter
-            model: anthropic/claude-sonnet-4
+            model: openrouter/hunter-alpha
             model_env: OPENROUTER_MODEL
             api_key_env: OPENROUTER_API_KEY
             max_tokens: 8192
@@ -368,7 +368,7 @@ def test_model_env_empty_uses_yaml_default(tier_yaml: Path) -> None:
         tiers = load_tier_configs(tier_yaml)
 
     t1 = tiers["tier1_heavy_reasoning"]
-    assert t1.providers[0].model == "anthropic/claude-sonnet-4"
+    assert t1.providers[0].model == "openrouter/hunter-alpha"
 
 
 # ── MasterAgentBridge integration ─────────────────────────────────────
