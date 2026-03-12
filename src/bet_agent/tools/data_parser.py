@@ -456,6 +456,19 @@ def process_crawl_results(
         logger.warning("No parser registered for sport: %s", sport)
         return 0
 
+    # Ironclad gate: resolve all team names through the alias resolver
+    resolver = None
+    try:
+        from bet_agent.ingest.alias_resolver import IroncladAliasResolver
+
+        sport_enum = Sport(sport)
+        resolver = IroncladAliasResolver(session, sport_enum)
+    except (ValueError, Exception) as exc:
+        logger.warning(
+            "Could not init alias resolver for %s: %s — raw names will be used",
+            sport, exc,
+        )
+
     total_upserted = 0
 
     for page in pages:
@@ -473,10 +486,11 @@ def process_crawl_results(
 
         for team_name, league, stats in parsed:
             try:
+                canonical_name = resolver.resolve(team_name) if resolver else team_name
                 upsert_daily_stats(
                     session=session,
                     sport=sport,
-                    team_name=team_name,
+                    team_name=canonical_name,
                     league=league,
                     stat_date=stat_date,
                     stats=stats,
