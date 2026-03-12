@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from bet_agent.tools.odds import normalize_odds
+
 
 @dataclass(frozen=True)
 class KellyResult:
@@ -45,11 +47,12 @@ def calculate_quarter_kelly(
     Raises:
         ValueError: If inputs are out of valid ranges.
     """
+    # Normalize odds format (auto-detect American → Decimal)
+    odds = normalize_odds(odds)
+
     # Input validation
     if not 0.0 < prob < 1.0:
         raise ValueError(f"prob must be in (0, 1), got {prob}")
-    if odds <= 1.0:
-        raise ValueError(f"odds must be > 1.0, got {odds}")
     if bankroll < 0.0:
         raise ValueError(f"bankroll must be >= 0, got {bankroll}")
 

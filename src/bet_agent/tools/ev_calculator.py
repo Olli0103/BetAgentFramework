@@ -14,6 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
+from bet_agent.tools.odds import normalize_odds
 from bet_agent.tools.prob_models.registry import get_model
 
 logger = logging.getLogger(__name__)
@@ -56,11 +57,12 @@ def calculate_live_ev(
         KeyError: If sport has no registered probability model.
         ValueError: If inputs are out of valid ranges.
     """
+    # Normalize odds format (auto-detect American → Decimal)
+    live_odds = normalize_odds(live_odds)
+
     # Input validation
     if not 0.0 <= pre_match_prob <= 1.0:
         raise ValueError(f"pre_match_prob must be in [0, 1], got {pre_match_prob}")
-    if live_odds <= 1.0:
-        raise ValueError(f"live_odds must be > 1.0, got {live_odds}")
     if live_time < 0.0:
         raise ValueError(f"live_time must be >= 0, got {live_time}")
 
@@ -103,10 +105,10 @@ def calculate_pre_match_ev(
     Returns:
         EVResult with probability, implied probability, edge, and EV.
     """
+    odds = normalize_odds(odds)
+
     if not 0.0 <= model_prob <= 1.0:
         raise ValueError(f"model_prob must be in [0, 1], got {model_prob}")
-    if odds <= 1.0:
-        raise ValueError(f"odds must be > 1.0, got {odds}")
 
     implied_prob = 1.0 / odds
     prob_edge = model_prob - implied_prob
@@ -205,6 +207,7 @@ def calculate_ml_pre_match_ev(
 
 def _make_ev_result(model_prob: float, odds: float, source: str) -> EVResult:
     """Create an EVResult from probability and odds."""
+    odds = normalize_odds(odds)
     implied_prob = 1.0 / odds
     prob_edge = model_prob - implied_prob
     ev = (model_prob * (odds - 1.0)) - (1.0 - model_prob)

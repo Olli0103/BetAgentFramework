@@ -98,7 +98,7 @@ class TestLiveEV:
             )
 
     def test_invalid_live_odds(self):
-        with pytest.raises(ValueError, match="live_odds"):
+        with pytest.raises(ValueError, match="odds"):
             calculate_live_ev(
                 sport="football",
                 pre_match_prob=0.5,
