@@ -234,6 +234,64 @@ class TestNHLIngester:
         assert model.match_stats["home_shots"] == 32.0
         assert model.match_stats["away_shots"] == 28.0
 
+    def test_season_derived_from_date_when_missing(self):
+        """When CSV has no 'season' column, derive NHL season from date."""
+        from bet_agent.ingest.nhl import NHLIngester, _derive_nhl_season
+
+        # Jan 2005 → season 2004-05
+        row = {
+            "game_id": "G001",
+            "home": {
+                "date": "2005-01-07", "team_name": "Red Wings",
+                "goals_for": "3", "is_home": "1",
+            },
+            "away": {
+                "date": "2005-01-07", "team_name": "Avalanche",
+                "goals_for": "2", "is_home": "0",
+            },
+        }
+        ingester = NHLIngester()
+        model = ingester.row_to_model(row, "nhl_data.csv")
+        assert model.season == "2004-05"
+
+    def test_derive_nhl_season_various_dates(self):
+        from datetime import date
+        from bet_agent.ingest.nhl import _derive_nhl_season
+
+        # Oct-Dec: season starts this year
+        assert _derive_nhl_season(date(2024, 10, 15)) == "2024-25"
+        assert _derive_nhl_season(date(2024, 12, 31)) == "2024-25"
+
+        # Jan-Jun: season started previous year
+        assert _derive_nhl_season(date(2025, 1, 7)) == "2024-25"
+        assert _derive_nhl_season(date(2025, 4, 15)) == "2024-25"
+        assert _derive_nhl_season(date(2025, 6, 30)) == "2024-25"
+
+        # Jul-Sep: preseason
+        assert _derive_nhl_season(date(2025, 9, 20)) == "2025-26"
+
+        # Old data: Jan 2004
+        assert _derive_nhl_season(date(2004, 1, 7)) == "2003-04"
+
+    def test_season_from_csv_takes_priority(self):
+        """When CSV has a 'season' column, use it instead of deriving."""
+        from bet_agent.ingest.nhl import NHLIngester
+
+        row = {
+            "game_id": "G002",
+            "home": {
+                "date": "2005-01-07", "team_name": "Red Wings",
+                "goals_for": "3", "is_home": "1", "season": "2004-05",
+            },
+            "away": {
+                "date": "2005-01-07", "team_name": "Avalanche",
+                "goals_for": "2", "is_home": "0", "season": "2004-05",
+            },
+        }
+        ingester = NHLIngester()
+        model = ingester.row_to_model(row, "nhl_data.csv")
+        assert model.season == "2004-05"
+
     def test_single_row_game_skipped(self):
         from bet_agent.ingest.nhl import NHLIngester
 

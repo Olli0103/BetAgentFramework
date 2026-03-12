@@ -74,6 +74,25 @@ DIFF_COLS = [
 ]
 
 
+def _derive_nhl_season(match_date) -> str:
+    """Derive NHL season string from match date.
+
+    NHL season runs Oct → Jun, so a game in Jan 2005 belongs to "2004-05".
+    Games Jul-Sep belong to the upcoming season (preseason).
+    """
+    year = match_date.year
+    month = match_date.month
+    if month >= 10:
+        # Oct-Dec: season starts this year
+        return f"{year}-{str(year + 1)[2:]}"
+    elif month <= 6:
+        # Jan-Jun: season started previous year
+        return f"{year - 1}-{str(year)[2:]}"
+    else:
+        # Jul-Sep: preseason for upcoming season
+        return f"{year}-{str(year + 1)[2:]}"
+
+
 class NHLIngester(BaseIngester):
     sport = Sport.ICE_HOCKEY
     source_name = "nhl_historical_csv"
@@ -119,7 +138,7 @@ class NHLIngester(BaseIngester):
             home["date"],
             formats=["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"],
         )
-        season = (home.get("season") or "").strip() or str(match_date.year)
+        season = (home.get("season") or "").strip() or _derive_nhl_season(match_date)
 
         home_goals = safe_int(home.get("goals_for"))
         away_goals = safe_int(away.get("goals_for"))
