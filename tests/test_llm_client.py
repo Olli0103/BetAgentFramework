@@ -33,6 +33,7 @@ SAMPLE_TIER_YAML = textwrap.dedent("""\
             timeout_seconds: 60
           - provider: openrouter
             model: anthropic/claude-sonnet-4
+            model_env: OPENROUTER_MODEL
             api_key_env: OPENROUTER_API_KEY
             max_tokens: 8192
             temperature: 0.2
@@ -336,6 +337,38 @@ def test_openrouter_url_in_provider_urls() -> None:
     """OpenRouter URL is correctly configured."""
     from bet_agent.llm.client import _PROVIDER_URLS
     assert _PROVIDER_URLS["openrouter"] == "https://openrouter.ai/api/v1"
+
+
+def test_model_env_overrides_yaml_default(tier_yaml: Path) -> None:
+    """OPENROUTER_MODEL env var overrides the YAML default model."""
+    env = {
+        "OPENROUTER_API_KEY": "or-key",
+        "OPENROUTER_MODEL": "meta-llama/llama-4-scout",
+        "OPENCLAW_OAUTH_TOKEN": "",
+        "GEMINI_API_KEY": "",
+    }
+    with patch.dict("os.environ", env, clear=False):
+        tiers = load_tier_configs(tier_yaml)
+
+    t1 = tiers["tier1_heavy_reasoning"]
+    assert len(t1.providers) == 1
+    assert t1.providers[0].name == "openrouter"
+    assert t1.providers[0].model == "meta-llama/llama-4-scout"
+
+
+def test_model_env_empty_uses_yaml_default(tier_yaml: Path) -> None:
+    """Empty OPENROUTER_MODEL falls back to YAML default."""
+    env = {
+        "OPENROUTER_API_KEY": "or-key",
+        "OPENROUTER_MODEL": "",
+        "OPENCLAW_OAUTH_TOKEN": "",
+        "GEMINI_API_KEY": "",
+    }
+    with patch.dict("os.environ", env, clear=False):
+        tiers = load_tier_configs(tier_yaml)
+
+    t1 = tiers["tier1_heavy_reasoning"]
+    assert t1.providers[0].model == "anthropic/claude-sonnet-4"
 
 
 # ── MasterAgentBridge integration ─────────────────────────────────────

@@ -120,10 +120,15 @@ def _resolve_provider(cfg: dict[str, Any]) -> ProviderConfig | None:
     if not base_url:
         return None
 
+    # Model: env override takes precedence over YAML default
+    model = cfg.get("model", "")
+    if "model_env" in cfg:
+        model = os.environ.get(cfg["model_env"], "") or model
+
     return ProviderConfig(
         name=provider,
         base_url=base_url,
-        model=cfg.get("model", ""),
+        model=model,
         api_key=api_key,
         max_tokens=cfg.get("max_tokens", 8192),
         temperature=cfg.get("temperature", 0.2),

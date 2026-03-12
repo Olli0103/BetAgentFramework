@@ -18,7 +18,8 @@ tiers:
         temperature: 0.2
         timeout_seconds: 60
       - provider: openrouter
-        model: anthropic/claude-sonnet-4   # Best reasoning per dollar
+        model: anthropic/claude-sonnet-4   # Default; override via env
+        model_env: OPENROUTER_MODEL        # e.g. meta-llama/llama-4-scout
         api_key_env: OPENROUTER_API_KEY
         max_tokens: 8192
         temperature: 0.2
