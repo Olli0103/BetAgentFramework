@@ -114,6 +114,21 @@ _REDDIT_SPORT_SUBS: dict[str, list[str]] = {
 # Flattened list of all sport subreddits for general queries
 _ALL_SPORT_SUBS = sorted({sub for subs in _REDDIT_SPORT_SUBS.values() for sub in subs})
 
+
+def _reddit_user_agent() -> str:
+    """Build a Reddit-compliant User-Agent string.
+
+    Reddit requires: ``<platform>:<app_id>:<version> (by /u/<username>)``
+    Set REDDIT_USERNAME env var to provide the ``/u/`` portion.
+    """
+    username = os.environ.get("REDDIT_USERNAME", "")
+    base = "linux:bet_agent:1.0"
+    if username:
+        return f"{base} (by /u/{username})"
+    logger.warning("REDDIT_USERNAME not set — User-Agent may be rejected by Reddit")
+    return f"{base} (by /u/UNSET)"
+
+
 # Reddit OAuth token cache (thread-safe)
 _reddit_token_lock = threading.Lock()
 _reddit_token: str | None = None
@@ -145,7 +160,7 @@ def _get_reddit_oauth_token() -> str | None:
                 "https://www.reddit.com/api/v1/access_token",
                 auth=(client_id, client_secret),
                 data={"grant_type": "client_credentials"},
-                headers={"User-Agent": "BetAgent/1.0 (sports research bot)"},
+                headers={"User-Agent": _reddit_user_agent()},
                 timeout=10,
             )
             resp.raise_for_status()
@@ -228,7 +243,7 @@ class RedditRSSSearch:
             try:
                 resp = _requests.get(
                     f"https://www.reddit.com/r/{sub}/.rss",
-                    headers={"User-Agent": "BetAgent/1.0 (sports research bot)"},
+                    headers={"User-Agent": _reddit_user_agent()},
                     timeout=8,
                 )
                 if resp.status_code in (429, 403):
@@ -298,7 +313,7 @@ class RedditRSSSearch:
                     },
                     headers={
                         "Authorization": f"Bearer {token}",
-                        "User-Agent": "BetAgent/1.0 (sports research bot)",
+                        "User-Agent": _reddit_user_agent(),
                     },
                     timeout=8,
                 )
