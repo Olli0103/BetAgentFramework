@@ -211,11 +211,17 @@ def safe_int(val: str | None, default: int = 0) -> int:
 
 
 def safe_float(val: str | None, default: float | None = None) -> float | None:
-    """Parse a float from a string, returning default on failure."""
+    """Parse a float from a string, returning default on failure.
+
+    Rejects NaN and Inf to prevent feature vector poisoning.
+    """
     if not val or not val.strip():
         return default
     try:
-        return float(val.strip())
+        result = float(val.strip())
+        if result != result or result == float("inf") or result == float("-inf"):
+            return default
+        return result
     except (ValueError, TypeError):
         return default
 

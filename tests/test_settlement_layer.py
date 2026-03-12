@@ -459,6 +459,24 @@ class TestSettlementEngine:
         assert summary.won == 1
         assert summary.lost == 1
 
+    def test_settle_bet_idempotent(self, db_session):
+        """Calling settle_bet twice on the same bet must not double-count bankroll."""
+        from bet_agent.tools.settlement_engine import settle_bet
+
+        match = _add_match(db_session, home_score=3, away_score=0, state=MatchState.FINISHED)
+        bet = _add_bet(db_session, match, selection="home", odds=Decimal("2.00"), stake=Decimal("10.00"))
+        _add_bankroll(db_session, LedgerType.REAL, Decimal("990.00"))
+
+        # First settlement
+        r1 = settle_bet(db_session, bet, match)
+        assert r1.new_status == BetStatus.WON
+        assert r1.pnl_eur == Decimal("10.00")
+
+        # Second call must be a no-op
+        r2 = settle_bet(db_session, bet, match)
+        assert r2.reason == "already_settled"
+        assert r2.new_status == BetStatus.WON
+
     def test_skips_already_settled_bets(self, db_session):
         """Already WON/LOST bets should not be re-settled."""
         from bet_agent.tools.settlement_engine import settle_finished_matches

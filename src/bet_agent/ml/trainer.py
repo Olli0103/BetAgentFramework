@@ -406,23 +406,40 @@ def run_training_pipeline(
     # Dynamic feature names from the actual dataset
     feature_names = get_feature_names(sport, dataset=dataset)
 
+    # Filter invalid results (walkovers, unknowns, abandoned)
+    _INVALID_RESULTS = {"U", "W/O", "ABD", "CANC", "POSTP", "AWD", ""}
+    n_classes = _num_classes(sport)
+    if n_classes == 3:
+        valid_results = {"H", "D", "A"}
+        result_map = {"H": 0, "D": 1, "A": 2}
+    else:
+        valid_results = {"H", "A"}
+        result_map = {"H": 0, "A": 1}
+
+    pre_filter = len(dataset)
+    dataset = [
+        fv for fv in dataset
+        if (fv.target_result or "").upper() in valid_results
+    ]
+    if len(dataset) < pre_filter:
+        logger.info(
+            "Filtered %d invalid results from training data (U/W.O./ABD)",
+            pre_filter - len(dataset),
+        )
+
+    if len(dataset) < 20:
+        logger.warning("Insufficient data after filtering: %d samples", len(dataset))
+        return {}
+
     # Build numpy arrays
     X = np.zeros((len(dataset), len(feature_names)))
     y_result = np.zeros(len(dataset), dtype=int)
     y_total = np.zeros(len(dataset))
 
-    n_classes = _num_classes(sport)
-    if n_classes == 3:
-        result_map = {"H": 0, "D": 1, "A": 2}
-        default_label = 1  # draw
-    else:
-        result_map = {"H": 0, "A": 1}
-        default_label = 0  # home (arbitrary; draws are collapsed to home)
-
     for i, fv in enumerate(dataset):
         for j, fname in enumerate(feature_names):
             X[i, j] = fv.features.get(fname, 0.0)
-        y_result[i] = result_map.get(fv.target_result or "", default_label)
+        y_result[i] = result_map[fv.target_result.upper()]
         y_total[i] = float(fv.target_total_goals or 0)
 
     # ── Walk-Forward Validation ──────────────────────────────────────

@@ -50,6 +50,15 @@ class TestBaseUtilities:
         assert safe_float(None) is None
         assert safe_float("abc", default=0.0) == 0.0
 
+    def test_safe_float_rejects_nan_inf(self):
+        """NaN and Inf must not pass through to feature vectors."""
+        assert safe_float("nan") is None
+        assert safe_float("NaN") is None
+        assert safe_float("inf") is None
+        assert safe_float("-inf") is None
+        assert safe_float("Infinity") is None
+        assert safe_float("nan", default=0.0) == 0.0
+
     def test_parse_date_multiple_formats(self):
         assert parse_date("11/03/2026") == date(2026, 3, 11)
         assert parse_date("2026-03-11") == date(2026, 3, 11)

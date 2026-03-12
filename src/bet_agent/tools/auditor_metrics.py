@@ -37,9 +37,31 @@ logger = logging.getLogger(__name__)
 
 # ── Degradation thresholds ───────────────────────────────────────────
 
-BRIER_THRESHOLD = 0.22  # Above this = poorly calibrated
+BRIER_THRESHOLD = 0.22  # Default (fallback)
 ROI_THRESHOLD = -5.0  # Below -5% ROI = losing money
 ROLLING_WINDOW = 50  # Minimum bets for degradation check
+
+# Per-market Brier thresholds: 3-way markets are harder to calibrate
+_BRIER_THRESHOLDS: dict[str, float] = {
+    "match_winner": 0.18,  # 3-way (Home/Draw/Away) — bookmaker ~0.16-0.18
+    "over_under": 0.22,    # 2-way — bookmaker ~0.20-0.22
+    "btts": 0.22,          # 2-way
+    "spread": 0.22,        # 2-way
+}
+
+
+def _brier_threshold_for_model(model_name: str) -> float:
+    """Return the appropriate Brier threshold based on model name.
+
+    Match winner models (3-way) get a tighter threshold since they're
+    evaluated with multi-class Brier. 2-way models use the default.
+    """
+    name = model_name.lower()
+    if "match_winner" in name:
+        return _BRIER_THRESHOLDS["match_winner"]
+    if "over_under" in name:
+        return _BRIER_THRESHOLDS["over_under"]
+    return BRIER_THRESHOLD
 
 
 # ── Data structures ──────────────────────────────────────────────────
@@ -328,10 +350,11 @@ def evaluate_model_performance(
         reasons: list[str] = []
 
         if len(bets) >= ROLLING_WINDOW:
-            if brier > BRIER_THRESHOLD:
+            brier_thresh = _brier_threshold_for_model(model_name)
+            if brier > brier_thresh:
                 is_degraded = True
                 reasons.append(
-                    f"Brier Score {brier:.4f} > {BRIER_THRESHOLD} "
+                    f"Brier Score {brier:.4f} > {brier_thresh} "
                     f"(over {len(bets)} bets)"
                 )
             if roi < ROI_THRESHOLD:
@@ -517,10 +540,11 @@ def check_rolling_degradation(
     total_pnl = sum(b.pnl_eur or Decimal("0") for b in bets)
     roi = calculate_roi(total_staked, total_pnl)
 
-    is_degraded = brier > BRIER_THRESHOLD or roi < ROI_THRESHOLD
+    brier_thresh = _brier_threshold_for_model(model_name)
+    is_degraded = brier > brier_thresh or roi < ROI_THRESHOLD
     reasons = []
-    if brier > BRIER_THRESHOLD:
-        reasons.append(f"Brier {brier:.4f} > {BRIER_THRESHOLD}")
+    if brier > brier_thresh:
+        reasons.append(f"Brier {brier:.4f} > {brier_thresh}")
     if roi < ROI_THRESHOLD:
         reasons.append(f"ROI {roi:.2f}% < {ROI_THRESHOLD}%")
 

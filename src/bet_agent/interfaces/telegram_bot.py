@@ -124,6 +124,30 @@ def _parse_group_id() -> int | None:
         return None
 
 
+_TELEGRAM_MAX_MSG_LEN = 4096
+
+
+async def _safe_reply(message, text: str, **kwargs) -> None:
+    """Reply with automatic message splitting if text exceeds Telegram's limit."""
+    if len(text) <= _TELEGRAM_MAX_MSG_LEN:
+        await message.reply_text(text, **kwargs)
+        return
+    # Split on newline boundaries to keep readability
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > _TELEGRAM_MAX_MSG_LEN:
+            if current:
+                chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+    for chunk in chunks:
+        await message.reply_text(chunk, **kwargs)
+
+
 def get_user_display_name(user) -> str:
     """Extract display name from a Telegram User object."""
     if user is None:
@@ -352,6 +376,24 @@ async def cmd_start(update, context) -> None:
     )
 
 
+async def cmd_help(update, context) -> None:
+    """Handle /help — list available commands."""
+    if not _check_auth(update):
+        return
+
+    await update.message.reply_text(
+        "Available commands:\n\n"
+        "/status  — Portfolio summary (balances, open bets)\n"
+        "/pending — Bets awaiting your execution\n"
+        "/pnl     — Balance & profit/loss report\n"
+        "/health  — Model health (Brier, ROI, degradation)\n"
+        "/placed <id> <odds> <stake> — Confirm manual placement\n"
+        "/cancel  — Abort custom odds/stake entry\n"
+        "/help    — This message\n\n"
+        "Or type any question in natural language."
+    )
+
+
 async def cmd_status(update, context) -> None:
     """Handle /status — daily portfolio summary."""
     if not _check_auth(update):
@@ -360,7 +402,7 @@ async def cmd_status(update, context) -> None:
 
     try:
         text = await asyncio.to_thread(_sync_fetch_status)
-        await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
+        await _safe_reply(update.message, f"```\n{text}\n```", parse_mode="Markdown")
     except Exception as e:
         logger.error("Error in /status: %s", e)
         await update.message.reply_text(f"Error fetching status: {e}")
@@ -428,7 +470,7 @@ async def cmd_pnl(update, context) -> None:
 
     try:
         text = await asyncio.to_thread(_sync_fetch_pnl)
-        await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
+        await _safe_reply(update.message, f"```\n{text}\n```", parse_mode="Markdown")
     except Exception as e:
         logger.error("Error in /pnl: %s", e)
         await update.message.reply_text(f"Error: {e}")
@@ -457,8 +499,8 @@ async def cmd_health(update, context) -> None:
             )
             lines.append("")
 
-        await update.message.reply_text(
-            f"```\n{chr(10).join(lines)}\n```", parse_mode="Markdown"
+        await _safe_reply(
+            update.message, f"```\n{chr(10).join(lines)}\n```", parse_mode="Markdown"
         )
     except Exception as e:
         logger.error("Error in /health: %s", e)
@@ -856,8 +898,8 @@ async def _broadcast_placement(context, result, bet_id, user_name, user):
                         f"EV: {ev_str}"
                     ),
                 )
-            except Exception:
-                pass  # User may not have started the bot yet
+            except Exception as exc:
+                logger.debug("Broadcast to user %d failed: %s", uid, exc)
 
 
 # ── Alert digest / batching (thread-safe asyncio.Queue) ─────────────
@@ -913,8 +955,8 @@ async def _send_to_all(context, text: str) -> None:
         if uid != int(TELEGRAM_GROUP_ID or 0):
             try:
                 await context.bot.send_message(chat_id=uid, text=text)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Digest to user %d failed: %s", uid, exc)
 
 
 # ── Bot builder ──────────────────────────────────────────────────────
@@ -951,6 +993,7 @@ def build_application():
 
     # Register command handlers
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("pnl", cmd_pnl))

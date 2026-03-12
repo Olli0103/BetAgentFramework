@@ -285,7 +285,21 @@ def settle_bet(
     Accounting: stake was deducted at placement.  At settlement we
     return money to the bankroll (WON → full payout, VOID → refund).
     The ``bet.pnl_eur`` stores the human-readable net profit/loss.
+
+    Idempotent: if the bet is already settled (WON/LOST/VOID), returns
+    the existing result without modifying the bankroll again.
     """
+    # Guard: skip already-settled bets to prevent double bankroll adjustment
+    if bet.status in (BetStatus.WON, BetStatus.LOST, BetStatus.VOID):
+        logger.debug("Bet %s already settled (%s), skipping", bet.id, bet.status.value)
+        return SettlementResult(
+            bet_id=bet.id,
+            old_status=bet.status,
+            new_status=bet.status,
+            pnl_eur=bet.pnl_eur or Decimal("0.00"),
+            reason="already_settled",
+        )
+
     old_status = bet.status
     outcome = determine_outcome(bet, match)
     bankroll_delta = calculate_pnl(bet, outcome)
@@ -328,7 +342,8 @@ def expire_stale_bets(
     Returns:
         List of dicts describing each expired bet (for Telegram alerts).
     """
-    cutoff = datetime.now(timezone.utc) - __import__("datetime").timedelta(minutes=max_age_minutes)
+    from datetime import timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
 
     stale = list(
         session.execute(
