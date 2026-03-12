@@ -3,8 +3,11 @@
 Takes PENDING predictions and searches for qualitative risks (injuries,
 lineup changes, fatigue, weather) before approving or vetoing.
 
-Uses Tier 1 LLM (via configurable search backend) to analyze news results
-and make APPROVE/VETO decisions.
+Two-layer analysis:
+  Layer 1 (Regex): Fast keyword scan for obvious risk terms.
+  Layer 2 (LLM):  Tier-1 semantic analysis of news snippets — catches
+                   nuanced risks that regex misses (e.g. "trained
+                   individually", "rested key players in cup match").
 
 Golden Rule: When in doubt, VETO.  A missed bet costs nothing.
 """
@@ -57,16 +60,13 @@ class NewsSearchBackend(Protocol):
 
 
 class DefaultNewsSearch:
-    """Stub search backend — returns empty results when no API is configured.
-
-    In production, replace with TavilySearch, CloudflareSearch, or GoogleSearch.
-    """
+    """Stub search backend — returns empty results when no API is configured."""
 
     def search(self, query: str, max_results: int = 5) -> list[dict]:
         return []
 
 
-# ── Risk keyword analysis ────────────────────────────────────────────
+# ── Risk keyword analysis (Layer 1: Regex) ────────────────────────────
 
 _RISK_KEYWORDS = [
     r"\binjur(?:y|ed|ies)\b",
@@ -101,19 +101,87 @@ def _extract_risk_factors(snippets: list[str]) -> list[str]:
     return factors
 
 
+# ── LLM risk analysis (Layer 2: Semantic) ────────────────────────────
+
+_LLM_RISK_PROMPT = """\
+You are a sports betting risk analyst. Analyze these news snippets about \
+an upcoming match between {home} and {away}.
+
+NEWS SNIPPETS:
+{snippets}
+
+Identify risk factors that could invalidate a statistical prediction. \
+Look for:
+- Key player injuries, illness, or personal issues (even if not using \
+the word "injury")
+- Tactical changes (rotation, resting players, youth lineup)
+- Travel fatigue, fixture congestion, back-to-back games
+- Coaching changes, internal conflicts, morale issues
+- External factors (weather, pitch conditions, fan protests)
+- Motivation asymmetry (nothing to play for vs must-win)
+
+Respond ONLY with a JSON array of short risk factor strings. \
+If no risks found, respond with an empty array [].
+Example: ["Mbappé trained individually - doubtful", "3rd match in 7 days"]"""
+
+
+def _llm_analyze_risks(
+    home: str,
+    away: str,
+    snippets: list[str],
+) -> list[str]:
+    """Use Tier-1 LLM to semantically extract risk factors from news.
+
+    Returns list of risk factor strings, or empty list on failure.
+    """
+    if not snippets:
+        return []
+
+    try:
+        from bet_agent.llm.client import LLMClient
+        client = LLMClient.for_tier("tier1_heavy_reasoning")
+    except Exception:
+        logger.debug("LLM unavailable for risk analysis — regex only")
+        return []
+
+    snippet_text = "\n".join(f"- {s[:300]}" for s in snippets[:10])
+    prompt = _LLM_RISK_PROMPT.format(
+        home=home, away=away, snippets=snippet_text,
+    )
+
+    try:
+        response = client.chat(prompt, temperature=0.1, max_tokens=512)
+    except Exception as exc:
+        logger.warning("LLM risk analysis failed: %s", exc)
+        return []
+
+    # Parse JSON array from response
+    import json
+    try:
+        # Find the JSON array in the response (LLM might add preamble)
+        start = response.index("[")
+        end = response.rindex("]") + 1
+        factors = json.loads(response[start:end])
+        if isinstance(factors, list):
+            return [str(f) for f in factors if f]
+    except (ValueError, json.JSONDecodeError):
+        logger.debug("Could not parse LLM risk response: %s", response[:200])
+
+    return []
+
+
 # ── Core veto logic ──────────────────────────────────────────────────
 
 
-def _build_search_queries(match: Match) -> list[str]:
-    """Build targeted search queries for a match's qualitative risks."""
-    teams = [match.home_team, match.away_team]
-    queries = []
-    for team in teams:
-        queries.append(f"{team} injury news today")
-        queries.append(f"{team} lineup changes {date.today()}")
-    # General match query
-    queries.append(f"{match.home_team} vs {match.away_team} preview news")
-    return queries
+def _build_search_query(match: Match) -> str:
+    """Build a single consolidated search query for a match.
+
+    Uses one query per match instead of 5 to conserve API budget.
+    """
+    return (
+        f"{match.home_team} vs {match.away_team} "
+        f"injury lineup news {date.today()}"
+    )
 
 
 def veto_check(
@@ -121,20 +189,30 @@ def veto_check(
     prediction: Prediction,
     search_backend: NewsSearchBackend | None = None,
     risk_threshold: int = 2,
+    *,
+    use_llm: bool = True,
 ) -> VetoResult:
     """Run a qualitative veto check on a single prediction.
+
+    Two-layer analysis:
+      1. Regex keyword scan (fast, free, catches obvious terms)
+      2. LLM semantic analysis (catches nuanced risks regex misses)
+
+    Risk factors from both layers are merged and deduplicated.
 
     Args:
         session: SQLAlchemy session.
         prediction: The PENDING prediction to check.
-        search_backend: Pluggable news search (defaults to stub).
+        search_backend: Pluggable news search (auto-detects if None).
         risk_threshold: Number of risk factors to trigger automatic VETO.
+        use_llm: Whether to run LLM analysis on top of regex.
 
     Returns:
         VetoResult with decision and reasoning.
     """
     if search_backend is None:
-        search_backend = DefaultNewsSearch()
+        from bet_agent.tools.search_backends import create_search_backend
+        search_backend = create_search_backend()
 
     match = prediction.match
     if match is None:
@@ -147,24 +225,33 @@ def veto_check(
             reason="Match not found in database",
         )
 
-    # Collect news snippets
+    # Collect news snippets (1 query per match to conserve budget)
     all_snippets: list[str] = []
     all_news: list[dict] = []
 
-    queries = _build_search_queries(match)
-    for query in queries:
-        try:
-            results = search_backend.search(query, max_results=3)
-            for r in results:
-                snippet = r.get("snippet", r.get("title", ""))
-                if snippet:
-                    all_snippets.append(snippet)
-                    all_news.append(r)
-        except Exception as exc:
-            logger.warning("Search failed for query '%s': %s", query, exc)
+    query = _build_search_query(match)
+    try:
+        results = search_backend.search(query, max_results=5)
+        for r in results:
+            snippet = r.get("snippet", r.get("title", ""))
+            if snippet:
+                all_snippets.append(snippet)
+                all_news.append(r)
+    except Exception as exc:
+        logger.warning("Search failed for '%s': %s", query, exc)
 
-    # Extract risk factors from snippets
-    risk_factors = _extract_risk_factors(all_snippets)
+    # Layer 1: Regex keyword extraction
+    regex_factors = _extract_risk_factors(all_snippets)
+
+    # Layer 2: LLM semantic analysis (only if we have snippets)
+    llm_factors: list[str] = []
+    if use_llm and all_snippets:
+        llm_factors = _llm_analyze_risks(
+            match.home_team, match.away_team, all_snippets,
+        )
+
+    # Merge and deduplicate risk factors
+    risk_factors = _merge_risk_factors(regex_factors, llm_factors)
 
     # Decision logic
     if len(risk_factors) >= risk_threshold:
@@ -196,6 +283,32 @@ def veto_check(
         risk_factors=risk_factors,
         news_snippets=news_snippet_texts,
     )
+
+
+def _merge_risk_factors(
+    regex_factors: list[str],
+    llm_factors: list[str],
+) -> list[str]:
+    """Merge regex and LLM risk factors, deduplicating by lowercase."""
+    seen: set[str] = set()
+    merged: list[str] = []
+
+    # Regex factors first (deterministic, trusted)
+    for f in regex_factors:
+        key = f.lower().strip()
+        if key not in seen:
+            seen.add(key)
+            merged.append(f)
+
+    # LLM factors (may overlap with regex hits)
+    for f in llm_factors:
+        key = f.lower().strip()
+        # Check if any existing factor is a substring match
+        if key not in seen and not any(key in s or s in key for s in seen):
+            seen.add(key)
+            merged.append(f)
+
+    return merged
 
 
 def apply_veto_result(

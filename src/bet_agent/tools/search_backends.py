@@ -1,0 +1,315 @@
+"""Search backends for the Devil's Advocate veto engine.
+
+Provides pluggable news search implementations with cascading fallback:
+  Priority 1: TavilySearch  — best quality, 1000 req/month free tier
+  Priority 2: BraveSearch   — good quality, 2000 req/month free tier
+  Priority 3: DefaultNewsSearch — stub (regex-only veto path)
+
+Budget management:
+  Each paid backend tracks its own monthly usage via file-based counters.
+  When a backend's budget is exhausted, the cascading search falls through
+  to the next available backend automatically.
+
+  Combined budget: ~3000 searches/month → ~100/day → plenty of headroom.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Monthly request budgets
+_TAVILY_MONTHLY_BUDGET = 1000
+_BRAVE_MONTHLY_BUDGET = 2000
+_USAGE_DIR = Path(os.environ.get("SEARCH_USAGE_DIR", "/tmp"))
+_TAVILY_USAGE_FILE = _USAGE_DIR / "tavily_usage.json"
+_BRAVE_USAGE_FILE = _USAGE_DIR / "brave_usage.json"
+
+
+# ── Budget tracking ──────────────────────────────────────────────────
+
+
+def _load_usage(usage_file: Path) -> dict:
+    """Load {month: count} from a usage file."""
+    if usage_file.exists():
+        try:
+            return json.loads(usage_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_usage(usage: dict, usage_file: Path) -> None:
+    try:
+        usage_file.parent.mkdir(parents=True, exist_ok=True)
+        usage_file.write_text(json.dumps(usage))
+    except OSError as exc:
+        logger.warning("Could not save usage file %s: %s", usage_file, exc)
+
+
+def _increment_usage(usage_file: Path) -> int:
+    """Increment this month's counter and return the new total."""
+    month_key = date.today().strftime("%Y-%m")
+    usage = _load_usage(usage_file)
+    count = usage.get(month_key, 0) + 1
+    usage[month_key] = count
+    _save_usage(usage, usage_file)
+    return count
+
+
+def _get_monthly_usage(usage_file: Path) -> int:
+    """Return the current month's request count for a backend."""
+    month_key = date.today().strftime("%Y-%m")
+    return _load_usage(usage_file).get(month_key, 0)
+
+
+def _budget_remaining(usage_file: Path, budget: int) -> int:
+    """Return how many requests remain this month for a backend."""
+    return max(0, budget - _get_monthly_usage(usage_file))
+
+
+# ── Convenience wrappers (Tavily — backward compat) ──────────────────
+
+def get_monthly_usage() -> int:
+    """Return Tavily's current month request count."""
+    return _get_monthly_usage(_TAVILY_USAGE_FILE)
+
+
+def budget_remaining() -> int:
+    """Return how many Tavily requests remain this month."""
+    return _budget_remaining(_TAVILY_USAGE_FILE, _TAVILY_MONTHLY_BUDGET)
+
+
+# ── Stub backend ─────────────────────────────────────────────────────
+
+
+class DefaultNewsSearch:
+    """Stub search backend — returns empty results when no API is configured."""
+
+    def search(self, query: str, max_results: int = 5) -> list[dict]:
+        return []
+
+
+# ── Tavily backend ───────────────────────────────────────────────────
+
+
+class TavilySearch:
+    """Production news search backend using Tavily Search API.
+
+    Requires TAVILY_API_KEY environment variable.
+
+    Budget-aware: refuses to search when monthly budget is exhausted,
+    falling back to empty results (regex-only veto path).
+    """
+
+    def __init__(self, api_key: str | None = None) -> None:
+        self._api_key = api_key or os.environ.get("TAVILY_API_KEY", "")
+        if not self._api_key:
+            logger.warning(
+                "TAVILY_API_KEY not set — TavilySearch will return empty results"
+            )
+
+    @property
+    def available(self) -> bool:
+        return bool(self._api_key) and _budget_remaining(
+            _TAVILY_USAGE_FILE, _TAVILY_MONTHLY_BUDGET,
+        ) > 0
+
+    def search(self, query: str, max_results: int = 5) -> list[dict]:
+        """Search for recent news using Tavily API.
+
+        Returns list of dicts with 'title', 'snippet', 'url' keys.
+        Returns empty list if API key is missing or budget exhausted.
+        """
+        if not self._api_key:
+            return []
+
+        remaining = _budget_remaining(_TAVILY_USAGE_FILE, _TAVILY_MONTHLY_BUDGET)
+        if remaining <= 0:
+            logger.warning(
+                "Tavily monthly budget exhausted (%d/%d) — skipping search",
+                _get_monthly_usage(_TAVILY_USAGE_FILE), _TAVILY_MONTHLY_BUDGET,
+            )
+            return []
+
+        import requests
+
+        try:
+            resp = requests.post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key": self._api_key,
+                    "query": query,
+                    "search_depth": "basic",
+                    "max_results": max_results,
+                    "include_answer": False,
+                    "topic": "news",
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            logger.warning("Tavily search failed for '%s': %s", query, exc)
+            return []
+
+        count = _increment_usage(_TAVILY_USAGE_FILE)
+        logger.debug(
+            "Tavily search OK (%d/%d this month): %s",
+            count, _TAVILY_MONTHLY_BUDGET, query,
+        )
+
+        results: list[dict] = []
+        for item in data.get("results", []):
+            results.append({
+                "title": item.get("title", ""),
+                "snippet": item.get("content", ""),
+                "url": item.get("url", ""),
+            })
+
+        return results
+
+
+# ── Brave Search backend ─────────────────────────────────────────────
+
+
+class BraveSearch:
+    """News search backend using Brave Search API.
+
+    Free tier: 2000 queries/month (no credit card required).
+    Requires BRAVE_SEARCH_API_KEY environment variable.
+    """
+
+    def __init__(self, api_key: str | None = None) -> None:
+        self._api_key = api_key or os.environ.get("BRAVE_SEARCH_API_KEY", "")
+        if not self._api_key:
+            logger.warning(
+                "BRAVE_SEARCH_API_KEY not set — BraveSearch will return empty results"
+            )
+
+    @property
+    def available(self) -> bool:
+        return bool(self._api_key) and _budget_remaining(
+            _BRAVE_USAGE_FILE, _BRAVE_MONTHLY_BUDGET,
+        ) > 0
+
+    def search(self, query: str, max_results: int = 5) -> list[dict]:
+        """Search for recent news using Brave Search API.
+
+        Returns list of dicts with 'title', 'snippet', 'url' keys.
+        """
+        if not self._api_key:
+            return []
+
+        remaining = _budget_remaining(_BRAVE_USAGE_FILE, _BRAVE_MONTHLY_BUDGET)
+        if remaining <= 0:
+            logger.warning(
+                "Brave monthly budget exhausted (%d/%d) — skipping search",
+                _get_monthly_usage(_BRAVE_USAGE_FILE), _BRAVE_MONTHLY_BUDGET,
+            )
+            return []
+
+        import requests
+
+        try:
+            resp = requests.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Encoding": "gzip",
+                    "X-Subscription-Token": self._api_key,
+                },
+                params={
+                    "q": query,
+                    "count": max_results,
+                    "search_lang": "en",
+                    "freshness": "pd",  # past day — most relevant for sports
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            logger.warning("Brave search failed for '%s': %s", query, exc)
+            return []
+
+        count = _increment_usage(_BRAVE_USAGE_FILE)
+        logger.debug(
+            "Brave search OK (%d/%d this month): %s",
+            count, _BRAVE_MONTHLY_BUDGET, query,
+        )
+
+        results: list[dict] = []
+        for item in data.get("web", {}).get("results", []):
+            results.append({
+                "title": item.get("title", ""),
+                "snippet": item.get("description", ""),
+                "url": item.get("url", ""),
+            })
+
+        return results
+
+
+# ── Cascading search ─────────────────────────────────────────────────
+
+
+class CascadingSearch:
+    """Tries multiple search backends in priority order.
+
+    Falls through to the next backend when:
+      - Current backend has no API key
+      - Current backend's monthly budget is exhausted
+      - Current backend's API call fails
+
+    Priority: Tavily (best quality) → Brave (free fallback) → empty.
+    """
+
+    def __init__(self, backends: list) -> None:
+        self._backends = backends
+
+    def search(self, query: str, max_results: int = 5) -> list[dict]:
+        for backend in self._backends:
+            if hasattr(backend, "available") and not backend.available:
+                continue
+            results = backend.search(query, max_results)
+            if results:
+                return results
+        return []
+
+
+# ── Factory ──────────────────────────────────────────────────────────
+
+
+def create_search_backend() -> CascadingSearch:
+    """Create a cascading search backend: Tavily → Brave → empty stub.
+
+    Automatically detects available API keys and builds the fallback
+    chain. Backends without API keys are skipped at search time.
+    """
+    backends: list = []
+
+    tavily_key = os.environ.get("TAVILY_API_KEY", "")
+    if tavily_key:
+        backends.append(TavilySearch(tavily_key))
+
+    brave_key = os.environ.get("BRAVE_SEARCH_API_KEY", "")
+    if brave_key:
+        backends.append(BraveSearch(brave_key))
+
+    # Always include stub as final fallback
+    backends.append(DefaultNewsSearch())
+
+    if len(backends) == 1:
+        logger.info(
+            "No search API keys configured — veto engine will use regex-only analysis"
+        )
+    else:
+        names = [type(b).__name__ for b in backends[:-1]]
+        logger.info("Search fallback chain: %s → regex-only", " → ".join(names))
+
+    return CascadingSearch(backends)
