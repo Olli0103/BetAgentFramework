@@ -128,18 +128,34 @@ agents:
         tennis: tennis_atp_french_open,tennis_atp_us_open,tennis_atp_wimbledon
     api_sports:
       provider: api-sports.io
-      base_url: "https://v3.football.api-sports.io"
-      api_key_env: API_SPORTS_KEY
-      endpoints:
-        injuries: /injuries          # All sports
-        standings: /standings        # League tables
-        fixtures: /fixtures          # Upcoming matches
-        predictions: /predictions    # API-native predictions (for comparison)
-      sports_apis:                   # Each sport has its own subdomain
-        football: v3.football.api-sports.io
-        basketball: v1.basketball.api-sports.io
-        ice_hockey: v1.hockey.api-sports.io
-        american_football: v1.american-football.api-sports.io
+      api_key_env: API_SPORTS_KEY     # Same key for all sport APIs
+      auth_header: x-apisports-key    # NOT Authorization: Bearer
+      # Each sport = separate API with its own subdomain + version
+      # 100 req/day free per API (shared across all sport APIs)
+      apis:
+        football:
+          base_url: "https://v3.football.api-sports.io"
+          endpoints: [fixtures, standings, injuries, predictions, odds, teams, players, statistics]
+        basketball:
+          base_url: "https://v1.basketball.api-sports.io"
+          endpoints: [games, standings, odds, teams, statistics]
+        nba:
+          base_url: "https://v2.nba.api-sports.io"
+          endpoints: [games, standings, teams, players, statistics]
+        hockey:
+          base_url: "https://v1.hockey.api-sports.io"
+          endpoints: [games, standings, odds, teams, statistics]
+        nfl:
+          base_url: "https://v1.american-football.api-sports.io"
+          endpoints: [games, standings, teams, players, statistics, injuries]
+        # Available but not yet used by our system:
+        # baseball:  https://v1.baseball.api-sports.io
+        # handball:  https://v1.handball.api-sports.io
+        # rugby:     https://v1.rugby.api-sports.io
+        # volleyball: https://v1.volleyball.api-sports.io
+        # mma:       https://v1.mma.api-sports.io
+        # formula1:  https://v1.formula-1.api-sports.io
+        # afl:       https://v1.afl.api-sports.io
     cloudflare_crawl:
       enabled: true
       max_crawls_per_day: 5
