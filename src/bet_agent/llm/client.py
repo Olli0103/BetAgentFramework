@@ -47,6 +47,7 @@ class ProviderConfig:
     max_tokens: int = 8192
     temperature: float = 0.2
     timeout: int = 60
+    connect_timeout: int = 10  # Separate connect timeout for fast DNS/network fail
     # When set, called instead of using ``api_key`` directly.
     # Returns a fresh token string each time (for OAuth auto-refresh).
     _token_fn: Any = None  # Callable[[], str] | None
@@ -136,6 +137,7 @@ def _resolve_provider(cfg: dict[str, Any]) -> ProviderConfig | None:
         max_tokens=cfg.get("max_tokens", 8192),
         temperature=cfg.get("temperature", 0.2),
         timeout=cfg.get("timeout_seconds", 60),
+        connect_timeout=cfg.get("connect_timeout_seconds", 10),
         _token_fn=token_fn,
     )
 
@@ -291,7 +293,10 @@ class LLMClient:
         }
 
         logger.debug("LLM request → %s (%s)", prov.name, prov.model)
-        resp = requests.post(url, json=payload, headers=headers, timeout=prov.timeout)
+        resp = requests.post(
+            url, json=payload, headers=headers,
+            timeout=(prov.connect_timeout, prov.timeout),  # (connect, read) — fast-fail on DNS/network
+        )
         resp.raise_for_status()
 
         data = resp.json()

@@ -37,6 +37,37 @@ from bet_agent.db.models import (
 
 logger = logging.getLogger(__name__)
 
+# ── Minimum team name length to reject obvious abbreviations ────────
+_MIN_TEAM_NAME_LEN = 4
+
+
+def validate_fixture(match: Match, odds_map: dict) -> tuple[bool, str]:
+    """Validate a fixture is ready for prediction.
+
+    Returns (is_valid, reason). Rejected fixtures are logged, not predicted.
+    """
+    # 1. Team name quality — reject obvious abbreviations (< 4 chars)
+    if len(match.home_team.strip()) < _MIN_TEAM_NAME_LEN:
+        return False, f"home_team too short: '{match.home_team}'"
+    if len(match.away_team.strip()) < _MIN_TEAM_NAME_LEN:
+        return False, f"away_team too short: '{match.away_team}'"
+
+    # 2. Valid scheduled_at
+    if match.scheduled_at is None:
+        return False, "missing scheduled_at"
+
+    # 3. Odds completeness — need at least match_winner home odds
+    mw = odds_map.get("match_winner", {})
+    if not mw or mw.get("home") is None:
+        return False, "no match_winner odds available"
+
+    # 4. Odds range sanity (should be decimal > 1.0 after normalization)
+    for sel, val in mw.items():
+        if val is not None and val <= 1.0:
+            return False, f"invalid odds for {sel}: {val}"
+
+    return True, ""
+
 
 def run_daily_predictions(
     session: Session,
@@ -81,10 +112,22 @@ def run_daily_predictions(
     bulk_odds = _bulk_load_odds(session, match_ids) if match_ids else {}
 
     all_predictions: list[Prediction] = []
+    rejected_count = 0
 
     for match in matches:
         try:
             odds_map = bulk_odds.get(match.id, {})
+
+            # ── Fixture validity gate ─────────────────────────────
+            is_valid, reject_reason = validate_fixture(match, odds_map)
+            if not is_valid:
+                logger.warning(
+                    "Fixture rejected: %s vs %s — %s",
+                    match.home_team, match.away_team, reject_reason,
+                )
+                rejected_count += 1
+                continue
+
             preds = _predict_match(session, match, prediction_date, model_dir, odds_map)
             for pred in preds:
                 if pred.ev >= Decimal(str(min_ev)):
@@ -98,8 +141,8 @@ def run_daily_predictions(
 
     session.flush()
     logger.info(
-        "Generated %d predictions for %s (%d matches)",
-        len(all_predictions), prediction_date, len(matches),
+        "Generated %d predictions for %s (%d matches, %d rejected by fixture gate)",
+        len(all_predictions), prediction_date, len(matches), rejected_count,
     )
     return all_predictions
 

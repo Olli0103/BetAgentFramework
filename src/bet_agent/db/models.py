@@ -12,6 +12,7 @@ from decimal import Decimal
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Enum,
@@ -182,10 +183,27 @@ class OddsMarket(Base):
 
     __table_args__ = (
         Index("ix_odds_match_market", "match_id", "market_type"),
+        CheckConstraint("odds_decimal > 1.0", name="ck_odds_decimal_valid"),
     )
+
+    @staticmethod
+    def normalize_odds_on_set(target, value, oldvalue, initiator):
+        """Auto-normalize American odds to decimal before DB write."""
+        if value is None:
+            return value
+        fval = float(value)
+        if fval <= -100 or fval >= 99.0:
+            from bet_agent.tools.odds import american_to_decimal
+            return Decimal(str(american_to_decimal(fval)))
+        return value
 
     def __repr__(self) -> str:
         return f"<OddsMarket {self.sportsbook} {self.selection}@{self.odds_decimal}>"
+
+
+# Auto-normalize odds on attribute set (catches all creation paths)
+from sqlalchemy import event as _sa_event  # noqa: E402
+_sa_event.listen(OddsMarket.odds_decimal, "set", OddsMarket.normalize_odds_on_set, retval=True)
 
 
 class BankrollLedger(Base):

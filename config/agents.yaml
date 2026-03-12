@@ -125,8 +125,12 @@ agents:
         american_football: americanfootball_nfl,americanfootball_nfl_super_bowl_winner
         basketball: basketball_nba
         ice_hockey: icehockey_nhl
-        tennis: tennis_atp_french_open,tennis_atp_us_open,tennis_atp_wimbledon
+        tennis: tennis_atp*,tennis_wta*
         darts: darts_pdc_world_championship
+      # Note: Wildcard entries (e.g. "tennis_atp*") are expanded at runtime
+      # by match_sport_keys() against the live /sports endpoint.
+      # This ensures new tournaments (tennis_atp_dubai, tennis_wta_rome, etc.)
+      # are automatically picked up without config changes.
     api_sports:
       provider: api-sports.io
       api_key_env: API_SPORTS_KEY     # Same key for all sport APIs

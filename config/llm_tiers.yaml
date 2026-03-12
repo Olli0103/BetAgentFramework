@@ -16,14 +16,16 @@ tiers:
         auth_env: OPENCLAW_OAUTH_TOKEN  # Fallback if ~/.codex/auth.json missing
         max_tokens: 8192
         temperature: 0.2
-        timeout_seconds: 60
+        connect_timeout_seconds: 5   # Fast-fail on DNS/network errors
+        timeout_seconds: 30          # Read timeout (was 60 — halved for faster fallback)
       - provider: openrouter
         model: openrouter/hunter-alpha   # Default; override via env
         model_env: OPENROUTER_MODEL        # e.g. meta-llama/llama-4-scout
         api_key_env: OPENROUTER_API_KEY
         max_tokens: 8192
         temperature: 0.2
-        timeout_seconds: 60
+        connect_timeout_seconds: 5
+        timeout_seconds: 45
       - provider: google
         model: gemini-2.0-flash
         api_key_env: GEMINI_API_KEY

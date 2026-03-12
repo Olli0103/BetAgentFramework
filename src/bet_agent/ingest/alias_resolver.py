@@ -160,6 +160,11 @@ class IroncladAliasResolver:
         self._cache: dict[str, str] = {}
         # canonical_key → canonical_name (preserves original casing)
         self._canonicals: dict[str, str] = {}
+        # Resolution tracking — confidence metrics
+        self._exact_hits: int = 0
+        self._fuzzy_hits: int = 0
+        self._auto_registered: int = 0
+        self._unresolved: list[str] = []  # names that fell through (auto_register=False)
         self._load_cache()
 
     def _load_cache(self) -> None:
@@ -194,10 +199,12 @@ class IroncladAliasResolver:
 
         # 1. Exact match in alias cache
         if key in self._cache:
+            self._exact_hits += 1
             return self._cache[key]
 
         # 2. Exact match against canonical names (canonical → itself)
         if key in self._canonicals:
+            self._exact_hits += 1
             return self._canonicals[key]
 
         # 3. Tennis abbreviated name heuristic
@@ -214,6 +221,7 @@ class IroncladAliasResolver:
         # 4. Fuzzy match against all known canonical names
         best_match, best_ratio = self._fuzzy_match(key)
         if best_match and best_ratio >= self._fuzzy_threshold:
+            self._fuzzy_hits += 1
             self._register_alias(best_match, raw_name.strip())
             logger.info(
                 "Fuzzy matched '%s' → '%s' (%.1f%%)",
@@ -223,6 +231,7 @@ class IroncladAliasResolver:
 
         # 5. Auto-register as new canonical name
         if self._auto_register:
+            self._auto_registered += 1
             canonical = normalized  # accent-stripped, case-preserved
             self._register_canonical(canonical, raw_name.strip())
             logger.info(
@@ -232,6 +241,11 @@ class IroncladAliasResolver:
             return canonical
 
         # Fallback (auto_register=False): return normalized form
+        self._unresolved.append(raw_name.strip())
+        logger.warning(
+            "UNRESOLVED alias (strict mode): '%s' [%s]",
+            raw_name, self._sport.value,
+        )
         return normalized
 
     def _fuzzy_match(self, key: str) -> tuple[str | None, float]:
@@ -312,10 +326,17 @@ class IroncladAliasResolver:
                 ))
 
     @property
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, int | str | list[str]]:
         """Return resolver statistics for logging/debugging."""
+        total = self._exact_hits + self._fuzzy_hits + self._auto_registered + len(self._unresolved)
         return {
             "sport": self._sport.value,
             "aliases_cached": len(self._cache),
             "canonical_names": len(self._canonicals),
+            "exact_hits": self._exact_hits,
+            "fuzzy_hits": self._fuzzy_hits,
+            "auto_registered": self._auto_registered,
+            "unresolved_count": len(self._unresolved),
+            "unresolved_names": self._unresolved[:20],  # cap for logging
+            "total_lookups": total,
         }

@@ -21,9 +21,85 @@ import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
 
-from bet_agent.db.models import LedgerType, Match, Prediction
+from bet_agent.db.models import LedgerType, Match, OddsMarket, Prediction
 
 logger = logging.getLogger(__name__)
+
+# Maximum age (minutes) for odds to be considered fresh
+_ODDS_FRESHNESS_MINUTES = 120
+
+# Minimum team name length to pass quality check
+_MIN_NAME_LEN = 4
+
+
+# ── Readiness gate ──────────────────────────────────────────────────
+
+
+@dataclass
+class ReadinessCheck:
+    """Result of a bettable readiness check."""
+
+    is_ready: bool
+    checks: dict[str, bool]  # check_name → passed
+    reason: str  # Human-readable reason if not ready
+
+    @property
+    def failed_checks(self) -> list[str]:
+        return [k for k, v in self.checks.items() if not v]
+
+
+def check_bet_readiness(
+    prediction: Prediction,
+    match: Match,
+    stake_eur: float,
+) -> ReadinessCheck:
+    """Final quality gate before a bet is recommended for REAL placement.
+
+    Checks:
+      1. odds_available — prediction has best_odds populated
+      2. odds_reasonable — best_odds > 1.0 and < 100.0
+      3. team_names_ok — home/away names are not abbreviations (>= 4 chars)
+      4. stake_positive — stake > 0
+      5. ev_positive — EV > 0
+
+    Returns a ReadinessCheck. If not ready, the bet should be routed to
+    PAPER ledger or flagged as DO_NOT_BET in the ticket.
+    """
+    checks: dict[str, bool] = {}
+
+    # 1. Odds available
+    checks["odds_available"] = prediction.best_odds is not None and float(prediction.best_odds) > 0
+
+    # 2. Odds reasonable
+    if prediction.best_odds is not None:
+        odds_val = float(prediction.best_odds)
+        checks["odds_reasonable"] = 1.0 < odds_val < 100.0
+    else:
+        checks["odds_reasonable"] = False
+
+    # 3. Team name quality
+    checks["team_names_ok"] = (
+        len(match.home_team.strip()) >= _MIN_NAME_LEN
+        and len(match.away_team.strip()) >= _MIN_NAME_LEN
+    )
+
+    # 4. Stake positive
+    checks["stake_positive"] = stake_eur > 0
+
+    # 5. EV positive
+    checks["ev_positive"] = float(prediction.ev) > 0
+
+    is_ready = all(checks.values())
+    failed = [k for k, v in checks.items() if not v]
+    reason = ""
+    if not is_ready:
+        reason = f"Failed: {', '.join(failed)}"
+        logger.warning(
+            "Readiness gate FAILED for %s: %s",
+            prediction.selection, reason,
+        )
+
+    return ReadinessCheck(is_ready=is_ready, checks=checks, reason=reason)
 
 
 # ── Data structures ──────────────────────────────────────────────────
@@ -64,7 +140,20 @@ def build_ticket(
     stake_eur: float,
     ledger_type: LedgerType,
 ) -> BetTicket:
-    """Build a BetTicket from prediction, match, and sizing data."""
+    """Build a BetTicket from prediction, match, and sizing data.
+
+    Runs the readiness gate — if the bet fails quality checks, it's
+    downgraded to PAPER ledger and the veto_status reflects the failure.
+    """
+    # ── Readiness gate ────────────────────────────────────────
+    readiness = check_bet_readiness(prediction, match, stake_eur)
+    if not readiness.is_ready and ledger_type == LedgerType.REAL:
+        logger.warning(
+            "Downgrading %s to PAPER — readiness gate failed: %s",
+            prediction.selection, readiness.reason,
+        )
+        ledger_type = LedgerType.PAPER
+
     best_odds = float(prediction.best_odds) if prediction.best_odds else 0.0
     best_book = prediction.best_sportsbook or "unknown"
 
@@ -76,6 +165,8 @@ def build_ticket(
     veto = "PASSED"
     if prediction.veto_reason:
         veto = prediction.veto_reason
+    if not readiness.is_ready:
+        veto = f"READINESS FAIL: {readiness.reason}"
 
     return BetTicket(
         prediction_id=prediction.id,
@@ -103,6 +194,10 @@ def format_ticket_message(ticket: BetTicket) -> str:
     emoji = _SPORT_EMOJI.get(ticket.sport, "\U0001f3c6")
     ledger_tag = f"[{ticket.ledger_type}]" if ticket.ledger_type == "PAPER" else ""
 
+    readiness_warn = ""
+    if "READINESS FAIL" in ticket.veto_status:
+        readiness_warn = "\n\u26a0\ufe0f DO NOT BET (REAL) \u2014 data quality issues detected"
+
     lines = [
         "\U0001f6a8 NEW +EV BET READY " + ledger_tag,
         f"{emoji} Match: {ticket.match_description}",
@@ -114,6 +209,8 @@ def format_ticket_message(ticket: BetTicket) -> str:
         f"\U0001f6e1\ufe0f Veto Check: {ticket.veto_status}",
         f"\U0001f4ca Source: {ticket.model_source}",
     ]
+    if readiness_warn:
+        lines.append(readiness_warn)
     return "\n".join(lines)
 
 

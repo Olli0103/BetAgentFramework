@@ -27,6 +27,10 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import streamlit as st
 
 try:
@@ -79,6 +83,7 @@ from bet_agent.db.models import (
     Prediction,
     PredictionStatus,
     Sport,
+    TeamAlias,
 )
 from bet_agent.db.session import get_session
 from bet_agent.ui.helpers import SPORT_EMOJI, get_match_display, resolve_display_name
@@ -632,7 +637,48 @@ with tab_mlops:
 
                 st.caption("Degradation threshold: Brier > 0.22 (red zone)")
         else:
-            st.info("No model metrics yet. Run the Auditor morning audit first.")
+            st.warning("No model metrics yet.")
+            st.markdown("**Prerequisites for model metrics:**")
+            # Show diagnostic checklist
+            try:
+                with get_session() as diag_sess:
+                    pred_count = diag_sess.execute(
+                        select(func.count(Prediction.id))
+                    ).scalar() or 0
+                    placed_count = diag_sess.execute(
+                        select(func.count(PlacedBet.id)).where(
+                            PlacedBet.status == BetStatus.PLACED
+                        )
+                    ).scalar() or 0
+                    settled_count = diag_sess.execute(
+                        select(func.count(PlacedBet.id)).where(
+                            PlacedBet.status.in_([BetStatus.WON, BetStatus.LOST, BetStatus.VOID])
+                        )
+                    ).scalar() or 0
+                    metrics_count = diag_sess.execute(
+                        select(func.count(ModelMetrics.id))
+                    ).scalar() or 0
+
+                dc1, dc2, dc3, dc4 = st.columns(4)
+                dc1.metric("Predictions", pred_count,
+                           delta="OK" if pred_count > 0 else "NEEDED",
+                           delta_color="normal" if pred_count > 0 else "inverse")
+                dc2.metric("Placed Bets", placed_count,
+                           delta="OK" if placed_count > 0 else "NEEDED",
+                           delta_color="normal" if placed_count > 0 else "inverse")
+                dc3.metric("Settled Bets", settled_count,
+                           delta="OK" if settled_count >= 10 else f"Need {max(0, 10 - settled_count)} more",
+                           delta_color="normal" if settled_count >= 10 else "inverse")
+                dc4.metric("Metric Records", metrics_count)
+
+                st.markdown(
+                    "**Pipeline:** Predictions \u2192 Place bets \u2192 Settle results \u2192 "
+                    "Auditor morning audit (05:00 UTC) \u2192 Metrics\n\n"
+                    "Metrics are calculated after the Auditor settles finished matches "
+                    "and evaluates Brier scores + ROI across at least 10 settled bets."
+                )
+            except Exception:
+                st.info("Run the Auditor morning audit to generate metrics.")
 
     except Exception as e:
         st.error(f"MLOps query failed: {e}")
@@ -727,10 +773,16 @@ with tab_agents:
                 "detail": f"{approved_with_odds} lines shopped",
             }
 
-            # Data Janitor: inferred from scout activity
+            # Data Janitor: alias resolution stats
+            alias_count = sess.execute(
+                select(func.count(TeamAlias.id))
+            ).scalar() or 0
+            canonical_count = sess.execute(
+                select(func.count(func.distinct(TeamAlias.canonical_name)))
+            ).scalar() or 0
             agent_activity["data_janitor"] = {
                 "status": "active" if recent_matches_with_odds > 0 else "idle",
-                "detail": "Processing crawl data" if recent_matches_with_odds > 0 else "Waiting for data",
+                "detail": f"{alias_count} aliases, {canonical_count} canonical names",
             }
 
             # Moonshot: check parlays (if any placed bets are parlays)
