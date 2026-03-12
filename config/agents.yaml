@@ -100,11 +100,46 @@ agents:
       - update_match_record
       - run_morning_crawl
       - hand_off_crawl_results
+      - fetch_injuries
+      - fetch_standings
+      - fetch_fixtures
     reports_to: master
     schedule:
       morning_crawl: "0 4 * * *"       # Daily at 04:00 UTC — Cloudflare stats
       pre_match_scan: "0 */2 * * *"    # Every 2 hours
       live_polling: see in_play_trigger
+    # ── External API providers ────────────────────────────────────────
+    odds_api:
+      provider: the-odds-api
+      base_url: "https://api.the-odds-api.com/v4"
+      api_key_env: THE_ODDS_API_KEY
+      # Regions for German-legal sportsbooks
+      regions: eu
+      markets:
+        - h2h              # 1X2 / Moneyline
+        - spreads           # Handicap / Spread
+        - totals            # Over/Under
+      odds_format: decimal
+      sports_mapping:
+        football: soccer_germany_bundesliga,soccer_germany_bundesliga2,soccer_epl,soccer_spain_la_liga,soccer_italy_serie_a,soccer_uefa_champs_league
+        american_football: americanfootball_nfl,americanfootball_nfl_super_bowl_winner
+        basketball: basketball_nba
+        ice_hockey: icehockey_nhl
+        tennis: tennis_atp_french_open,tennis_atp_us_open,tennis_atp_wimbledon
+    api_sports:
+      provider: api-sports.io
+      base_url: "https://v3.football.api-sports.io"
+      api_key_env: API_SPORTS_KEY
+      endpoints:
+        injuries: /injuries          # All sports
+        standings: /standings        # League tables
+        fixtures: /fixtures          # Upcoming matches
+        predictions: /predictions    # API-native predictions (for comparison)
+      sports_apis:                   # Each sport has its own subdomain
+        football: v3.football.api-sports.io
+        basketball: v1.basketball.api-sports.io
+        ice_hockey: v1.hockey.api-sports.io
+        american_football: v1.american-football.api-sports.io
     cloudflare_crawl:
       enabled: true
       max_crawls_per_day: 5
