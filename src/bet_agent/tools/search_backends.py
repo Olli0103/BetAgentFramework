@@ -1,9 +1,13 @@
 """Search backends for the Devil's Advocate veto engine.
 
 Provides pluggable news search implementations with cascading fallback:
-  Priority 1: TavilySearch  — best quality, 1000 req/month free tier
-  Priority 2: BraveSearch   — good quality, 2000 req/month free tier
-  Priority 3: DefaultNewsSearch — stub (regex-only veto path)
+  Priority 1: RedditRSS     — free, no API key, sport-subreddit search
+  Priority 2: TavilySearch   — best quality, 1000 req/month free tier
+  Priority 3: BraveSearch    — good quality, 2000 req/month free tier
+  Priority 4: DefaultNewsSearch — stub (regex-only veto path)
+
+Reddit RSS is always tried first since it's free and unlimited (~60 req/min).
+When Reddit returns no results, paid backends kick in.
 
 Budget management:
   Each paid backend tracks its own monthly usage via file-based counters.
@@ -83,6 +87,129 @@ def get_monthly_usage() -> int:
 def budget_remaining() -> int:
     """Return how many Tavily requests remain this month."""
     return _budget_remaining(_TAVILY_USAGE_FILE, _TAVILY_MONTHLY_BUDGET)
+
+
+# ── Reddit RSS backend (free, no API key) ────────────────────────────
+
+# Subreddits per sport — curated for injury news, analysis, and discussion
+_REDDIT_SPORT_SUBS: dict[str, list[str]] = {
+    "football": ["soccer", "Bundesliga", "PremierLeague", "LaLiga", "SerieA", "ChampionsLeague"],
+    "american_football": ["nfl", "fantasyfootball"],
+    "basketball": ["nba", "NBAdiscussion"],
+    "ice_hockey": ["hockey", "nhl"],
+    "tennis": ["tennis"],
+}
+
+# Flattened list of all sport subreddits for general queries
+_ALL_SPORT_SUBS = sorted({sub for subs in _REDDIT_SPORT_SUBS.values() for sub in subs})
+
+
+class RedditRSSSearch:
+    """Free news backend using Reddit's public JSON search.
+
+    No API key needed.  Searches sport subreddits via
+    ``https://www.reddit.com/r/{sub}/search.json`` with
+    ``restrict_sr=on`` and ``sort=new``.
+
+    Rate limit: ~60 req/min without auth (plenty for our use case).
+    """
+
+    def __init__(self, subreddits: list[str] | None = None) -> None:
+        self._subreddits = subreddits or _ALL_SPORT_SUBS
+
+    @property
+    def available(self) -> bool:
+        return True  # Always available — no API key needed
+
+    def search(self, query: str, max_results: int = 5) -> list[dict]:
+        """Search Reddit for recent posts matching the query."""
+        import requests as _requests
+
+        results: list[dict] = []
+        subs_to_search = self._pick_subreddits(query)
+
+        for sub in subs_to_search[:3]:  # Cap at 3 subs to stay fast
+            try:
+                resp = _requests.get(
+                    f"https://www.reddit.com/r/{sub}/search.json",
+                    params={
+                        "q": query,
+                        "restrict_sr": "on",
+                        "sort": "new",
+                        "t": "week",
+                        "limit": max_results,
+                    },
+                    headers={"User-Agent": "BetAgent/0.1 (sports research bot)"},
+                    timeout=8,
+                )
+                if resp.status_code == 429:
+                    logger.debug("Reddit rate-limited on r/%s — skipping", sub)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                logger.debug("Reddit search failed for r/%s: %s", sub, exc)
+                continue
+
+            for post in data.get("data", {}).get("children", []):
+                pd = post.get("data", {})
+                title = pd.get("title", "")
+                selftext = pd.get("selftext", "")
+                snippet = selftext[:300] if selftext else title
+                permalink = pd.get("permalink", "")
+                url = f"https://www.reddit.com{permalink}" if permalink else ""
+
+                results.append({
+                    "title": title,
+                    "snippet": snippet,
+                    "url": url,
+                    "source": f"reddit/r/{sub}",
+                })
+
+                if len(results) >= max_results:
+                    return results
+
+        return results
+
+    def _pick_subreddits(self, query: str) -> list[str]:
+        """Pick the most relevant subreddits based on query keywords."""
+        q_lower = query.lower()
+        picked: list[str] = []
+
+        for sport, subs in _REDDIT_SPORT_SUBS.items():
+            sport_keywords = sport.replace("_", " ").split()
+            if any(kw in q_lower for kw in sport_keywords):
+                picked.extend(subs)
+
+        # Sport-specific keyword matching
+        keyword_map = {
+            "nfl": ["nfl", "fantasyfootball"],
+            "nba": ["nba", "NBAdiscussion"],
+            "nhl": ["hockey", "nhl"],
+            "bundesliga": ["Bundesliga"],
+            "premier league": ["PremierLeague"],
+            "la liga": ["LaLiga"],
+            "champions league": ["ChampionsLeague"],
+            "serie a": ["SerieA"],
+        }
+        for keyword, subs in keyword_map.items():
+            if keyword in q_lower:
+                picked.extend(subs)
+
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        unique: list[str] = []
+        for s in picked:
+            if s not in seen:
+                seen.add(s)
+                unique.append(s)
+
+        return unique if unique else self._subreddits[:3]
+
+    @staticmethod
+    def subreddits_for_sport(sport: str) -> list[str]:
+        """Return subreddit list for a given sport key."""
+        return _REDDIT_SPORT_SUBS.get(sport, _ALL_SPORT_SUBS[:3])
 
 
 # ── Stub backend ─────────────────────────────────────────────────────
@@ -266,7 +393,7 @@ class CascadingSearch:
       - Current backend's monthly budget is exhausted
       - Current backend's API call fails
 
-    Priority: Tavily (best quality) → Brave (free fallback) → empty.
+    Priority: Reddit (free) → Tavily (best quality) → Brave → empty.
     """
 
     def __init__(self, backends: list) -> None:
@@ -286,12 +413,15 @@ class CascadingSearch:
 
 
 def create_search_backend() -> CascadingSearch:
-    """Create a cascading search backend: Tavily → Brave → empty stub.
+    """Create a cascading search backend: Reddit → Tavily → Brave → empty stub.
 
-    Automatically detects available API keys and builds the fallback
-    chain. Backends without API keys are skipped at search time.
+    Reddit RSS is always first (free, no API key). Paid backends follow
+    as fallback when Reddit returns no results.
     """
     backends: list = []
+
+    # Reddit RSS — always available, no API key needed
+    backends.append(RedditRSSSearch())
 
     tavily_key = os.environ.get("TAVILY_API_KEY", "")
     if tavily_key:
@@ -304,12 +434,7 @@ def create_search_backend() -> CascadingSearch:
     # Always include stub as final fallback
     backends.append(DefaultNewsSearch())
 
-    if len(backends) == 1:
-        logger.info(
-            "No search API keys configured — veto engine will use regex-only analysis"
-        )
-    else:
-        names = [type(b).__name__ for b in backends[:-1]]
-        logger.info("Search fallback chain: %s → regex-only", " → ".join(names))
+    names = [type(b).__name__ for b in backends[:-1]]
+    logger.info("Search fallback chain: %s → regex-only", " → ".join(names))
 
     return CascadingSearch(backends)

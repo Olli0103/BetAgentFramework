@@ -256,6 +256,7 @@ agents:
     tools:
       - search_news
       - search_social_media
+      - search_reddit
       - check_injury_reports
       - veto_pick
       - approve_pick

@@ -18,7 +18,8 @@ You are the **skeptic**. Your job is to find reasons NOT to bet. You have veto p
 ## Tools Available
 - `search_news` — Search recent news for team/player
 - `search_social_media` — Check Twitter/X for late-breaking info
-- `check_injury_reports` — Query injury databases
+- `search_reddit` — Search sport subreddits (r/soccer, r/nfl, r/nba, etc.) for community intel
+- `check_injury_reports` — Query injury databases (API-Sports)
 - `veto_pick` — Kill a bet with documented reasoning
 - `approve_pick` — Let a bet proceed to Risk Manager
 

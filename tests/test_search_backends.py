@@ -1,4 +1,4 @@
-"""Tests for search backends (Tavily, Brave, Cascading fallback)."""
+"""Tests for search backends (Reddit, Tavily, Brave, Cascading fallback)."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from bet_agent.tools.search_backends import (
     BraveSearch,
     CascadingSearch,
     DefaultNewsSearch,
+    RedditRSSSearch,
     TavilySearch,
     _budget_remaining,
     _get_monthly_usage,
@@ -169,6 +170,98 @@ def test_brave_budget_exhausted(tmp_path: Path):
         assert backend.search("test") == []
 
 
+# ── RedditRSSSearch ──────────────────────────────────────────────────
+
+
+def test_reddit_always_available():
+    backend = RedditRSSSearch()
+    assert backend.available is True
+
+
+def test_reddit_pick_subreddits_nfl():
+    backend = RedditRSSSearch()
+    subs = backend._pick_subreddits("NFL Chiefs injury report")
+    assert "nfl" in subs
+    assert "fantasyfootball" in subs
+
+
+def test_reddit_pick_subreddits_bundesliga():
+    backend = RedditRSSSearch()
+    subs = backend._pick_subreddits("Bundesliga Bayern München lineup")
+    assert "Bundesliga" in subs
+
+
+def test_reddit_pick_subreddits_nba():
+    backend = RedditRSSSearch()
+    subs = backend._pick_subreddits("NBA Lakers injury")
+    assert "nba" in subs
+
+
+def test_reddit_pick_subreddits_fallback():
+    """Generic query with no sport keywords falls back to default subs."""
+    backend = RedditRSSSearch()
+    subs = backend._pick_subreddits("some random query")
+    assert len(subs) > 0  # Should return some defaults
+
+
+def test_reddit_subreddits_for_sport():
+    assert "nfl" in RedditRSSSearch.subreddits_for_sport("american_football")
+    assert "soccer" in RedditRSSSearch.subreddits_for_sport("football")
+    assert "nba" in RedditRSSSearch.subreddits_for_sport("basketball")
+    assert "hockey" in RedditRSSSearch.subreddits_for_sport("ice_hockey")
+    assert "tennis" in RedditRSSSearch.subreddits_for_sport("tennis")
+
+
+def test_reddit_search_success():
+    """Mocked Reddit JSON response is parsed correctly."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "data": {
+            "children": [
+                {
+                    "data": {
+                        "title": "Mahomes questionable for Sunday",
+                        "selftext": "Per Schefter, Mahomes has ankle issues...",
+                        "permalink": "/r/nfl/comments/abc123/mahomes/",
+                    }
+                },
+            ]
+        }
+    }
+
+    with patch("requests.get", return_value=mock_resp):
+        backend = RedditRSSSearch(subreddits=["nfl"])
+        results = backend.search("Mahomes injury")
+
+    assert len(results) == 1
+    assert results[0]["title"] == "Mahomes questionable for Sunday"
+    assert "Schefter" in results[0]["snippet"]
+    assert results[0]["url"] == "https://www.reddit.com/r/nfl/comments/abc123/mahomes/"
+    assert results[0]["source"] == "reddit/r/nfl"
+
+
+def test_reddit_search_rate_limited():
+    """429 response is handled gracefully."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 429
+
+    with patch("requests.get", return_value=mock_resp):
+        backend = RedditRSSSearch(subreddits=["nfl"])
+        results = backend.search("test")
+
+    assert results == []
+
+
+def test_reddit_search_network_error():
+    """Network errors are handled gracefully."""
+    with patch("requests.get", side_effect=Exception("connection refused")):
+        backend = RedditRSSSearch(subreddits=["nfl"])
+        results = backend.search("test")
+
+    assert results == []
+
+
 # ── CascadingSearch ──────────────────────────────────────────────────
 
 
@@ -240,36 +333,41 @@ def test_cascading_stub_has_no_available_attr():
 
 
 def test_factory_no_keys():
+    """Reddit is always first, stub is always last."""
     with patch.dict("os.environ", {}, clear=True):
         backend = create_search_backend()
         assert isinstance(backend, CascadingSearch)
-        assert len(backend._backends) == 1  # only DefaultNewsSearch
-        assert isinstance(backend._backends[0], DefaultNewsSearch)
+        assert len(backend._backends) == 2  # Reddit + DefaultNewsSearch
+        assert isinstance(backend._backends[0], RedditRSSSearch)
+        assert isinstance(backend._backends[1], DefaultNewsSearch)
 
 
 def test_factory_tavily_only():
     with patch.dict("os.environ", {"TAVILY_API_KEY": "tk"}, clear=True):
         backend = create_search_backend()
         assert isinstance(backend, CascadingSearch)
-        assert len(backend._backends) == 2
-        assert isinstance(backend._backends[0], TavilySearch)
-        assert isinstance(backend._backends[1], DefaultNewsSearch)
+        assert len(backend._backends) == 3
+        assert isinstance(backend._backends[0], RedditRSSSearch)
+        assert isinstance(backend._backends[1], TavilySearch)
+        assert isinstance(backend._backends[2], DefaultNewsSearch)
 
 
 def test_factory_brave_only():
     with patch.dict("os.environ", {"BRAVE_SEARCH_API_KEY": "bk"}, clear=True):
         backend = create_search_backend()
         assert isinstance(backend, CascadingSearch)
-        assert len(backend._backends) == 2
-        assert isinstance(backend._backends[0], BraveSearch)
-        assert isinstance(backend._backends[1], DefaultNewsSearch)
+        assert len(backend._backends) == 3
+        assert isinstance(backend._backends[0], RedditRSSSearch)
+        assert isinstance(backend._backends[1], BraveSearch)
+        assert isinstance(backend._backends[2], DefaultNewsSearch)
 
 
 def test_factory_both_keys():
     with patch.dict("os.environ", {"TAVILY_API_KEY": "tk", "BRAVE_SEARCH_API_KEY": "bk"}, clear=True):
         backend = create_search_backend()
         assert isinstance(backend, CascadingSearch)
-        assert len(backend._backends) == 3
-        assert isinstance(backend._backends[0], TavilySearch)
-        assert isinstance(backend._backends[1], BraveSearch)
-        assert isinstance(backend._backends[2], DefaultNewsSearch)
+        assert len(backend._backends) == 4
+        assert isinstance(backend._backends[0], RedditRSSSearch)
+        assert isinstance(backend._backends[1], TavilySearch)
+        assert isinstance(backend._backends[2], BraveSearch)
+        assert isinstance(backend._backends[3], DefaultNewsSearch)
