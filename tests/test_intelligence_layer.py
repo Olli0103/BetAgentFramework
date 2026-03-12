@@ -415,6 +415,31 @@ class TestMLTrainer:
             assert "away" in result
             assert abs(result["home"] + result["draw"] + result["away"] - 1.0) < 0.01
 
+    def test_predict_match_winner_binary(self):
+        """Binary sport (Tennis) returns draw=0.0 and probs sum to 1.0."""
+        from bet_agent.ml.trainer import predict_match_winner, train_match_winner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            np.random.seed(42)
+
+            X = np.random.rand(50, 5)
+            y = np.random.randint(0, 2, 50)  # Binary: 0=Home, 1=Away
+
+            artifact = train_match_winner(
+                X, y,
+                feature_names=[f"f{i}" for i in range(5)],
+                sport=Sport.TENNIS,
+                model_dir=model_dir,
+            )
+
+            result = predict_match_winner(artifact.file_path, X[:1])
+            assert "home" in result
+            assert "draw" in result
+            assert "away" in result
+            assert result["draw"] == 0.0
+            assert abs(result["home"] + result["away"] - 1.0) < 0.01
+
     def test_predict_total(self):
         from bet_agent.ml.trainer import predict_total, train_over_under
 

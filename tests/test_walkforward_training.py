@@ -313,6 +313,48 @@ class TestWalkForwardValidation:
         train_sizes = [f["train_size"] for f in result["folds"]]
         assert train_sizes == sorted(train_sizes), "Training set should grow with each fold"
 
+    def test_walk_forward_binary_sport(self):
+        """Walk-Forward uses 2-class binary:logistic for non-draw sports."""
+        from bet_agent.ml.trainer import _walk_forward_validate
+
+        np.random.seed(42)
+        n = 100
+        X = np.random.randn(n, 5)
+        y_result = np.random.randint(0, 2, size=n)  # Binary: 0=Home, 1=Away
+        y_total = np.random.rand(n) * 5
+
+        result = _walk_forward_validate(
+            X, y_result, y_total,
+            feature_names=[f"f{i}" for i in range(5)],
+            sport=Sport.TENNIS,
+            n_splits=3,
+        )
+
+        assert result["n_classes"] == 2
+        assert result["n_splits"] == 3
+        assert len(result["folds"]) == 3
+        assert result["mean_brier"] >= 0
+        assert result["mean_accuracy"] >= 0
+
+    def test_walk_forward_three_way_sport(self):
+        """Walk-Forward uses 3-class multi:softprob for draw sports."""
+        from bet_agent.ml.trainer import _walk_forward_validate
+
+        np.random.seed(42)
+        n = 100
+        X = np.random.randn(n, 5)
+        y_result = np.random.randint(0, 3, size=n)  # 3-way: H/D/A
+        y_total = np.random.rand(n) * 5
+
+        result = _walk_forward_validate(
+            X, y_result, y_total,
+            feature_names=[f"f{i}" for i in range(5)],
+            sport=Sport.FOOTBALL,
+            n_splits=3,
+        )
+
+        assert result["n_classes"] == 3
+
 
 # ── Integration: build_training_dataset with dynamic features ───────
 

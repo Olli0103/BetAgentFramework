@@ -35,6 +35,16 @@ logger = logging.getLogger(__name__)
 # n_jobs=-1 would starve the entire system while XGBoost runs.
 _TRAINING_JOBS = max(1, (os.cpu_count() or 4) - 2)
 
+# Sports with meaningful draw outcomes use 3-way classification (H/D/A).
+# All others use 2-way (H/A) — draws are statistically negligible
+# (NBA/Tennis: impossible, NFL: ~0.3% of games, Darts: impossible).
+_THREE_WAY_SPORTS = frozenset({Sport.FOOTBALL, Sport.ICE_HOCKEY})
+
+
+def _num_classes(sport: Sport) -> int:
+    """Return 3 for sports with draws, 2 otherwise."""
+    return 3 if sport in _THREE_WAY_SPORTS else 2
+
 # Default model storage directory
 _MODEL_DIR = Path("models")
 
@@ -96,18 +106,22 @@ def train_match_winner(
         model_dir = _MODEL_DIR
     model_dir.mkdir(parents=True, exist_ok=True)
 
+    n_classes = _num_classes(sport)
+    is_binary = n_classes == 2
+
     params = {
         "n_estimators": 200,
         "max_depth": 6,
         "learning_rate": 0.05,
         "subsample": 0.8,
         "colsample_bytree": 0.8,
-        "objective": "multi:softprob",
-        "num_class": 3,
-        "eval_metric": "mlogloss",
+        "objective": "binary:logistic" if is_binary else "multi:softprob",
+        "eval_metric": "logloss" if is_binary else "mlogloss",
         "random_state": 42,
         "n_jobs": _TRAINING_JOBS,
     }
+    if not is_binary:
+        params["num_class"] = n_classes
     if hyperparams:
         params.update(hyperparams)
 
@@ -305,7 +319,7 @@ def predict_match_winner(
     model_path: str | Path,
     features: np.ndarray,
 ) -> dict[str, float]:
-    """Predict 1X2 probabilities for a single match.
+    """Predict match outcome probabilities.
 
     Args:
         model_path: Path to the trained classifier.
@@ -313,10 +327,21 @@ def predict_match_winner(
 
     Returns:
         {"home": p, "draw": p, "away": p}
+        For 2-class models, draw is always 0.0.
     """
     probs = predict(model_path, features)
     if probs.ndim == 1:
         probs = probs.reshape(1, -1)
+
+    n_classes = probs.shape[1]
+
+    if n_classes == 2:
+        # Binary model: column 0 = home win prob, column 1 = away win prob
+        return {
+            "home": float(probs[0, 0]),
+            "draw": 0.0,
+            "away": float(probs[0, 1]),
+        }
     return {
         "home": float(probs[0, 0]),
         "draw": float(probs[0, 1]),
@@ -386,12 +411,18 @@ def run_training_pipeline(
     y_result = np.zeros(len(dataset), dtype=int)
     y_total = np.zeros(len(dataset))
 
-    result_map = {"H": 0, "D": 1, "A": 2}
+    n_classes = _num_classes(sport)
+    if n_classes == 3:
+        result_map = {"H": 0, "D": 1, "A": 2}
+        default_label = 1  # draw
+    else:
+        result_map = {"H": 0, "A": 1}
+        default_label = 0  # home (arbitrary; draws are collapsed to home)
 
     for i, fv in enumerate(dataset):
         for j, fname in enumerate(feature_names):
             X[i, j] = fv.features.get(fname, 0.0)
-        y_result[i] = result_map.get(fv.target_result or "D", 1)
+        y_result[i] = result_map.get(fv.target_result or "", default_label)
         y_total[i] = float(fv.target_total_goals or 0)
 
     # ── Walk-Forward Validation ──────────────────────────────────────
@@ -458,6 +489,8 @@ def _walk_forward_validate(
     from xgboost import XGBClassifier, XGBRegressor
 
     tss = TimeSeriesSplit(n_splits=n_splits)
+    n_classes = _num_classes(sport)
+    is_binary = n_classes == 2
 
     fold_briers: list[float] = []
     fold_accuracies: list[float] = []
@@ -477,23 +510,26 @@ def _walk_forward_validate(
         "n_jobs": _TRAINING_JOBS,
     }
 
+    clf_params: dict = {
+        "objective": "binary:logistic" if is_binary else "multi:softprob",
+        "eval_metric": "logloss" if is_binary else "mlogloss",
+        **conservative_params,
+    }
+    if not is_binary:
+        clf_params["num_class"] = n_classes
+
     for fold_idx, (train_idx, val_idx) in enumerate(tss.split(X)):
         X_train, X_val = X[train_idx], X[val_idx]
         y_train_r, y_val_r = y_result[train_idx], y_result[val_idx]
         y_train_t, y_val_t = y_total[train_idx], y_total[val_idx]
 
-        # ── Classifier (1X2) ──
-        clf = XGBClassifier(
-            objective="multi:softprob",
-            num_class=3,
-            eval_metric="mlogloss",
-            **conservative_params,
-        )
+        # ── Classifier ──
+        clf = XGBClassifier(**clf_params)
         clf.fit(X_train, y_train_r)
 
-        # Multiclass Brier Score
-        probs = clf.predict_proba(X_val)  # (n_val, 3)
-        brier = _multiclass_brier_score(y_val_r, probs, n_classes=3)
+        # Brier Score
+        probs = clf.predict_proba(X_val)
+        brier = _multiclass_brier_score(y_val_r, probs, n_classes=n_classes)
 
         # Accuracy
         preds = clf.predict(X_val)
@@ -530,6 +566,7 @@ def _walk_forward_validate(
 
     return {
         "sport": sport.value,
+        "n_classes": n_classes,
         "n_splits": n_splits,
         "total_samples": len(X),
         "folds": fold_details,
