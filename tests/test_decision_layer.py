@@ -386,7 +386,7 @@ class TestSizingEngine:
         assert sized.reason is None
 
     def test_zero_bankroll_returns_no_stake(self, db_session):
-        """No bankroll → no stake."""
+        """Explicit zero bankroll → no stake."""
         from bet_agent.tools.sizing_engine import size_bet
 
         match = _add_match(db_session)
@@ -394,7 +394,8 @@ class TestSizingEngine:
         pred.best_odds = Decimal("2.10")
         db_session.flush()
 
-        # No bankroll added
+        # Explicitly seed bankroll at 0 (auto-seed would give a positive balance)
+        _add_bankroll(db_session, balance=Decimal("0.00"))
 
         sized = size_bet(db_session, pred)
         assert sized.stake_eur == 0.0
@@ -455,11 +456,12 @@ class TestSizingEngine:
         assert get_bankroll(db_session, LedgerType.REAL) == Decimal("500.00")
         assert get_bankroll(db_session, LedgerType.PAPER) == Decimal("10000.00")
 
-    def test_get_bankroll_missing_returns_zero(self, db_session):
-        """Missing ledger returns 0."""
+    def test_get_bankroll_missing_auto_seeds(self, db_session):
+        """Missing ledger auto-seeds with default balance."""
         from bet_agent.tools.sizing_engine import get_bankroll
 
-        assert get_bankroll(db_session, LedgerType.REAL) == Decimal("0.00")
+        balance = get_bankroll(db_session, LedgerType.REAL)
+        assert balance > Decimal("0.00")  # Auto-seeded, not silently zero
 
     def test_assign_ledger_proven_model(self, db_session):
         """Analytical models go to REAL ledger."""

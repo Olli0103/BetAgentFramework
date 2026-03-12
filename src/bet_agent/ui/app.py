@@ -287,14 +287,26 @@ with tab_cmd:
             n_settled = len(settled_bets)
             settled_pnl = sum(float(b.pnl_eur or 0) for b in settled_bets)
 
-            k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
+            # Count sizing outcomes for approved predictions
+            n_positive_ev = sum(
+                1 for p in predictions
+                if p.status == PredictionStatus.APPROVED and p.ev and p.ev > 0
+            )
+            n_has_odds = sum(
+                1 for p in predictions
+                if p.status == PredictionStatus.APPROVED and p.best_odds is not None
+            )
+
+            k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
             k1.metric("Matches", n_matches)
             k2.metric("Predictions", n_predictions)
             k3.metric("Pending", n_pending)
             k4.metric("Approved", n_approved, delta=f"{n_approved}" if n_approved else None)
-            k5.metric("Vetoed", n_vetoed)
-            k6.metric("Placed", n_placed)
-            k7.metric("Settled", n_settled, delta=f"{settled_pnl:+.2f} EUR" if settled_bets else None)
+            k5.metric("+EV / Odds", f"{n_positive_ev}/{n_has_odds}",
+                      help="Positive EV / Has shopped odds (of approved)")
+            k6.metric("Vetoed", n_vetoed)
+            k7.metric("Placed", n_placed)
+            k8.metric("Settled", n_settled, delta=f"{settled_pnl:+.2f} EUR" if settled_bets else None)
 
             st.divider()
 
@@ -388,11 +400,23 @@ with tab_cmd:
                             m = item["match"]
                             disp = get_match_display(sess, m)
                             ev_color = "green" if p.ev > 0 else "red"
+                            odds_str = f"@ {float(p.best_odds):.2f}" if p.best_odds else "no odds"
                             st.markdown(
                                 f"{disp['sport_emoji']} **{disp['home']}** vs **{disp['away']}**\n\n"
-                                f"`{p.selection}` | EV: :{ev_color}[{p.ev:.4f}]\n\n"
+                                f"`{p.selection}` {odds_str} | EV: :{ev_color}[{p.ev:.4f}]\n\n"
                                 f"Prob: {p.model_prob:.1%} | {p.model_source}"
                             )
+                            # Show sizing blockers for approved predictions
+                            if header == "APPROVED" and p.status == PredictionStatus.APPROVED:
+                                blockers = []
+                                if not p.best_odds:
+                                    blockers.append("No shopped odds")
+                                if p.ev and p.ev <= 0:
+                                    blockers.append(f"Negative EV ({p.ev:.4f})")
+                                if not p.model_prob or float(p.model_prob) <= 0:
+                                    blockers.append("Missing model_prob")
+                                if blockers:
+                                    st.caption(f"Sizing blockers: {' | '.join(blockers)}")
                         st.divider()
 
     except Exception as e:

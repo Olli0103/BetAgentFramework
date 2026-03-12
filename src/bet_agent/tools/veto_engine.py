@@ -346,7 +346,7 @@ def apply_veto_result(
 
     Updates status to APPROVED or VETOED and stores veto_reason.
     """
-    _MAX_VETO_REASON_LEN = 4096
+    _MAX_VETO_REASON_LEN = 32_768  # TEXT column, generous safety cap
     if result.decision == "VETO":
         prediction.status = PredictionStatus.VETOED
         reason = result.reason or ""

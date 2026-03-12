@@ -92,14 +92,39 @@ class RiskCheckResult:
 # ── Bankroll queries ─────────────────────────────────────────────────
 
 
+def _default_initial_balance(ledger_type: LedgerType) -> Decimal:
+    """Initial bankroll seeded when no ledger row exists.
+
+    Configurable via env: INITIAL_BANKROLL_REAL / INITIAL_BANKROLL_PAPER.
+    Defaults: REAL=50 EUR, PAPER=10000 EUR.
+    """
+    import os
+    if ledger_type == LedgerType.REAL:
+        return Decimal(os.environ.get("INITIAL_BANKROLL_REAL", "50.00"))
+    return Decimal(os.environ.get("INITIAL_BANKROLL_PAPER", "10000.00"))
+
+
 def get_bankroll(session: Session, ledger_type: LedgerType = LedgerType.REAL) -> Decimal:
-    """Fetch the current balance from the bankroll_ledger table."""
+    """Fetch the current balance from the bankroll_ledger table.
+
+    Auto-seeds the ledger with a default balance if no row exists,
+    preventing silent zero-bankroll → zero-stake failures.
+    """
     ledger = session.execute(
         select(BankrollLedger).where(BankrollLedger.ledger_type == ledger_type)
     ).scalar_one_or_none()
 
     if ledger is None:
-        return Decimal("0.00")
+        initial = _default_initial_balance(ledger_type)
+        logger.warning(
+            "No %s bankroll ledger found — auto-seeding with %.2f EUR. "
+            "Set INITIAL_BANKROLL_%s env var to override.",
+            ledger_type.value, initial, ledger_type.value.upper(),
+        )
+        ledger = BankrollLedger(ledger_type=ledger_type, balance=initial)
+        session.add(ledger)
+        session.flush()
+        return initial
     return ledger.balance
 
 
@@ -273,6 +298,22 @@ def size_bet(
         stake = MOONSHOT_HARD_CAP_EUR
 
     reason = kelly.reason
+
+    # Diagnostic logging for zero-stake decisions
+    if stake == 0.0:
+        logger.info(
+            "Sizing → $0 for prediction %s: reason=%s, prob=%.4f, odds=%.4f, "
+            "bankroll=%.2f, EV=%.4f, ledger=%s",
+            prediction.id, reason, model_prob, bet_odds,
+            float(bankroll), kelly.expected_profit, ledger_type.value,
+        )
+    else:
+        logger.info(
+            "Sizing → %.2f EUR for prediction %s: kelly_frac=%.6f, "
+            "prob=%.4f, odds=%.4f, bankroll=%.2f, ledger=%s",
+            stake, prediction.id, kelly.kelly_fraction,
+            model_prob, bet_odds, float(bankroll), ledger_type.value,
+        )
 
     return SizedBet(
         prediction_id=prediction.id,

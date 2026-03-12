@@ -1136,7 +1136,7 @@ async def _broadcast_placement(context, result, bet_id, user_name, user):
             logger.error("Group broadcast failed: %s", exc)
 
     for uid in ALLOWED_IDS:
-        if uid != user.id and uid != group_id:
+        if uid != user.id and uid != group_id and uid not in _DEAD_CHAT_IDS:
             try:
                 await context.bot.send_message(
                     chat_id=uid,
@@ -1203,7 +1203,7 @@ async def _send_to_all(context, text: str) -> None:
             logger.error("Digest broadcast failed: %s", exc)
 
     for uid in ALLOWED_IDS:
-        if uid != group_id:
+        if uid != group_id and uid not in _DEAD_CHAT_IDS:
             try:
                 await context.bot.send_message(chat_id=uid, text=text)
             except Exception as exc:
