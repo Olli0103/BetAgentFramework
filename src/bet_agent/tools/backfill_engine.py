@@ -274,29 +274,52 @@ def _backfill_scores_from_odds_api(
 def _match_fixture_to_db(
     match: Match, fixtures: list[dict], sport_val: str,
 ) -> dict | None:
-    """Match an API-Sports fixture to a DB match by team name comparison."""
-    from bet_agent.tools.results_fetcher import _normalize_name
+    """Match an API-Sports fixture to a DB match by team name comparison.
+
+    Uses a multi-pass strategy:
+      1. Exact normalized match
+      2. Tennis abbreviation matching (if sport is tennis)
+      3. Token overlap matching (min token length 3)
+    """
+    from bet_agent.tools.results_fetcher import (
+        _normalize_name,
+        _name_tokens,
+        _tennis_name_match,
+    )
 
     db_home = _normalize_name(match.home_team)
     db_away = _normalize_name(match.away_team)
+    is_tennis = sport_val == "tennis"
 
     for fix in fixtures:
         teams = fix.get("teams", {})
         home = teams.get("home", {})
         away = teams.get("away", {})
-        api_home = _normalize_name(home.get("name", ""))
-        api_away = _normalize_name(away.get("name", ""))
+        api_home_raw = home.get("name", "")
+        api_away_raw = away.get("name", "")
+        api_home = _normalize_name(api_home_raw)
+        api_away = _normalize_name(api_away_raw)
 
-        # Exact match
+        # Pass 1: Exact match
         if api_home == db_home and api_away == db_away:
             return fix
 
-        # Token overlap match
-        from bet_agent.tools.results_fetcher import _name_tokens
+        # Pass 2: Tennis abbreviation match
+        if is_tennis:
+            home_ok = api_home == db_home or _tennis_name_match(
+                match.home_team, api_home_raw,
+            )
+            away_ok = api_away == db_away or _tennis_name_match(
+                match.away_team, api_away_raw,
+            )
+            if home_ok and away_ok:
+                return fix
+
+        # Pass 3: Token overlap match
         db_home_t = _name_tokens(match.home_team)
         db_away_t = _name_tokens(match.away_team)
-        api_home_t = _name_tokens(home.get("name", ""))
-        api_away_t = _name_tokens(away.get("name", ""))
+        api_home_t = _name_tokens(api_home_raw)
+        api_away_t = _name_tokens(api_away_raw)
 
         if db_home_t & api_home_t and db_away_t & api_away_t:
             return fix

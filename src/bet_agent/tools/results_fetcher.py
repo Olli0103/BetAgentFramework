@@ -110,9 +110,77 @@ def _normalize_name(raw: str) -> str:
     return s
 
 
-def _name_tokens(name: str) -> set[str]:
-    """Extract significant tokens (len >= 4) from a normalized name."""
-    return {t for t in _normalize_name(name).split() if len(t) >= 4}
+def _name_tokens(name: str, min_len: int = 3) -> set[str]:
+    """Extract significant tokens from a normalized name.
+
+    Args:
+        name: Raw name string.
+        min_len: Minimum token length.  Default 3 (was 4) to catch
+                 short first names common in tennis (e.g. "Ana", "Ben").
+    """
+    return {t for t in _normalize_name(name).split() if len(t) >= min_len}
+
+
+# ── Tennis-specific name matching helpers ─────────────────────────────
+
+
+def _tennis_name_match(name_a: str, name_b: str) -> bool:
+    """Check if two tennis player names refer to the same person.
+
+    Handles abbreviated formats common in different data sources:
+      - "J. Sinner" ↔ "Jannik Sinner"
+      - "Sinner J." ↔ "Jannik Sinner"
+      - "Sinner, Jannik" ↔ "Jannik Sinner"
+
+    Tries both directions (either could be abbreviated).
+    """
+    from bet_agent.ingest.alias_resolver import (
+        is_abbreviated_tennis_name,
+        try_match_abbreviated,
+    )
+
+    a_stripped = name_a.strip()
+    b_stripped = name_b.strip()
+
+    # If either is abbreviated, try matching against the other
+    if is_abbreviated_tennis_name(a_stripped):
+        if try_match_abbreviated(a_stripped, b_stripped):
+            return True
+    if is_abbreviated_tennis_name(b_stripped):
+        if try_match_abbreviated(b_stripped, a_stripped):
+            return True
+
+    return False
+
+
+def _extract_last_name(name: str) -> str:
+    """Extract the last name from a player name for fallback matching.
+
+    Handles common formats:
+      - "Jannik Sinner" → "sinner"
+      - "J. Sinner" → "sinner"
+      - "Sinner J." → "sinner"  (last name is the long part)
+      - "Sinner, Jannik" → "sinner"
+
+    Returns lowercase normalized last name.
+    """
+    s = _normalize_name(name)
+    if not s:
+        return ""
+
+    # "Lastname, Firstname" → lastname
+    if "," in s:
+        return s.split(",")[0].strip()
+
+    parts = s.split()
+    if len(parts) < 2:
+        return s  # single name
+
+    # "Sinner J." pattern — last name is first, initial is short
+    # "J. Sinner" pattern — initial is first, last name is last
+    # Heuristic: the longest token is the last name
+    longest = max(parts, key=len)
+    return longest
 
 
 # ── Sport → Odds API sport keys mapping ──────────────────────────────
@@ -131,6 +199,7 @@ _SPORT_PREFIX: dict[str, str] = {
 
 # League hint → preferred API sport key (for faster matching)
 _LEAGUE_HINTS: dict[str, str] = {
+    # Football / Soccer
     "bundesliga": "soccer_germany_bundesliga",
     "2. bundesliga": "soccer_germany_bundesliga2",
     "premier league": "soccer_epl",
@@ -138,9 +207,32 @@ _LEAGUE_HINTS: dict[str, str] = {
     "la liga": "soccer_spain_la_liga",
     "serie a": "soccer_italy_serie_a",
     "champions league": "soccer_uefa_champs_league",
+    # Basketball
     "nba": "basketball_nba",
+    # American Football
     "nfl": "americanfootball_nfl",
+    # Ice Hockey
     "nhl": "icehockey_nhl",
+    # Tennis — ATP
+    "atp": "tennis_atp_aus_open",
+    "atp australian open": "tennis_atp_aus_open",
+    "atp french open": "tennis_atp_french_open",
+    "atp us open": "tennis_atp_us_open",
+    "atp wimbledon": "tennis_atp_wimbledon",
+    # Tennis — WTA
+    "wta": "tennis_wta_aus_open",
+    "wta australian open": "tennis_wta_aus_open",
+    "wta french open": "tennis_wta_french_open",
+    "wta us open": "tennis_wta_us_open",
+    "wta wimbledon": "tennis_wta_wimbledon",
+}
+
+# Additional league substrings → sport keys for partial matching.
+# Used when exact league name doesn't match any hint above.
+_LEAGUE_SUBSTRING_HINTS: dict[str, list[str]] = {
+    "atp": ["tennis_atp_"],
+    "wta": ["tennis_wta_"],
+    "itf": ["tennis_itf_"],
 }
 
 
@@ -235,28 +327,43 @@ class TheOddsAPIResultsBackend:
         """Get API sport keys to query, ordered by relevance.
 
         Priority:
-          1. League hint (most specific, avoids unnecessary API calls)
-          2. Explicit keys from agents.yaml
-          3. Dynamic discovery from /v4/sports
+          1. League hint — exact match (most specific)
+          2. League substring hints (e.g. "ATP Roland Garros" matches "atp")
+          3. Explicit keys from agents.yaml
+          4. Dynamic discovery from /v4/sports (filtered by prefix)
         """
         keys: list[str] = []
         seen: set[str] = set()
 
-        # 1. League hint — put the most likely key first
         if league:
             league_lower = league.strip().lower()
+
+            # 1. Exact league hint
             hint = _LEAGUE_HINTS.get(league_lower)
             if hint and hint not in seen:
                 keys.append(hint)
                 seen.add(hint)
 
-        # 2. Explicit keys from agents.yaml
+            # 2. Substring hint — e.g. league "ATP Indian Wells" contains "atp"
+            if not keys:
+                for substr, prefixes in _LEAGUE_SUBSTRING_HINTS.items():
+                    if substr in league_lower:
+                        # Need discovered keys filtered by prefix
+                        discovered = self._discover_sport_keys()
+                        for k in discovered.get(sport.value, []):
+                            for pfx in prefixes:
+                                if k.startswith(pfx) and k not in seen:
+                                    keys.append(k)
+                                    seen.add(k)
+                        break
+
+        # 3. Explicit keys from agents.yaml
         for k in self._configured_keys.get(sport.value, []):
             if k not in seen:
                 keys.append(k)
                 seen.add(k)
 
-        # 3. Dynamic discovery (only if we still have nothing)
+        # 4. Dynamic discovery (only if we still have nothing)
         if not keys:
             discovered = self._discover_sport_keys()
             for k in discovered.get(sport.value, []):
@@ -302,7 +409,10 @@ class TheOddsAPIResultsBackend:
 
         Pass 0: Direct event ID lookup (from previous binding)
         Pass 1: Exact normalized name match
-        Pass 2: Fuzzy token scoring
+        Pass 2: Tennis abbreviation matching (J. Sinner ↔ Jannik Sinner)
+        Pass 3: Fuzzy token scoring + substring containment
+        Pass 4: Tennis last-name-only matching (1v1 sport — last names
+                 are usually unique within a day's events)
         """
         # Pass 0: direct event ID from live_stats
         bound_id = (match.live_stats or {}).get("odds_event_id")
@@ -313,6 +423,7 @@ class TheOddsAPIResultsBackend:
 
         db_home = _normalize_name(match.home_team)
         db_away = _normalize_name(match.away_team)
+        is_tennis = match.sport == Sport.TENNIS
 
         # Pass 1: exact normalized match
         for ev in events:
@@ -321,7 +432,28 @@ class TheOddsAPIResultsBackend:
             if api_home == db_home and api_away == db_away:
                 return ev
 
-        # Pass 2: fuzzy token scoring
+        # Pass 2: tennis abbreviation matching
+        # Handles "J. Sinner" ↔ "Jannik Sinner", "Sinner J." ↔ "Jannik Sinner"
+        if is_tennis:
+            for ev in events:
+                api_home_raw = ev.get("home_team") or ""
+                api_away_raw = ev.get("away_team") or ""
+                home_ok = (
+                    _normalize_name(api_home_raw) == db_home
+                    or _tennis_name_match(match.home_team, api_home_raw)
+                )
+                away_ok = (
+                    _normalize_name(api_away_raw) == db_away
+                    or _tennis_name_match(match.away_team, api_away_raw)
+                )
+                if home_ok and away_ok:
+                    logger.debug(
+                        "Tennis abbreviation matched: DB(%s vs %s) → API(%s vs %s)",
+                        match.home_team, match.away_team, api_home_raw, api_away_raw,
+                    )
+                    return ev
+
+        # Pass 3: fuzzy token scoring
         db_home_tokens = _name_tokens(match.home_team)
         db_away_tokens = _name_tokens(match.away_team)
 
@@ -355,8 +487,29 @@ class TheOddsAPIResultsBackend:
                 best_score, match.home_team, match.away_team,
                 best_ev.get("home_team"), best_ev.get("away_team"),
             )
+            return best_ev
 
-        return best_ev
+        # Pass 4: tennis last-name-only match (1v1 — last names unique per day)
+        if is_tennis:
+            db_home_last = _extract_last_name(match.home_team)
+            db_away_last = _extract_last_name(match.away_team)
+            if db_home_last and db_away_last:
+                for ev in events:
+                    api_home_last = _extract_last_name(ev.get("home_team") or "")
+                    api_away_last = _extract_last_name(ev.get("away_team") or "")
+                    if (
+                        api_home_last and api_away_last
+                        and db_home_last == api_home_last
+                        and db_away_last == api_away_last
+                    ):
+                        logger.debug(
+                            "Tennis last-name matched: DB(%s vs %s) → API(%s vs %s)",
+                            match.home_team, match.away_team,
+                            ev.get("home_team"), ev.get("away_team"),
+                        )
+                        return ev
+
+        return None
 
     def _bind_event(self, match: Match, event: dict, sport_key: str) -> None:
         """Store event binding in Match.live_stats for future direct lookup."""
@@ -436,15 +589,17 @@ class TheOddsAPIResultsBackend:
 
 
 def _fuzzy_team_match(name_a: str, name_b: str) -> bool:
-    """Check if two team names likely refer to the same team.
+    """Check if two team/player names likely refer to the same entity.
 
-    Compares significant tokens (length >= 4) after Unicode normalization.
+    Compares significant tokens (length >= 3) after Unicode normalization.
+    Also checks tennis abbreviation patterns as a fallback.
     """
     tokens_a = _name_tokens(name_a)
     tokens_b = _name_tokens(name_b)
-    if not tokens_a or not tokens_b:
-        return False
-    return bool(tokens_a & tokens_b)
+    if tokens_a and tokens_b and (tokens_a & tokens_b):
+        return True
+    # Fallback: tennis abbreviation check
+    return _tennis_name_match(name_a, name_b)
 
 
 class APISportsResultsBackend:
