@@ -1348,14 +1348,18 @@ async def _conv_entry(update, context) -> int:
 async def _global_error_handler(update, context) -> None:
     """Handle uncaught exceptions in Telegram handlers.
 
-    Logs the error instead of crashing.  Transient network errors
-    (502 Bad Gateway, connection resets) are logged at WARNING level
-    to reduce noise.
+    Uses python-telegram-bot typed exceptions for reliable classification.
+    Transient network errors are logged at WARNING level to reduce noise.
     """
+    from telegram.error import NetworkError, RetryAfter, TimedOut
+
     err = context.error
-    err_str = str(err).lower()
-    transient = any(k in err_str for k in ("502", "bad gateway", "timed out", "connection"))
-    if transient:
+
+    if isinstance(err, RetryAfter):
+        logger.warning(
+            "Telegram rate-limited — retry after %ds", err.retry_after,
+        )
+    elif isinstance(err, (TimedOut, NetworkError)):
         logger.warning("Transient Telegram error (will retry): %s", err)
     else:
         logger.error("Unhandled Telegram error: %s", err, exc_info=err)
