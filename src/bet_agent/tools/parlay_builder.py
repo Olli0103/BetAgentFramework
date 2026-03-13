@@ -309,15 +309,23 @@ def validate_parlay_stake(
     return stake_eur, errors
 
 
+# Eligible statuses for moonshot candidate pool (aggressive: not just APPROVED)
+_ELIGIBLE_STATUSES = [
+    PredictionStatus.PENDING,
+    PredictionStatus.APPROVED,
+    PredictionStatus.PLACED,
+]
+
+
 def _fetch_todays_candidates(
     session: Session,
     sport_filter: str | None = None,
     target_date: date | None = None,
 ) -> list[Prediction]:
-    """Fetch today's approved predictions sorted by model confidence.
+    """Fetch today's eligible predictions sorted by model confidence.
 
     Selects predictions with:
-      - status = APPROVED
+      - status in (PENDING, APPROVED, PLACED)
       - model_prob >= MIN_LEG_PROB (30%)
       - best_odds populated (line-shopped)
       - match scheduled today (or target_date)
@@ -342,7 +350,7 @@ def _fetch_todays_candidates(
         select(Prediction)
         .join(Match, Match.id == Prediction.match_id)
         .where(
-            Prediction.status == PredictionStatus.APPROVED,
+            Prediction.status.in_(_ELIGIBLE_STATUSES),
             Prediction.model_prob >= MIN_LEG_PROB,
             Prediction.best_odds.is_not(None),
             Match.scheduled_at >= day_start,
@@ -489,7 +497,7 @@ def build_parlay(
             session.execute(
                 select(Prediction).where(
                     Prediction.id.in_(prediction_ids),
-                    Prediction.status == PredictionStatus.APPROVED,
+                    Prediction.status.in_(_ELIGIBLE_STATUSES),
                 )
             ).scalars().all()
         )
@@ -500,7 +508,7 @@ def build_parlay(
             reverse=True,
         )[:num_legs]
     else:
-        # Auto-select: highest confidence approved predictions
+        # Auto-select: highest confidence eligible predictions
         candidates = _fetch_todays_candidates(
             session, sport_filter=sport_filter, target_date=target_date,
         )
@@ -514,9 +522,16 @@ def build_parlay(
             if len(predictions) >= num_legs:
                 break
 
-    if len(predictions) < MIN_LEGS:
+    # Aggressive leg fallback: if not enough for requested legs,
+    # try smaller parlay sizes down to MIN_LEGS
+    if len(predictions) < num_legs and len(predictions) >= MIN_LEGS:
         logger.info(
-            "Not enough approved predictions for parlay: %d < %d minimum",
+            "Requested %d legs but only %d eligible — building %d-leg parlay",
+            num_legs, len(predictions), len(predictions),
+        )
+    elif len(predictions) < MIN_LEGS:
+        logger.info(
+            "Not enough eligible predictions for parlay: %d < %d minimum",
             len(predictions), MIN_LEGS,
         )
         return None

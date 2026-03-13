@@ -346,7 +346,7 @@ def apply_veto_result(
 
     Updates status to APPROVED or VETOED and stores veto_reason.
     """
-    _MAX_VETO_REASON_LEN = 32_768  # TEXT column, generous safety cap
+    _MAX_VETO_REASON_LEN = 500  # Safe for DB column; truncate to prevent errors
     if result.decision == "VETO":
         prediction.status = PredictionStatus.VETOED
         reason = result.reason or ""
@@ -366,14 +366,26 @@ def run_veto_checks(
     predictions: list[Prediction] | None = None,
     search_backend: NewsSearchBackend | None = None,
     risk_threshold: int = 2,
+    use_llm: bool | None = None,
 ) -> list[VetoResult]:
     """Run veto checks on a batch of PENDING predictions.
 
     If no predictions are provided, queries all PENDING predictions for today.
 
+    Args:
+        session: SQLAlchemy session.
+        predictions: Explicit list, or None to query today's PENDING.
+        search_backend: Pluggable news search.
+        risk_threshold: Number of risk factors to trigger VETO.
+        use_llm: Whether to run LLM layer. Defaults to VETO_USE_LLM env
+                 (default "1" = enabled). Set to False for rule-only mode.
+
     Returns:
         List of VetoResult objects (one per prediction).
     """
+    if use_llm is None:
+        use_llm = os.environ.get("VETO_USE_LLM", "1").strip().lower() in ("1", "true", "yes")
+
     if predictions is None:
         today = date.today()
         day_start = datetime.combine(today, time.min, tzinfo=timezone.utc)
@@ -393,15 +405,18 @@ def run_veto_checks(
 
     results: list[VetoResult] = []
     for pred in predictions:
-        result = veto_check(session, pred, search_backend, risk_threshold)
+        result = veto_check(
+            session, pred, search_backend, risk_threshold, use_llm=use_llm,
+        )
         apply_veto_result(session, pred, result)
         results.append(result)
 
     session.flush()
     logger.info(
-        "Veto check complete: %d approved, %d vetoed out of %d",
+        "Veto check complete: %d approved, %d vetoed out of %d (use_llm=%s)",
         sum(1 for r in results if r.decision == "APPROVE"),
         sum(1 for r in results if r.decision == "VETO"),
         len(results),
+        use_llm,
     )
     return results

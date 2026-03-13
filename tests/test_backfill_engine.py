@@ -272,9 +272,9 @@ def _mock_odds_api_response(events, sport_keys=None):
     def side_effect(url, **kwargs):
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
-        if "/v4/sports" in url and "/events" not in url:
+        if "/v4/sports" in url and "/odds" not in url and "/events" not in url:
             mock_resp.json.return_value = sport_keys
-        elif "/events" in url:
+        elif "/odds" in url or "/events" in url:
             mock_resp.json.return_value = events
         else:
             mock_resp.json.return_value = []
@@ -580,7 +580,7 @@ class TestBackfillDayWithSeeding:
         def mock_get(url, **kwargs):
             mock_resp = MagicMock()
             mock_resp.raise_for_status = MagicMock()
-            if "/v4/sports" in url and "/events" not in url:
+            if "/v4/sports" in url and "/odds" not in url and "/events" not in url:
                 mock_resp.json.return_value = sport_keys
             elif "basketball_nba" in url:
                 mock_resp.json.return_value = [

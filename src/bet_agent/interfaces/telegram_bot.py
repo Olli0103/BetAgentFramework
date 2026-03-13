@@ -428,22 +428,22 @@ class MasterAgentBridge:
                 ticket = build_best_parlay(sess, sport_filter=sport_filter, num_legs=num_legs)
 
             if ticket is None:
-                sport_hint = f" for {sport_filter}" if sport_filter else ""
+                sport_hint = f" für {sport_filter}" if sport_filter else ""
                 return (
                     f"[Moonshot Architect] Kann aktuell keine {num_legs}er Kombi"
-                    f"{sport_hint} bauen — nicht genug approved +EV Picks "
+                    f"{sport_hint} bauen — nicht genug eligible Picks "
                     f"für heute vorhanden.\n\n"
                     f"Voraussetzungen:\n"
-                    f"• Mindestens {num_legs} APPROVED Predictions mit positivem EV\n"
+                    f"• Mindestens 2 Predictions (PENDING/APPROVED/PLACED)\n"
+                    f"• best_odds muss vorhanden sein\n"
                     f"• Matches müssen heute scheduled sein\n\n"
                     f"Tipp: /status zeigt den aktuellen Pipeline-Stand."
                 )
 
             if not ticket.is_positive_ev:
                 return (
-                    f"[Moonshot Architect] {num_legs}er Kombi gebaut, aber "
-                    f"EV ist negativ ({ticket.combined_ev:+.4f}). "
-                    f"Kein +EV Parlay möglich mit den aktuellen Picks.\n\n"
+                    f"[Moonshot Architect] {ticket.num_legs}er Kombi gebaut "
+                    f"(EV {ticket.combined_ev:+.4f} — Lotto-Ticket, kein +EV nötig).\n\n"
                     f"{ticket.format_message()}"
                 )
 

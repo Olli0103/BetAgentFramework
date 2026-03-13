@@ -17,7 +17,7 @@ Golden Rule #2: STATEFUL MEMORY.  All predictions go to PostgreSQL.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Sequence
@@ -60,6 +60,29 @@ def _is_abbreviation(name: str) -> bool:
     if len(stripped) <= 4 and stripped.isupper():
         return True
     return False
+
+
+def _operational_window_bounds(
+    reference: date | None = None,
+) -> tuple[datetime, datetime]:
+    """Return the operational window [07:00 UTC, +24h).
+
+    The BetAgent pipeline operates on a shifted day that starts at 07:00 UTC
+    and ends at 06:59:59 UTC the following calendar day.  This aligns with
+    the European evening sports schedule so that late-night matches are
+    grouped with their logical "day".
+
+    Args:
+        reference: Calendar date whose window to return.  Defaults to today.
+
+    Returns:
+        (window_start, window_end) — both timezone-aware UTC datetimes.
+    """
+    if reference is None:
+        reference = date.today()
+    window_start = datetime.combine(reference, time(7, 0), tzinfo=timezone.utc)
+    window_end = window_start + timedelta(hours=24)
+    return window_start, window_end
 
 
 def validate_fixture(match: Match, odds_map: dict) -> tuple[bool, str]:
@@ -134,16 +157,15 @@ def run_daily_predictions(
     except Exception as exc:
         logger.warning("Quality gate check failed (non-blocking): %s", exc)
 
-    # Query today's NOT_STARTED matches
-    day_start = datetime.combine(prediction_date, time.min, tzinfo=timezone.utc)
-    day_end = datetime.combine(prediction_date, time.max, tzinfo=timezone.utc)
+    # Query NOT_STARTED matches in the operational window (07:00 UTC → +24h)
+    window_start, window_end = _operational_window_bounds(prediction_date)
 
     matches: Sequence[Match] = session.execute(
         select(Match)
         .where(
             Match.match_state == MatchState.NOT_STARTED,
-            Match.scheduled_at >= day_start,
-            Match.scheduled_at <= day_end,
+            Match.scheduled_at >= window_start,
+            Match.scheduled_at < window_end,
         )
         .order_by(Match.scheduled_at)
     ).scalars().all()
@@ -162,6 +184,8 @@ def run_daily_predictions(
     for match in matches:
         try:
             odds_map = bulk_odds.get(match.id, {})
+            # Coerce team-name selections to home/away/draw
+            odds_map = _coerce_match_winner_keys(match, odds_map)
 
             # ── Fixture validity gate ─────────────────────────────
             is_valid, reject_reason = validate_fixture(match, odds_map)
@@ -175,9 +199,12 @@ def run_daily_predictions(
 
             preds = _predict_match(session, match, prediction_date, model_dir, odds_map)
             for pred in preds:
-                if pred.ev >= Decimal(str(min_ev)):
-                    _upsert_prediction(session, pred)
-                    all_predictions.append(pred)
+                if pred.ev < Decimal(str(min_ev)):
+                    # Persist but immediately VETO — no silent drops
+                    pred.status = PredictionStatus.VETOED
+                    pred.veto_reason = f"EV {float(pred.ev):.4f} below min_ev {min_ev}"
+                _upsert_prediction(session, pred)
+                all_predictions.append(pred)
         except Exception as exc:
             logger.warning(
                 "Failed to predict %s vs %s: %s",
@@ -205,6 +232,7 @@ def _predict_match(
     # Use pre-loaded odds or fall back to per-match query
     if odds_map is None:
         odds_map = _get_match_odds(session, match)
+        odds_map = _coerce_match_winner_keys(match, odds_map)
 
     # Try ML prediction first
     ml_preds = _try_ml_prediction(session, match, prediction_date, odds_map, model_dir)
@@ -490,6 +518,45 @@ def _try_analytical_prediction(
 # ── Helpers ──────────────────────────────────────────────────────────
 
 
+def _coerce_match_winner_keys(match: Match, odds_map: dict) -> dict:
+    """Map team-name–based match_winner selections to home/away/draw.
+
+    Some sportsbooks store selections as the actual team name (e.g.
+    "Los Angeles Lakers") instead of the canonical "home"/"away".
+    This function detects those keys and remaps them so the rest of
+    the pipeline (validate_fixture, _try_*_prediction) sees the
+    expected home/away/draw keys.
+
+    Mutates and returns *odds_map* for convenience.
+    """
+    mw = odds_map.get("match_winner", {})
+    if not mw:
+        return odds_map
+
+    # Already has canonical keys — nothing to do
+    if "home" in mw or "away" in mw:
+        return odds_map
+
+    home_lower = match.home_team.lower().strip()
+    away_lower = match.away_team.lower().strip()
+
+    remapped: dict = {}
+    for sel, val in mw.items():
+        sel_lower = sel.lower().strip()
+        if sel_lower == home_lower or sel_lower.startswith(home_lower[:8]):
+            remapped["home"] = val
+        elif sel_lower == away_lower or sel_lower.startswith(away_lower[:8]):
+            remapped["away"] = val
+        elif sel_lower == "draw":
+            remapped["draw"] = val
+        else:
+            # Keep original key as well (so no data is lost)
+            remapped[sel] = val
+
+    odds_map["match_winner"] = remapped
+    return odds_map
+
+
 def _bulk_load_odds(
     session: Session,
     match_ids: list,
@@ -566,7 +633,8 @@ def _bulk_load_odds(
             odds = raw_odds
 
             if row.market_type == MarketType.MATCH_WINNER:
-                if sel in ("home", "draw", "away") and sel not in odds_map["match_winner"]:
+                # Keep all selections (team-name keys are coerced later)
+                if sel not in odds_map["match_winner"]:
                     odds_map["match_winner"][sel] = odds
 
             elif row.market_type == MarketType.OVER_UNDER:
@@ -615,7 +683,8 @@ def _get_match_odds(session: Session, match: Match) -> dict:
         odds = float(row.odds_decimal)
 
         if row.market_type == MarketType.MATCH_WINNER:
-            if sel in ("home", "draw", "away") and sel not in result["match_winner"]:
+            # Keep all selections (team-name keys are coerced later)
+            if sel not in result["match_winner"]:
                 result["match_winner"][sel] = odds
 
         elif row.market_type == MarketType.OVER_UNDER:
@@ -646,12 +715,28 @@ def _upsert_prediction(session: Session, pred: Prediction) -> None:
     ).scalar_one_or_none()
 
     if existing:
-        # Update probabilities but don't regress pipeline status
+        # Update probabilities and metadata
         existing.model_prob = pred.model_prob
         existing.implied_prob = pred.implied_prob
         existing.prob_edge = pred.prob_edge
         existing.ev = pred.ev
         existing.model_source = pred.model_source
+        # Update status only if the existing prediction hasn't progressed
+        # beyond the new status (don't regress APPROVED/PLACED back to PENDING)
+        _STATUS_RANK = {
+            PredictionStatus.VETOED: 0,
+            PredictionStatus.PENDING: 1,
+            PredictionStatus.APPROVED: 2,
+            PredictionStatus.PLACED: 3,
+        }
+        if _STATUS_RANK.get(pred.status, 0) >= _STATUS_RANK.get(existing.status, 0):
+            existing.status = pred.status
+        if pred.veto_reason is not None:
+            existing.veto_reason = pred.veto_reason
+        if pred.best_odds is not None:
+            existing.best_odds = pred.best_odds
+        if pred.best_sportsbook is not None:
+            existing.best_sportsbook = pred.best_sportsbook
     else:
         session.add(pred)
 
@@ -673,8 +758,7 @@ def get_positive_ev_predictions(
     if prediction_date is None:
         prediction_date = date.today()
 
-    day_start = datetime.combine(prediction_date, time.min, tzinfo=timezone.utc)
-    day_end = datetime.combine(prediction_date, time.max, tzinfo=timezone.utc)
+    window_start, window_end = _operational_window_bounds(prediction_date)
 
     query = (
         select(Prediction)
@@ -682,8 +766,8 @@ def get_positive_ev_predictions(
         .where(
             Prediction.status == status,
             Prediction.ev > Decimal(str(min_ev)),
-            Match.scheduled_at >= day_start,
-            Match.scheduled_at <= day_end,
+            Match.scheduled_at >= window_start,
+            Match.scheduled_at < window_end,
         )
         .order_by(Prediction.ev.desc())
     )
@@ -707,8 +791,7 @@ def get_todays_actionable_predictions(
     if prediction_date is None:
         prediction_date = date.today()
 
-    day_start = datetime.combine(prediction_date, time.min, tzinfo=timezone.utc)
-    day_end = datetime.combine(prediction_date, time.max, tzinfo=timezone.utc)
+    window_start, window_end = _operational_window_bounds(prediction_date)
 
     query = (
         select(Prediction)
@@ -716,8 +799,8 @@ def get_todays_actionable_predictions(
         .where(
             Prediction.status.in_([PredictionStatus.APPROVED, PredictionStatus.PLACED]),
             Prediction.ev > Decimal("0"),
-            Match.scheduled_at >= day_start,
-            Match.scheduled_at <= day_end,
+            Match.scheduled_at >= window_start,
+            Match.scheduled_at < window_end,
         )
         .order_by(Prediction.ev.desc())
     )

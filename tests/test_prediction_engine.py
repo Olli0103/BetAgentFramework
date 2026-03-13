@@ -302,7 +302,10 @@ class TestPredictionRunner:
 
         assert len(preds) > 0
         assert all(isinstance(p, Prediction) for p in preds)
-        assert all(p.status == PredictionStatus.PENDING for p in preds)
+        assert all(
+            p.status in (PredictionStatus.PENDING, PredictionStatus.VETOED)
+            for p in preds
+        )
 
     def test_idempotent_predictions(self, db_session):
         from bet_agent.tools.prediction_runner import run_daily_predictions
@@ -380,11 +383,13 @@ class TestPredictionRunner:
         match = _add_match(db_session)
         _add_odds(db_session, match)
 
-        # Very high min_ev should filter out most predictions
+        # Very high min_ev: predictions are persisted but immediately VETOED
         preds = run_daily_predictions(
             db_session, prediction_date=date.today(), min_ev=10.0,
         )
-        assert len(preds) == 0
+        # All predictions below min_ev are VETOED (not dropped)
+        assert all(p.status == PredictionStatus.VETOED for p in preds)
+        assert all("below min_ev" in (p.veto_reason or "") for p in preds)
 
 
 # ── Query Helpers ────────────────────────────────────────────────────

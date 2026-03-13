@@ -23,8 +23,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from bet_agent.db.models import (
+    MarketType,
     Match,
     MatchState,
+    OddsMarket,
     Sport,
     TeamDailyStats,
 )
@@ -162,6 +164,78 @@ def _odds_league_from_key(sport_key: str) -> str:
     return sport_key.replace("_", " ").title()
 
 
+def _seed_match_winner_odds_from_event(
+    session: Session,
+    match: Match,
+    event: dict,
+) -> int:
+    """Write OddsMarket rows (MATCH_WINNER / h2h) from an OddsAPI event.
+
+    Parses the ``bookmakers`` array in the event payload and creates
+    one OddsMarket row per (sportsbook, outcome) — so a 3-way match
+    with 2 bookmakers yields up to 6 rows.
+
+    Idempotent: skips if an OddsMarket already exists for the same
+    (match_id, sportsbook, market_type, selection).
+
+    Returns the number of new OddsMarket rows inserted.
+    """
+    from decimal import Decimal as D
+
+    bookmakers = event.get("bookmakers", [])
+    if not bookmakers:
+        return 0
+
+    inserted = 0
+    for bm in bookmakers:
+        sportsbook = bm.get("key", bm.get("title", "unknown"))
+        for market in bm.get("markets", []):
+            if market.get("key") != "h2h":
+                continue
+            for outcome in market.get("outcomes", []):
+                name = outcome.get("name", "")
+                price = outcome.get("price")
+                if not name or price is None or price <= 1.0:
+                    continue
+
+                # Map outcome name → canonical selection
+                name_lower = name.lower().strip()
+                home_lower = match.home_team.lower().strip()
+                away_lower = match.away_team.lower().strip()
+                if name_lower == home_lower or name_lower == "home":
+                    selection = "home"
+                elif name_lower == away_lower or name_lower == "away":
+                    selection = "away"
+                elif name_lower == "draw":
+                    selection = "draw"
+                else:
+                    selection = name_lower
+
+                # Idempotency: check if already exists
+                existing = session.execute(
+                    select(OddsMarket).where(
+                        OddsMarket.match_id == match.id,
+                        OddsMarket.sportsbook == sportsbook,
+                        OddsMarket.market_type == MarketType.MATCH_WINNER,
+                        OddsMarket.selection == selection,
+                    )
+                ).scalars().first()
+                if existing:
+                    continue
+
+                session.add(OddsMarket(
+                    match_id=match.id,
+                    sportsbook=sportsbook,
+                    market_type=MarketType.MATCH_WINNER,
+                    selection=selection,
+                    odds_decimal=D(str(round(price, 4))),
+                    is_live=False,
+                ))
+                inserted += 1
+
+    return inserted
+
+
 def _seed_matches_from_odds_api(
     session: Session,
     target_date: date,
@@ -227,8 +301,13 @@ def _seed_matches_from_odds_api(
     for sk in relevant_keys:
         try:
             resp = requests.get(
-                f"https://api.the-odds-api.com/v4/sports/{sk}/events",
-                params={"apiKey": api_key, "dateFormat": "iso"},
+                f"https://api.the-odds-api.com/v4/sports/{sk}/odds",
+                params={
+                    "apiKey": api_key,
+                    "dateFormat": "iso",
+                    "markets": "h2h",
+                    "oddsFormat": "decimal",
+                },
                 timeout=15,
             )
             resp.raise_for_status()
@@ -285,6 +364,9 @@ def _seed_matches_from_odds_api(
                 existing.live_stats = stats
                 if not existing.source:
                     existing.source = "the_odds_api"
+                # Seed h2h odds onto existing match too
+                session.flush()
+                _seed_match_winner_odds_from_event(session, existing, ev)
                 continue
 
             # Insert new Match row
@@ -304,6 +386,8 @@ def _seed_matches_from_odds_api(
                 },
             )
             session.add(match)
+            session.flush()  # Ensure match.id is populated for odds FK
+            _seed_match_winner_odds_from_event(session, match, ev)
             seeded += 1
 
     session.flush()
