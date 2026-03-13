@@ -52,19 +52,18 @@ def _determine_ledger_type(
     return LedgerType.REAL
 
 
-def _bet_already_exists(
+def _find_existing_bet(
     session: Session,
     prediction: Prediction,
-) -> bool:
-    """Check if a PlacedBet already exists for this prediction's unique key."""
-    exists = session.execute(
-        select(PlacedBet.id).where(
+) -> PlacedBet | None:
+    """Find an existing PlacedBet for this prediction's unique key."""
+    return session.execute(
+        select(PlacedBet).where(
             PlacedBet.match_id == prediction.match_id,
             PlacedBet.market_type == prediction.market_type,
             PlacedBet.selection == prediction.selection,
         ).limit(1)
     ).scalar_one_or_none()
-    return exists is not None
 
 
 def ensure_pending_bets_from_approved(
@@ -103,6 +102,7 @@ def ensure_pending_bets_from_approved(
     )
 
     created = 0
+    updated_existing = 0
     skipped_existing = 0
     skipped_no_odds = 0
 
@@ -112,17 +112,11 @@ def ensure_pending_bets_from_approved(
             skipped_no_odds += 1
             continue
 
-        # Idempotency: skip if bet already exists
-        if _bet_already_exists(session, pred):
-            skipped_existing += 1
-            continue
-
         match = pred.match if pred.match else session.get(Match, pred.match_id)
         if match is None:
             logger.warning("No match found for prediction %s", pred.id)
             continue
 
-        # Determine stake from sizing (use prediction EV to approximate)
         # Import here to avoid circular imports
         from bet_agent.tools.sizing_engine import size_bet
         sized = size_bet(session, pred)
@@ -134,6 +128,21 @@ def ensure_pending_bets_from_approved(
 
         # Route to REAL or PAPER via readiness gate
         ledger_type = _determine_ledger_type(pred, match, stake)
+
+        # Check for existing bet
+        existing = _find_existing_bet(session, pred)
+        if existing is not None:
+            # Sync ledger_type on PENDING bets (re-route if readiness changed)
+            if existing.status == BetStatus.PENDING and existing.ledger_type != ledger_type:
+                logger.info(
+                    "Re-routing existing bet %s: %s → %s",
+                    existing.selection, existing.ledger_type.value, ledger_type.value,
+                )
+                existing.ledger_type = ledger_type
+                updated_existing += 1
+            else:
+                skipped_existing += 1
+            continue
 
         bet = PlacedBet(
             ledger_type=ledger_type,
@@ -161,6 +170,7 @@ def ensure_pending_bets_from_approved(
     result = {
         "total": len(predictions),
         "created": created,
+        "updated_existing": updated_existing,
         "skipped_existing": skipped_existing,
         "skipped_no_odds": skipped_no_odds,
     }

@@ -140,6 +140,69 @@ class TestPipelineBridge:
         assert result["total"] == 0
         assert result["created"] == 0
 
+    def test_reroutes_existing_pending_on_ledger_change(self, db_session):
+        """Re-running bridge updates ledger_type on existing PENDING bets."""
+        from bet_agent.tools.pipeline_bridge import ensure_pending_bets_from_approved
+
+        _add_bankroll(db_session, ledger=LedgerType.REAL)
+        _add_bankroll(db_session, ledger=LedgerType.PAPER, balance=Decimal("10000.00"))
+        match = _add_match(db_session)
+
+        # First: create with normal edge → REAL
+        pred = _add_prediction(db_session, match)
+        r1 = ensure_pending_bets_from_approved(db_session)
+        assert r1["created"] == 1
+
+        bet = db_session.execute(select(PlacedBet)).scalar_one()
+        assert bet.ledger_type == LedgerType.REAL
+
+        # Now make edge implausible (simulate model update)
+        pred.model_prob = Decimal("0.40")
+        pred.implied_prob = Decimal("0.10")
+        pred.prob_edge = Decimal("0.30")
+        pred.ev = Decimal("3.00")
+        pred.best_odds = Decimal("10.00")
+        db_session.flush()
+
+        r2 = ensure_pending_bets_from_approved(db_session)
+        assert r2["updated_existing"] == 1
+        assert r2["created"] == 0
+
+        db_session.refresh(bet)
+        assert bet.ledger_type == LedgerType.PAPER
+
+    def test_no_reroute_on_placed_bet(self, db_session):
+        """Already PLACED bets are not re-routed (only PENDING can change)."""
+        from bet_agent.tools.pipeline_bridge import ensure_pending_bets_from_approved
+
+        _add_bankroll(db_session, ledger=LedgerType.REAL)
+        _add_bankroll(db_session, ledger=LedgerType.PAPER, balance=Decimal("10000.00"))
+        match = _add_match(db_session)
+
+        pred = _add_prediction(db_session, match)
+        r1 = ensure_pending_bets_from_approved(db_session)
+        assert r1["created"] == 1
+
+        # Simulate human confirmation
+        bet = db_session.execute(select(PlacedBet)).scalar_one()
+        bet.status = BetStatus.PLACED
+        db_session.flush()
+
+        # Make edge implausible
+        pred.model_prob = Decimal("0.40")
+        pred.implied_prob = Decimal("0.10")
+        pred.prob_edge = Decimal("0.30")
+        pred.ev = Decimal("3.00")
+        pred.best_odds = Decimal("10.00")
+        db_session.flush()
+
+        r2 = ensure_pending_bets_from_approved(db_session)
+        assert r2["skipped_existing"] == 1
+        assert r2["updated_existing"] == 0
+
+        db_session.refresh(bet)
+        assert bet.ledger_type == LedgerType.REAL  # unchanged
+
     def test_routes_implausible_edge_to_paper(self, db_session):
         """Extreme edge gets routed to PAPER via readiness gate."""
         from bet_agent.tools.pipeline_bridge import ensure_pending_bets_from_approved
