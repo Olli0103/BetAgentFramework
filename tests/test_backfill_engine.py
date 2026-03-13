@@ -10,12 +10,20 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from bet_agent.db.models import (
     Base,
+    BetStatus,
+    LedgerType,
+    MarketType,
     Match,
     MatchState,
+    OddsMarket,
+    PlacedBet,
+    Prediction,
+    PredictionStatus,
     Sport,
 )
 from bet_agent.tools.backfill_engine import (
     BackfillResult,
+    MergeResult,
     ReconcileResult,
     _odds_league_from_key,
     _odds_sport_from_key,
@@ -24,6 +32,7 @@ from bet_agent.tools.backfill_engine import (
     _update_provenance,
     backfill_day,
     backfill_open_gaps,
+    merge_duplicate_fixtures,
     reconcile_open_results,
 )
 
@@ -642,3 +651,354 @@ class TestBackfillDayWithSeeding:
 
         assert result2.matches_seeded == 0
         assert db_session.query(Match).count() == 17  # no duplicates
+
+
+# ── Near-Time Dedup Tests ───────────────────────────────────────────────
+
+
+class TestNearTimeDedup:
+    """Near-time dedup: ±15 min tolerance blocks kickoff-drift duplicates."""
+
+    def test_blocks_insert_within_tolerance(self, db_session):
+        """Existing match at 00:00 blocks insert at 00:10 for same teams."""
+        target = date(2026, 3, 14)
+        sched_00 = datetime(2026, 3, 14, 0, 0, tzinfo=timezone.utc)
+
+        existing = Match(
+            sport=Sport.ICE_HOCKEY,
+            league="Nhl",
+            home_team="New York Islanders",
+            away_team="Los Angeles Kings",
+            scheduled_at=sched_00,
+            match_state=MatchState.NOT_STARTED,
+            source="the_odds_api",
+            live_stats={"odds_event_id": "old_evt", "data_sources": ["the_odds_api"]},
+        )
+        db_session.add(existing)
+        db_session.commit()
+
+        # OddsAPI returns the same fixture with 00:10 kickoff (drift)
+        events = [
+            {
+                "id": "new_evt",
+                "home_team": "New York Islanders",
+                "away_team": "Los Angeles Kings",
+                "commence_time": datetime(2026, 3, 14, 0, 10, tzinfo=timezone.utc).isoformat(),
+            },
+        ]
+        sport_keys = [{"key": "icehockey_nhl"}]
+
+        result = BackfillResult(target_date=target.isoformat())
+        with patch("bet_agent.tools.backfill_engine.requests.get",
+                   side_effect=_mock_odds_api_response(events, sport_keys)):
+            with patch.dict("os.environ", {"THE_ODDS_API_KEY": "test_key"}):
+                _seed_matches_from_odds_api(db_session, target, None, result)
+                db_session.commit()
+
+        # No new match created
+        assert result.matches_seeded == 0
+        assert db_session.query(Match).count() == 1
+
+        # Provenance refreshed with new event ID
+        match = db_session.query(Match).one()
+        assert match.live_stats["odds_event_id"] == "new_evt"
+
+    def test_allows_insert_outside_tolerance(self, db_session):
+        """Different scheduled_at beyond 15 min → treated as separate fixture."""
+        target = date(2026, 3, 14)
+        sched_00 = datetime(2026, 3, 14, 0, 0, tzinfo=timezone.utc)
+
+        existing = Match(
+            sport=Sport.ICE_HOCKEY,
+            league="Nhl",
+            home_team="St Louis Blues",
+            away_team="Edmonton Oilers",
+            scheduled_at=sched_00,
+            match_state=MatchState.NOT_STARTED,
+            source="the_odds_api",
+        )
+        db_session.add(existing)
+        db_session.commit()
+
+        # Same teams but 2 hours later — genuinely different fixture
+        events = [
+            {
+                "id": "evt_later",
+                "home_team": "St Louis Blues",
+                "away_team": "Edmonton Oilers",
+                "commence_time": datetime(2026, 3, 14, 2, 0, tzinfo=timezone.utc).isoformat(),
+            },
+        ]
+        sport_keys = [{"key": "icehockey_nhl"}]
+
+        result = BackfillResult(target_date=target.isoformat())
+        with patch("bet_agent.tools.backfill_engine.requests.get",
+                   side_effect=_mock_odds_api_response(events, sport_keys)):
+            with patch.dict("os.environ", {"THE_ODDS_API_KEY": "test_key"}):
+                _seed_matches_from_odds_api(db_session, target, None, result)
+                db_session.commit()
+
+        assert result.matches_seeded == 1
+        assert db_session.query(Match).count() == 2
+
+    def test_updates_provenance_on_near_duplicate(self, db_session):
+        """Existing match without source gets source set on near-dedup hit."""
+        target = date(2026, 3, 14)
+        sched = datetime(2026, 3, 14, 1, 0, tzinfo=timezone.utc)
+
+        existing = Match(
+            sport=Sport.ICE_HOCKEY,
+            league="Nhl",
+            home_team="St Louis Blues",
+            away_team="Edmonton Oilers",
+            scheduled_at=sched,
+            match_state=MatchState.NOT_STARTED,
+            source=None,
+            live_stats={},
+        )
+        db_session.add(existing)
+        db_session.commit()
+
+        events = [
+            {
+                "id": "evt_prov",
+                "home_team": "St Louis Blues",
+                "away_team": "Edmonton Oilers",
+                "commence_time": datetime(2026, 3, 14, 1, 5, tzinfo=timezone.utc).isoformat(),
+            },
+        ]
+        sport_keys = [{"key": "icehockey_nhl"}]
+
+        result = BackfillResult(target_date=target.isoformat())
+        with patch("bet_agent.tools.backfill_engine.requests.get",
+                   side_effect=_mock_odds_api_response(events, sport_keys)):
+            with patch.dict("os.environ", {"THE_ODDS_API_KEY": "test_key"}):
+                _seed_matches_from_odds_api(db_session, target, None, result)
+                db_session.commit()
+
+        match = db_session.query(Match).one()
+        assert match.source == "the_odds_api"
+        assert match.live_stats["odds_event_id"] == "evt_prov"
+        assert "the_odds_api" in match.live_stats["data_sources"]
+
+
+# ── FK-Safe Merge Tests ─────────────────────────────────────────────────
+
+
+class TestMergeDuplicateFixtures:
+    """merge_duplicate_fixtures() finds clusters, repoints FKs, merges provenance."""
+
+    def _make_duplicate_pair(self, db_session):
+        """Create a pair of near-duplicate matches (10 min apart)."""
+        sched1 = datetime(2026, 3, 14, 0, 0, tzinfo=timezone.utc)
+        sched2 = datetime(2026, 3, 14, 0, 10, tzinfo=timezone.utc)
+
+        keeper = Match(
+            sport=Sport.ICE_HOCKEY,
+            league="Nhl",
+            home_team="New York Islanders",
+            away_team="Los Angeles Kings",
+            scheduled_at=sched1,
+            match_state=MatchState.NOT_STARTED,
+            source="the_odds_api",
+            live_stats={
+                "odds_event_id": "evt1",
+                "data_sources": ["the_odds_api"],
+            },
+        )
+        duplicate = Match(
+            sport=Sport.ICE_HOCKEY,
+            league="Nhl",
+            home_team="New York Islanders",
+            away_team="Los Angeles Kings",
+            scheduled_at=sched2,
+            match_state=MatchState.NOT_STARTED,
+            source="api_sports",
+            live_stats={
+                "api_sports_fixture_id": 12345,
+                "data_sources": ["api_sports"],
+            },
+        )
+        db_session.add_all([keeper, duplicate])
+        db_session.flush()
+        return keeper, duplicate
+
+    def test_merges_near_duplicates(self, db_session):
+        """Basic merge: finds and removes duplicate, keeps keeper."""
+        keeper, dup = self._make_duplicate_pair(db_session)
+
+        result = merge_duplicate_fixtures(db_session)
+        db_session.flush()
+
+        assert result.duplicates_found == 1
+        assert result.duplicates_merged == 1
+        assert db_session.query(Match).count() == 1
+
+        remaining = db_session.query(Match).one()
+        assert remaining.id == keeper.id
+
+    def test_merges_provenance(self, db_session):
+        """Merged match has data_sources from both keeper and duplicate."""
+        keeper, dup = self._make_duplicate_pair(db_session)
+
+        merge_duplicate_fixtures(db_session)
+        db_session.flush()
+
+        remaining = db_session.query(Match).one()
+        sources = remaining.live_stats["data_sources"]
+        assert "the_odds_api" in sources
+        assert "api_sports" in sources
+        assert remaining.live_stats.get("api_sports_fixture_id") == 12345
+        assert remaining.live_stats.get("odds_event_id") == "evt1"
+
+    def test_repoints_odds_market_fks(self, db_session):
+        """OddsMarket rows on duplicate get repointed to keeper."""
+        from decimal import Decimal
+
+        keeper, dup = self._make_duplicate_pair(db_session)
+
+        odds = OddsMarket(
+            match_id=dup.id,
+            sportsbook="bet365",
+            market_type=MarketType.MATCH_WINNER,
+            selection="New York Islanders",
+            odds_decimal=Decimal("2.10"),
+        )
+        db_session.add(odds)
+        db_session.flush()
+
+        result = merge_duplicate_fixtures(db_session)
+        db_session.flush()
+
+        assert result.fks_repointed == 1
+        assert result.duplicates_merged == 1
+
+        # OddsMarket now points to keeper
+        refreshed = db_session.query(OddsMarket).one()
+        assert refreshed.match_id == keeper.id
+
+    def test_repoints_prediction_fks(self, db_session):
+        """Prediction rows on duplicate get repointed to keeper."""
+        from decimal import Decimal
+
+        keeper, dup = self._make_duplicate_pair(db_session)
+
+        pred = Prediction(
+            match_id=dup.id,
+            model_name="test_model",
+            market_type=MarketType.MATCH_WINNER,
+            selection="New York Islanders",
+            model_prob=Decimal("0.55"),
+            implied_prob=Decimal("0.47"),
+            prob_edge=Decimal("0.08"),
+            ev=Decimal("0.15"),
+            status=PredictionStatus.PENDING,
+        )
+        db_session.add(pred)
+        db_session.flush()
+
+        result = merge_duplicate_fixtures(db_session)
+        db_session.flush()
+
+        assert result.fks_repointed == 1
+        refreshed = db_session.query(Prediction).one()
+        assert refreshed.match_id == keeper.id
+
+    def test_repoints_placed_bet_fks(self, db_session):
+        """PlacedBet rows on duplicate get repointed to keeper."""
+        from decimal import Decimal
+
+        keeper, dup = self._make_duplicate_pair(db_session)
+
+        bet = PlacedBet(
+            match_id=dup.id,
+            ledger_type=LedgerType.PAPER,
+            market_type=MarketType.MATCH_WINNER,
+            selection="New York Islanders",
+            odds_at_placement=Decimal("2.10"),
+            stake_eur=Decimal("10.00"),
+            model_prob=Decimal("0.55"),
+            ev_at_placement=Decimal("0.15"),
+            status=BetStatus.PENDING,
+        )
+        db_session.add(bet)
+        db_session.flush()
+
+        result = merge_duplicate_fixtures(db_session)
+        db_session.flush()
+
+        assert result.fks_repointed == 1
+        refreshed = db_session.query(PlacedBet).one()
+        assert refreshed.match_id == keeper.id
+
+    def test_preserves_scores_from_duplicate(self, db_session):
+        """If duplicate has scores but keeper doesn't, scores transfer."""
+        sched1 = datetime(2026, 3, 14, 0, 0, tzinfo=timezone.utc)
+        sched2 = datetime(2026, 3, 14, 0, 10, tzinfo=timezone.utc)
+
+        keeper = Match(
+            sport=Sport.ICE_HOCKEY,
+            league="Nhl",
+            home_team="New York Islanders",
+            away_team="Los Angeles Kings",
+            scheduled_at=sched1,
+            match_state=MatchState.NOT_STARTED,
+            home_score=None,
+            away_score=None,
+            live_stats={"data_sources": ["the_odds_api"]},
+        )
+        duplicate = Match(
+            sport=Sport.ICE_HOCKEY,
+            league="Nhl",
+            home_team="New York Islanders",
+            away_team="Los Angeles Kings",
+            scheduled_at=sched2,
+            match_state=MatchState.FINISHED,
+            home_score=3,
+            away_score=1,
+            live_stats={"data_sources": ["api_sports"]},
+        )
+        db_session.add_all([keeper, duplicate])
+        db_session.flush()
+
+        merge_duplicate_fixtures(db_session)
+        db_session.flush()
+
+        remaining = db_session.query(Match).one()
+        assert remaining.home_score == 3
+        assert remaining.away_score == 1
+        assert remaining.match_state == MatchState.FINISHED
+
+    def test_no_merge_beyond_tolerance(self, db_session):
+        """Matches more than tolerance apart are not merged."""
+        sched1 = datetime(2026, 3, 14, 0, 0, tzinfo=timezone.utc)
+        sched2 = datetime(2026, 3, 14, 2, 0, tzinfo=timezone.utc)  # 2h apart
+
+        m1 = Match(
+            sport=Sport.ICE_HOCKEY, league="Nhl",
+            home_team="Team A", away_team="Team B",
+            scheduled_at=sched1, match_state=MatchState.NOT_STARTED,
+            live_stats={},
+        )
+        m2 = Match(
+            sport=Sport.ICE_HOCKEY, league="Nhl",
+            home_team="Team A", away_team="Team B",
+            scheduled_at=sched2, match_state=MatchState.NOT_STARTED,
+            live_stats={},
+        )
+        db_session.add_all([m1, m2])
+        db_session.flush()
+
+        result = merge_duplicate_fixtures(db_session)
+        db_session.flush()
+
+        assert result.duplicates_found == 0
+        assert db_session.query(Match).count() == 2
+
+    def test_merge_result_to_dict(self):
+        """MergeResult.to_dict() returns expected structure."""
+        r = MergeResult(duplicates_found=3, duplicates_merged=2, fks_repointed=5)
+        d = r.to_dict()
+        assert d["duplicates_found"] == 3
+        assert d["duplicates_merged"] == 2
+        assert d["fks_repointed"] == 5

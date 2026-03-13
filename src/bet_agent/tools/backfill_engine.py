@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 # ── Constants ────────────────────────────────────────────────────────────
 
 _ODDS_SEED_MAX_KEYS_DEFAULT = 80
+_NEAR_DEDUP_TOLERANCE = timedelta(minutes=15)
 
 # TheOddsAPI sport key prefix → internal Sport enum
 _ODDS_PREFIX_TO_SPORT: dict[str, Sport] = {
@@ -258,28 +259,32 @@ def _seed_matches_from_odds_api(
             if not (day_start <= scheduled_at < day_end):
                 continue
 
-            # Check for existing match (idempotent)
+            # Near-time dedup: match on (sport, league, home, away)
+            # within ±15 minutes to catch kickoff-drift duplicates
+            # (e.g. 00:00 vs 00:10 for the same event).
             existing = session.execute(
                 select(Match).where(
                     Match.sport == sport,
                     Match.league == league,
                     Match.home_team == home,
                     Match.away_team == away,
-                    Match.scheduled_at == scheduled_at,
+                    Match.scheduled_at >= scheduled_at - _NEAR_DEDUP_TOLERANCE,
+                    Match.scheduled_at <= scheduled_at + _NEAR_DEDUP_TOLERANCE,
                 )
-            ).scalar_one_or_none()
+            ).scalars().first()
 
             if existing:
-                # Bind OddsAPI event ID for future direct lookups
+                # Update provenance on existing near-duplicate
                 stats = dict(existing.live_stats) if existing.live_stats else {}
-                if "odds_event_id" not in stats:
-                    stats["odds_event_id"] = ev.get("id", "")
-                    stats["odds_sport_key"] = sk
-                    sources = stats.get("data_sources", [])
-                    if "the_odds_api" not in sources:
-                        sources.append("the_odds_api")
-                    stats["data_sources"] = sources
-                    existing.live_stats = stats
+                stats["odds_event_id"] = ev.get("id", "")
+                stats["odds_sport_key"] = sk
+                sources = stats.get("data_sources", [])
+                if "the_odds_api" not in sources:
+                    sources.append("the_odds_api")
+                stats["data_sources"] = sources
+                existing.live_stats = stats
+                if not existing.source:
+                    existing.source = "the_odds_api"
                 continue
 
             # Insert new Match row
@@ -730,3 +735,213 @@ def reconcile_open_results(session: Session) -> ReconcileResult:
     )
 
     return result
+
+
+# ── Duplicate fixture cleanup ────────────────────────────────────────────
+
+
+@dataclass
+class MergeResult:
+    """Summary of a duplicate merge run."""
+    duplicates_found: int = 0
+    duplicates_merged: int = 0
+    fks_repointed: int = 0
+    errors: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "duplicates_found": self.duplicates_found,
+            "duplicates_merged": self.duplicates_merged,
+            "fks_repointed": self.fks_repointed,
+            "errors": self.errors[:20],
+        }
+
+
+def merge_duplicate_fixtures(
+    session: Session,
+    tolerance: timedelta | None = None,
+) -> MergeResult:
+    """Find and merge near-duplicate Match rows caused by kickoff drift.
+
+    Duplicates are defined as rows sharing (sport, league, home_team,
+    away_team) with scheduled_at within ±tolerance (default 15 min).
+
+    For each duplicate group:
+      1. Keep the earliest row (by scheduled_at, ties broken by created_at)
+      2. Repoint FKs (odds_markets, predictions, placed_bets) from
+         duplicate → keeper
+      3. Merge provenance (live_stats.data_sources, event IDs)
+      4. Delete the duplicate row
+
+    All changes are flushed but NOT committed — caller manages transaction.
+
+    Args:
+        session: SQLAlchemy session.
+        tolerance: Max time difference to consider as duplicate.
+                   Defaults to _NEAR_DEDUP_TOLERANCE (15 min).
+
+    Returns:
+        MergeResult summary.
+    """
+    from bet_agent.db.models import OddsMarket, PlacedBet, Prediction
+
+    if tolerance is None:
+        tolerance = _NEAR_DEDUP_TOLERANCE
+
+    result = MergeResult()
+
+    # Load all matches ordered by identity key + time
+    all_matches = list(
+        session.execute(
+            select(Match).order_by(
+                Match.sport, Match.league,
+                Match.home_team, Match.away_team,
+                Match.scheduled_at,
+            )
+        ).scalars().all()
+    )
+
+    # Group by identity key (sport, league, home_team, away_team)
+    groups: dict[tuple, list[Match]] = {}
+    for m in all_matches:
+        key = (m.sport, m.league, m.home_team, m.away_team)
+        groups.setdefault(key, []).append(m)
+
+    for key, matches in groups.items():
+        if len(matches) < 2:
+            continue
+
+        # Find near-duplicate clusters within this group
+        # matches are sorted by scheduled_at
+        i = 0
+        while i < len(matches):
+            cluster = [matches[i]]
+            j = i + 1
+            while j < len(matches):
+                time_diff = abs(
+                    (matches[j].scheduled_at - cluster[0].scheduled_at).total_seconds()
+                )
+                if time_diff <= tolerance.total_seconds():
+                    cluster.append(matches[j])
+                    j += 1
+                else:
+                    break
+            i = j
+
+            if len(cluster) < 2:
+                continue
+
+            result.duplicates_found += len(cluster) - 1
+
+            # Keep the earliest match (by scheduled_at, then created_at)
+            keeper = cluster[0]
+            duplicates = cluster[1:]
+
+            for dup in duplicates:
+                try:
+                    fks = _repoint_fks(session, dup, keeper)
+                    result.fks_repointed += fks
+                    _merge_provenance(keeper, dup)
+                    session.delete(dup)
+                    result.duplicates_merged += 1
+                    logger.info(
+                        "Merged duplicate: %s vs %s (%s vs %s) — "
+                        "dup %s → keeper %s (%d FKs repointed)",
+                        dup.home_team, dup.away_team,
+                        dup.scheduled_at.isoformat(),
+                        keeper.scheduled_at.isoformat(),
+                        dup.id, keeper.id, fks,
+                    )
+                except Exception as exc:
+                    result.errors.append(
+                        f"Merge failed for {dup.id} → {keeper.id}: {exc}"
+                    )
+                    logger.warning(
+                        "Failed to merge duplicate %s: %s", dup.id, exc,
+                    )
+
+    session.flush()
+
+    logger.info(
+        "Duplicate merge: %d found, %d merged, %d FKs repointed",
+        result.duplicates_found,
+        result.duplicates_merged,
+        result.fks_repointed,
+    )
+
+    return result
+
+
+def _repoint_fks(
+    session: Session,
+    source: Match,
+    target: Match,
+) -> int:
+    """Repoint all FK references from source match to target match.
+
+    Returns the total number of rows updated.
+    """
+    from bet_agent.db.models import OddsMarket, PlacedBet, Prediction
+
+    count = 0
+
+    # Repoint odds_markets
+    odds = list(
+        session.execute(
+            select(OddsMarket).where(OddsMarket.match_id == source.id)
+        ).scalars().all()
+    )
+    for o in odds:
+        o.match_id = target.id
+        count += 1
+
+    # Repoint predictions
+    preds = list(
+        session.execute(
+            select(Prediction).where(Prediction.match_id == source.id)
+        ).scalars().all()
+    )
+    for p in preds:
+        p.match_id = target.id
+        count += 1
+
+    # Repoint placed_bets
+    bets = list(
+        session.execute(
+            select(PlacedBet).where(PlacedBet.match_id == source.id)
+        ).scalars().all()
+    )
+    for b in bets:
+        b.match_id = target.id
+        count += 1
+
+    return count
+
+
+def _merge_provenance(keeper: Match, duplicate: Match) -> None:
+    """Merge provenance data from duplicate into keeper's live_stats."""
+    keeper_stats = dict(keeper.live_stats) if keeper.live_stats else {}
+    dup_stats = dict(duplicate.live_stats) if duplicate.live_stats else {}
+
+    # Merge data_sources lists
+    keeper_sources = keeper_stats.get("data_sources", [])
+    dup_sources = dup_stats.get("data_sources", [])
+    for src in dup_sources:
+        if src not in keeper_sources:
+            keeper_sources.append(src)
+    keeper_stats["data_sources"] = keeper_sources
+
+    # Copy event IDs if keeper doesn't have them
+    for key in ("odds_event_id", "odds_sport_key", "api_sports_fixture_id",
+                "sofascore_event_id"):
+        if key not in keeper_stats and key in dup_stats:
+            keeper_stats[key] = dup_stats[key]
+
+    # Prefer the higher score data (duplicate might have been resolved)
+    if duplicate.home_score is not None and keeper.home_score is None:
+        keeper.home_score = duplicate.home_score
+        keeper.away_score = duplicate.away_score
+        keeper.match_state = duplicate.match_state
+        keeper.is_live = duplicate.is_live
+
+    keeper.live_stats = keeper_stats

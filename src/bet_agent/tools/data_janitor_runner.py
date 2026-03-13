@@ -22,9 +22,11 @@ from datetime import date, timedelta
 
 from bet_agent.tools.backfill_engine import (
     BackfillResult,
+    MergeResult,
     ReconcileResult,
     backfill_day,
     backfill_open_gaps,
+    merge_duplicate_fixtures,
     reconcile_open_results,
 )
 from bet_agent.tools.coverage_engine import (
@@ -321,6 +323,38 @@ def cli_seed_fixtures():
             result = seed_today_window(session, sports=args.sports)
         session.commit()
         print(json.dumps(result.to_dict(), indent=2))
+    finally:
+        session.close()
+
+
+def cli_merge_duplicates():
+    """CLI: Find and merge near-duplicate fixtures caused by kickoff drift."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    parser = argparse.ArgumentParser(description="Merge near-duplicate fixtures")
+    parser.add_argument(
+        "--tolerance", type=int, default=15,
+        help="Near-duplicate tolerance in minutes (default: 15)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Report duplicates without merging",
+    )
+    args = parser.parse_args()
+
+    session = _get_session()
+    try:
+        tolerance = timedelta(minutes=args.tolerance)
+        if args.dry_run:
+            # Dry run: find duplicates but roll back
+            result = merge_duplicate_fixtures(session, tolerance=tolerance)
+            session.rollback()
+            print(json.dumps(result.to_dict(), indent=2))
+            print("(dry run — no changes committed)")
+        else:
+            result = merge_duplicate_fixtures(session, tolerance=tolerance)
+            session.commit()
+            print(json.dumps(result.to_dict(), indent=2))
     finally:
         session.close()
 
