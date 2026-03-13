@@ -196,21 +196,33 @@ def _sync_fetch_status():
 
 
 def _sync_fetch_pending_data():
-    """Synchronous: fetch pending bets as structured dicts."""
+    """Synchronous: fetch pending bets as structured dicts.
+
+    Runs the pipeline bridge first to ensure approved predictions
+    have corresponding PlacedBet(PENDING) rows.
+    """
     from bet_agent.db.session import get_session
     from bet_agent.tools.master_analysis import fetch_pending_for_human
+    from bet_agent.tools.pipeline_bridge import ensure_pending_bets_from_approved
     with get_session() as sess:
+        ensure_pending_bets_from_approved(sess)
         return fetch_pending_for_human(sess)
 
 
 def _sync_fetch_pending():
-    """Synchronous: fetch pending bets and format text."""
+    """Synchronous: fetch pending bets and format text.
+
+    Runs the pipeline bridge first to ensure approved predictions
+    have corresponding PlacedBet(PENDING) rows.
+    """
     from bet_agent.db.session import get_session
     from bet_agent.tools.master_analysis import (
         fetch_pending_for_human,
         format_pending_text,
     )
+    from bet_agent.tools.pipeline_bridge import ensure_pending_bets_from_approved
     with get_session() as sess:
+        ensure_pending_bets_from_approved(sess)
         pending = fetch_pending_for_human(sess)
         return format_pending_text(pending)
 
@@ -1288,6 +1300,9 @@ def build_application():
     # Free-text → Master Agent NL bridge (must be last)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # Global error handler — catches 502s, network errors, etc.
+    app.add_error_handler(_global_error_handler)
+
     # Schedule alert digest flush every 10 minutes
     if app.job_queue is not None:
         app.job_queue.run_repeating(
@@ -1328,6 +1343,22 @@ async def _conv_entry(update, context) -> int:
         parse_mode="Markdown",
     )
     return CONV_AWAITING_ODDS
+
+
+async def _global_error_handler(update, context) -> None:
+    """Handle uncaught exceptions in Telegram handlers.
+
+    Logs the error instead of crashing.  Transient network errors
+    (502 Bad Gateway, connection resets) are logged at WARNING level
+    to reduce noise.
+    """
+    err = context.error
+    err_str = str(err).lower()
+    transient = any(k in err_str for k in ("502", "bad gateway", "timed out", "connection"))
+    if transient:
+        logger.warning("Transient Telegram error (will retry): %s", err)
+    else:
+        logger.error("Unhandled Telegram error: %s", err, exc_info=err)
 
 
 def run_bot() -> None:

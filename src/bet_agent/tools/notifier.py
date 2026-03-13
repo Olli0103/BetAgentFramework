@@ -97,7 +97,7 @@ def check_bet_readiness(
     # 6. Edge plausibility — block extreme model-vs-market divergences
     model_prob = float(prediction.model_prob) if prediction.model_prob else 0.0
     implied_prob = float(prediction.implied_prob) if prediction.implied_prob else 0.0
-    edge_pp = abs(model_prob - implied_prob) * 100.0
+    edge_pp = round(abs(model_prob - implied_prob) * 100.0, 6)
     checks["edge_plausible"] = edge_pp <= _MAX_EDGE_PP
 
     is_ready = all(checks.values())
