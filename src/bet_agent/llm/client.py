@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 import yaml
@@ -30,6 +32,46 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# DNS failure cooldown: skip a provider host for N seconds after a
+# name-resolution failure to avoid repeated identical errors.
+_DNS_COOLDOWN_SECONDS = int(os.environ.get("BETAGENT_LLM_DNS_COOLDOWN_SECONDS", "300"))
+_dns_cooldown_until: dict[str, float] = {}  # host → monotonic timestamp
+
+
+def _is_dns_error(exc: Exception) -> bool:
+    """Return True if the exception looks like a DNS resolution failure."""
+    msg = str(exc).lower()
+    return any(k in msg for k in (
+        "failed to resolve",
+        "nodename nor servname",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "getaddrinfo failed",
+    ))
+
+
+def _host_from_url(url: str) -> str:
+    return urlparse(url).hostname or url
+
+
+def _is_on_cooldown(host: str) -> bool:
+    until = _dns_cooldown_until.get(host)
+    if until is None:
+        return False
+    if time.monotonic() < until:
+        return True
+    # Cooldown expired
+    del _dns_cooldown_until[host]
+    return False
+
+
+def _set_cooldown(host: str) -> None:
+    _dns_cooldown_until[host] = time.monotonic() + _DNS_COOLDOWN_SECONDS
+    logger.warning(
+        "DNS cooldown set for %s — skipping for %ds",
+        host, _DNS_COOLDOWN_SECONDS,
+    )
 
 # ── Configuration data classes ────────────────────────────────────────
 
@@ -246,9 +288,18 @@ class LLMClient:
 
         last_err: Exception | None = None
         for prov in self._providers:
+            host = _host_from_url(prov.base_url)
+            if _is_on_cooldown(host):
+                logger.debug(
+                    "Skipping %s (%s) — DNS cooldown active", prov.name, host,
+                )
+                continue
+
             try:
                 return self._call(prov, user_message, system_prompt, temperature, max_tokens)
             except Exception as exc:  # noqa: BLE001
+                if _is_dns_error(exc):
+                    _set_cooldown(host)
                 logger.warning(
                     "Provider %s (%s) failed: %s — trying next",
                     prov.name,
