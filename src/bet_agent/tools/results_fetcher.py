@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -59,6 +60,7 @@ class FetchResult:
     matches_checked: int
     matches_updated: int
     matches_not_found: int
+    voided_stale_paper: int = 0
 
 
 # ── Results backend protocol ─────────────────────────────────────────
@@ -90,19 +92,55 @@ class ManualResultsBackend:
         return self._results.get(key)
 
 
+# ── Unicode-safe team name normalization ─────────────────────────────
+
+
+def _normalize_name(raw: str) -> str:
+    """Normalize a team name for comparison.
+
+    - Strip whitespace
+    - Lowercase
+    - Unicode NFKD decomposition (ü → u, é → e, etc.)
+    - Remove common prefixes/suffixes that vary between sources
+    """
+    s = raw.strip().lower()
+    # Decompose Unicode: "München" → "Munchen", "Nîmes" → "Nimes"
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return s
+
+
+def _name_tokens(name: str) -> set[str]:
+    """Extract significant tokens (len >= 4) from a normalized name."""
+    return {t for t in _normalize_name(name).split() if len(t) >= 4}
+
+
 # ── Sport → Odds API sport keys mapping ──────────────────────────────
 
 _AGENTS_YAML = Path(__file__).resolve().parents[3] / "config" / "agents.yaml"
 
-# Internal Sport enum → list of Odds API sport key prefixes
-# Used to find the right /scores endpoint for each match.
-_SPORT_TO_API_KEYS: dict[str, list[str]] = {
-    "football": ["soccer_"],
-    "basketball": ["basketball_"],
-    "american_football": ["americanfootball_"],
-    "ice_hockey": ["icehockey_"],
-    "tennis": ["tennis_"],
-    "darts": ["darts_"],
+# Internal Sport enum → Odds API key prefix for dynamic discovery
+_SPORT_PREFIX: dict[str, str] = {
+    "football": "soccer_",
+    "basketball": "basketball_",
+    "american_football": "americanfootball_",
+    "ice_hockey": "icehockey_",
+    "tennis": "tennis_",
+    "darts": "darts_",
+}
+
+# League hint → preferred API sport key (for faster matching)
+_LEAGUE_HINTS: dict[str, str] = {
+    "bundesliga": "soccer_germany_bundesliga",
+    "2. bundesliga": "soccer_germany_bundesliga2",
+    "premier league": "soccer_epl",
+    "epl": "soccer_epl",
+    "la liga": "soccer_spain_la_liga",
+    "serie a": "soccer_italy_serie_a",
+    "champions league": "soccer_uefa_champs_league",
+    "nba": "basketball_nba",
+    "nfl": "americanfootball_nfl",
+    "nhl": "icehockey_nhl",
 }
 
 
@@ -131,13 +169,18 @@ def _load_configured_sport_keys() -> dict[str, list[str]]:
 class TheOddsAPIResultsBackend:
     """Fetch completed match scores from The Odds API /scores endpoint.
 
-    Batches requests per sport key and caches within a single run to
-    minimize API usage (each sport key = 2 credits with daysFrom=3).
+    Matching strategy (in priority order):
+      0. Direct lookup by ``odds_event_id`` stored in ``Match.live_stats``
+      1. Exact home_team + away_team match (Unicode-normalized)
+      2. Fuzzy token scoring (shared significant tokens ≥ 4 chars)
 
-    Matching strategy:
-      1. Exact home_team + away_team match (case-insensitive)
-      2. Fuzzy substring match as fallback (handles "FC Bayern München"
-         vs "Bayern Munich" style mismatches)
+    On successful match, binds the event by storing ``odds_event_id``
+    and ``odds_sport_key`` in ``Match.live_stats`` for future direct lookups.
+
+    Sport key selection:
+      - League hint mapping (e.g. "Bundesliga" → soccer_germany_bundesliga)
+      - Explicit keys from agents.yaml
+      - Dynamic discovery via ``/v4/sports`` endpoint (prefix-filtered)
     """
 
     def __init__(
@@ -152,25 +195,76 @@ class TheOddsAPIResultsBackend:
         self._cache: dict[str, list[dict]] = {}
         # Configured sport keys from agents.yaml (exact, no wildcards)
         self._configured_keys = _load_configured_sport_keys()
+        # Discovered sport keys from /v4/sports (lazy-loaded)
+        self._discovered_keys: dict[str, list[str]] | None = None
 
     @property
     def is_available(self) -> bool:
         return bool(self._api_key)
 
-    def _sport_keys_for(self, sport: Sport) -> list[str]:
-        """Get API sport keys to query for a given Sport enum value."""
-        # First try explicit keys from agents.yaml
-        configured = self._configured_keys.get(sport.value, [])
-        if configured:
-            return configured
-        # Fall back to prefix-based defaults
-        prefixes = _SPORT_TO_API_KEYS.get(sport.value, [])
-        if not prefixes:
-            return []
-        # We don't know all available keys without calling /sports,
-        # so return the prefixes as-is (won't match exact keys).
-        # For common sports the agents.yaml config should have them.
-        return []
+    def _discover_sport_keys(self) -> dict[str, list[str]]:
+        """Fetch available sport keys from /v4/sports and group by prefix."""
+        if self._discovered_keys is not None:
+            return self._discovered_keys
+
+        self._discovered_keys = {}
+        try:
+            resp = requests.get(
+                f"{self._base_url}/sports",
+                params={"apiKey": self._api_key},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            sports = resp.json()
+            for s in sports:
+                key = s.get("key", "")
+                for sport_name, prefix in _SPORT_PREFIX.items():
+                    if key.startswith(prefix):
+                        self._discovered_keys.setdefault(sport_name, []).append(key)
+            logger.info(
+                "Discovered %d sport keys from /v4/sports",
+                sum(len(v) for v in self._discovered_keys.values()),
+            )
+        except requests.RequestException as exc:
+            logger.warning("Failed to discover sport keys: %s", exc)
+            self._discovered_keys = {}
+
+        return self._discovered_keys
+
+    def _sport_keys_for(self, sport: Sport, league: str | None = None) -> list[str]:
+        """Get API sport keys to query, ordered by relevance.
+
+        Priority:
+          1. League hint (most specific, avoids unnecessary API calls)
+          2. Explicit keys from agents.yaml
+          3. Dynamic discovery from /v4/sports
+        """
+        keys: list[str] = []
+        seen: set[str] = set()
+
+        # 1. League hint — put the most likely key first
+        if league:
+            league_lower = league.strip().lower()
+            hint = _LEAGUE_HINTS.get(league_lower)
+            if hint and hint not in seen:
+                keys.append(hint)
+                seen.add(hint)
+
+        # 2. Explicit keys from agents.yaml
+        for k in self._configured_keys.get(sport.value, []):
+            if k not in seen:
+                keys.append(k)
+                seen.add(k)
+
+        # 3. Dynamic discovery (only if we still have nothing)
+        if not keys:
+            discovered = self._discover_sport_keys()
+            for k in discovered.get(sport.value, []):
+                if k not in seen:
+                    keys.append(k)
+                    seen.add(k)
+
+        return keys
 
     def _fetch_scores(self, sport_key: str) -> list[dict]:
         """Fetch scores for a sport key, with caching."""
@@ -206,47 +300,93 @@ class TheOddsAPIResultsBackend:
     ) -> dict | None:
         """Find the API event that corresponds to a DB match.
 
-        Tries exact team name match first, then falls back to
-        case-insensitive substring matching.
+        Pass 0: Direct event ID lookup (from previous binding)
+        Pass 1: Exact normalized name match
+        Pass 2: Fuzzy token scoring
         """
-        db_home = match.home_team.strip().lower()
-        db_away = match.away_team.strip().lower()
+        # Pass 0: direct event ID from live_stats
+        bound_id = (match.live_stats or {}).get("odds_event_id")
+        if bound_id:
+            for ev in events:
+                if ev.get("id") == bound_id:
+                    return ev
 
-        # Pass 1: exact case-insensitive match
+        db_home = _normalize_name(match.home_team)
+        db_away = _normalize_name(match.away_team)
+
+        # Pass 1: exact normalized match
         for ev in events:
-            api_home = (ev.get("home_team") or "").strip().lower()
-            api_away = (ev.get("away_team") or "").strip().lower()
+            api_home = _normalize_name(ev.get("home_team") or "")
+            api_away = _normalize_name(ev.get("away_team") or "")
             if api_home == db_home and api_away == db_away:
                 return ev
 
-        # Pass 2: substring match (handles "Bayern Munich" vs "FC Bayern München")
-        for ev in events:
-            api_home = (ev.get("home_team") or "").strip().lower()
-            api_away = (ev.get("away_team") or "").strip().lower()
-            home_ok = (
-                db_home in api_home or api_home in db_home
-                or _fuzzy_team_match(db_home, api_home)
-            )
-            away_ok = (
-                db_away in api_away or api_away in db_away
-                or _fuzzy_team_match(db_away, api_away)
-            )
-            if home_ok and away_ok:
-                logger.debug(
-                    "Fuzzy matched: DB(%s vs %s) → API(%s vs %s)",
-                    match.home_team, match.away_team,
-                    ev.get("home_team"), ev.get("away_team"),
-                )
-                return ev
+        # Pass 2: fuzzy token scoring
+        db_home_tokens = _name_tokens(match.home_team)
+        db_away_tokens = _name_tokens(match.away_team)
 
-        return None
+        best_ev = None
+        best_score = 0
+
+        for ev in events:
+            api_home_tokens = _name_tokens(ev.get("home_team") or "")
+            api_away_tokens = _name_tokens(ev.get("away_team") or "")
+
+            home_overlap = len(db_home_tokens & api_home_tokens)
+            away_overlap = len(db_away_tokens & api_away_tokens)
+
+            # Also check substring containment (normalized)
+            api_home_norm = _normalize_name(ev.get("home_team") or "")
+            api_away_norm = _normalize_name(ev.get("away_team") or "")
+            if db_home in api_home_norm or api_home_norm in db_home:
+                home_overlap = max(home_overlap, 1)
+            if db_away in api_away_norm or api_away_norm in db_away:
+                away_overlap = max(away_overlap, 1)
+
+            if home_overlap > 0 and away_overlap > 0:
+                score = home_overlap + away_overlap
+                if score > best_score:
+                    best_score = score
+                    best_ev = ev
+
+        if best_ev:
+            logger.debug(
+                "Fuzzy matched (score=%d): DB(%s vs %s) → API(%s vs %s)",
+                best_score, match.home_team, match.away_team,
+                best_ev.get("home_team"), best_ev.get("away_team"),
+            )
+
+        return best_ev
+
+    def _bind_event(self, match: Match, event: dict, sport_key: str) -> None:
+        """Store event binding in Match.live_stats for future direct lookup."""
+        event_id = event.get("id")
+        if not event_id:
+            return
+
+        stats = dict(match.live_stats) if match.live_stats else {}
+        if stats.get("odds_event_id") == event_id:
+            return  # already bound
+
+        stats["odds_event_id"] = event_id
+        stats["odds_sport_key"] = sport_key
+        match.live_stats = stats
+        logger.debug(
+            "Bound match %s vs %s → event %s (%s)",
+            match.home_team, match.away_team, event_id, sport_key,
+        )
 
     def fetch_result(self, match: Match) -> MatchResult | None:
         """Fetch the result for a single match from The Odds API."""
         if not self._api_key:
             return None
 
-        sport_keys = self._sport_keys_for(match.sport)
+        # If we have a bound sport key, try that first
+        bound_key = (match.live_stats or {}).get("odds_sport_key")
+        sport_keys = self._sport_keys_for(match.sport, match.league)
+        if bound_key and bound_key not in sport_keys:
+            sport_keys.insert(0, bound_key)
+
         if not sport_keys:
             logger.debug("No API sport keys for %s", match.sport.value)
             return None
@@ -257,11 +397,13 @@ class TheOddsAPIResultsBackend:
             if ev is None:
                 continue
 
+            # Bind event for future direct lookups
+            self._bind_event(match, ev, sport_key)
+
             completed = ev.get("completed", False)
             scores = ev.get("scores")
             if not scores:
                 if completed:
-                    # Completed but no scores (cancelled?)
                     return MatchResult(
                         home_team=match.home_team,
                         away_team=match.away_team,
@@ -273,9 +415,9 @@ class TheOddsAPIResultsBackend:
             # Parse scores list: [{"name": "Team A", "score": "2"}, ...]
             home_score = 0
             away_score = 0
-            api_home = (ev.get("home_team") or "").strip().lower()
+            api_home = _normalize_name(ev.get("home_team") or "")
             for s in scores:
-                sname = (s.get("name") or "").strip().lower()
+                sname = _normalize_name(s.get("name") or "")
                 sval = int(s.get("score", 0))
                 if sname == api_home:
                     home_score = sval
@@ -296,13 +438,10 @@ class TheOddsAPIResultsBackend:
 def _fuzzy_team_match(name_a: str, name_b: str) -> bool:
     """Check if two team names likely refer to the same team.
 
-    Compares significant tokens (length >= 4) and requires at least one
-    overlap.  Handles cases like:
-      - "borussia dortmund" vs "bvb dortmund"
-      - "charlotte hornets" vs "cha hornets"
+    Compares significant tokens (length >= 4) after Unicode normalization.
     """
-    tokens_a = {t for t in name_a.split() if len(t) >= 4}
-    tokens_b = {t for t in name_b.split() if len(t) >= 4}
+    tokens_a = _name_tokens(name_a)
+    tokens_b = _name_tokens(name_b)
     if not tokens_a or not tokens_b:
         return False
     return bool(tokens_a & tokens_b)
@@ -432,9 +571,75 @@ def fetch_and_update_results(
                 match.home_team, match.away_team, exc,
             )
 
+    # Void stale unmatched PAPER bets that are beyond the API's score window
+    # Void stale unmatched PAPER bets that are beyond the API's score window
+    voided = _void_stale_unmatched_paper_bets(session)
+
     session.flush()
     return FetchResult(
         matches_checked=len(matches),
         matches_updated=updated,
         matches_not_found=not_found,
+        voided_stale_paper=voided,
     )
+
+
+# ── Stale paper bet terminal fallback ───────────────────────────────
+
+# TheOddsAPI only returns scores for completed matches up to 3 days old.
+# PAPER bets on matches older than this that still have no result are
+# irrecoverable — void them so they don't block metrics forever.
+_STALE_PAPER_DAYS = int(os.environ.get("BETAGENT_STALE_PAPER_DAYS", "4"))
+
+
+def _void_stale_unmatched_paper_bets(session: Session) -> int:
+    """Void PAPER bets on unfinished matches older than the score window.
+
+    These are bets where the API score feed no longer returns the match
+    (e.g. tennis bracket advanced, event removed). Since they're PAPER
+    (simulated) and unresolvable, voiding is the cleanest outcome.
+
+    REAL bets are never auto-voided here — they need manual review.
+    """
+    from bet_agent.db.models import LedgerType
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_STALE_PAPER_DAYS)
+
+    stale_bets = list(
+        session.execute(
+            select(PlacedBet)
+            .join(Match, Match.id == PlacedBet.match_id)
+            .where(
+                PlacedBet.ledger_type == LedgerType.PAPER,
+                PlacedBet.status == BetStatus.PLACED,
+                Match.match_state != MatchState.FINISHED,
+                Match.scheduled_at < cutoff,
+            )
+        ).scalars().all()
+    )
+
+    for bet in stale_bets:
+        bet.status = BetStatus.VOID
+        bet.pnl_eur = bet.stake_eur  # refund stake (deduct-at-placement model)
+        bet.resolved_at = datetime.now(timezone.utc)
+
+        # Refund stake to PAPER ledger
+        from bet_agent.db.models import BankrollLedger
+        paper_ledger = session.execute(
+            select(BankrollLedger).where(
+                BankrollLedger.ledger_type == LedgerType.PAPER,
+            )
+        ).scalar_one_or_none()
+        if paper_ledger:
+            paper_ledger.balance += bet.stake_eur
+
+        logger.info(
+            "Voided stale PAPER bet: %s @%.2f (%.2f EUR) — match >%dd old, no result",
+            bet.selection, float(bet.odds_at_placement),
+            float(bet.stake_eur), _STALE_PAPER_DAYS,
+        )
+
+    if stale_bets:
+        logger.info("Voided %d stale unmatched PAPER bet(s)", len(stale_bets))
+
+    return len(stale_bets)
