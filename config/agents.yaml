@@ -208,14 +208,16 @@ agents:
   # ── 3. DATA JANITOR (ETL & Resolution) ──────────────────────────────
   - id: data_janitor
     name: "Data Janitor"
-    role: "ETL & Name Resolution"
+    role: "Data Coverage Enforcer & Quality Agent"
     llm_tier: tier2_local_tools
     soul_file: agents/data_janitor/SOUL.md
     description: >
-      Cleans raw scraped data, normalizes live stats, and resolves
-      fuzzy team/player naming conflicts using the team_aliases table.
-      Runs historical data imports and builds team daily stat snapshots.
+      Active data quality agent. Cleans raw scraped data, normalizes live
+      stats, resolves fuzzy team/player naming via the team_aliases table,
+      runs historical imports, and enforces coverage SLOs. Scans for gaps
+      every 30 min, backfills nightly, and reconciles weekly.
     tools:
+      # Existing tools
       - normalize_team_name
       - resolve_alias
       - clean_odds_data
@@ -224,8 +226,23 @@ agents:
       - upsert_daily_stats
       - run_full_historical_import
       - build_historical_daily_stats
+      # Coverage & quality tools
+      - scan_gaps
+      - coverage_report
+      - check_quality_gate
+      # Backfill tools
+      - backfill_day
+      - backfill_open_gaps
+      - reconcile_open_results
+      # Scheduled job runners
+      - run_intraday_scan
+      - run_nightly_backfill
+      - run_weekly_reconcile
     reports_to: master
-    schedule: null  # Triggered by scout output
+    schedule:
+      intraday_scan: "*/30 * * * *"      # Every 30 minutes
+      nightly_backfill: "30 3 * * *"     # Daily at 03:30 UTC (before auditor at 05:00)
+      weekly_reconcile: "0 2 * * 0"      # Every Sunday at 02:00 UTC
 
   # ── 4. QUANT AGENT (Math Engine) ────────────────────────────────────
   - id: quant

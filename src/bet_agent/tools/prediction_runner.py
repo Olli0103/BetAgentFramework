@@ -121,6 +121,19 @@ def run_daily_predictions(
     if prediction_date is None:
         prediction_date = date.today()
 
+    # Quality gate check — warn but don't block predictions
+    try:
+        from bet_agent.tools.coverage_engine import check_quality_gate
+        for sport in Sport:
+            gate = check_quality_gate(session, sport.value)
+            if not gate.can_predict:
+                logger.warning(
+                    "Quality gate: %s data below prediction SLO — %s",
+                    sport.value, "; ".join(gate.violations),
+                )
+    except Exception as exc:
+        logger.warning("Quality gate check failed (non-blocking): %s", exc)
+
     # Query today's NOT_STARTED matches
     day_start = datetime.combine(prediction_date, time.min, tzinfo=timezone.utc)
     day_end = datetime.combine(prediction_date, time.max, tzinfo=timezone.utc)

@@ -398,6 +398,19 @@ def run_training_pipeline(
 
     from bet_agent.tools.feature_factory import build_training_dataset, get_feature_names
 
+    # Quality gate check — block training on low-quality data
+    try:
+        from bet_agent.tools.coverage_engine import check_quality_gate
+        gate = check_quality_gate(session, sport.value)
+        if not gate.can_train:
+            logger.error(
+                "Cannot train %s: data quality below SLO — %s",
+                sport.value, "; ".join(gate.violations),
+            )
+            return {}
+    except Exception as exc:
+        logger.warning("Quality gate check failed (non-blocking): %s", exc)
+
     dataset = build_training_dataset(session, sport, season, min_games_played=min_games)
     if len(dataset) < 20:
         logger.warning("Insufficient data for %s: only %d samples", sport.value, len(dataset))

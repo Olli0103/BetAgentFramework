@@ -29,10 +29,19 @@ ui = [
 telegram = [
     "python-telegram-bot>=20.0",
 ]
+scraping = [
+    "playwright>=1.40",
+]
 dev = [
     "pytest>=7.0",
     "alembic>=1.12",
 ]
+
+[project.scripts]
+betagent-gap-scan = "bet_agent.tools.data_janitor_runner:cli_gap_scan"
+betagent-backfill = "bet_agent.tools.data_janitor_runner:cli_backfill_day"
+betagent-reconcile = "bet_agent.tools.data_janitor_runner:cli_reconcile_open_results"
+betagent-coverage = "bet_agent.tools.data_janitor_runner:cli_coverage_report"
 
 [tool.setuptools.packages.find]
 where = ["src"]

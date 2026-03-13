@@ -447,18 +447,123 @@ def _fuzzy_team_match(name_a: str, name_b: str) -> bool:
     return bool(tokens_a & tokens_b)
 
 
+class APISportsResultsBackend:
+    """Fetch results via API-Sports as a fallback backend.
+
+    Uses the APISportsClient to fetch fixture results by date,
+    matching against DB matches by team name comparison.
+    """
+
+    def __init__(self):
+        from bet_agent.tools.api_sports_client import APISportsClient
+        self._client = APISportsClient()
+
+    @property
+    def is_available(self) -> bool:
+        return self._client.is_available
+
+    def fetch_result(self, match: Match) -> MatchResult | None:
+        if not self._client.is_available:
+            return None
+
+        date_str = match.scheduled_at.strftime("%Y-%m-%d")
+        fixtures = self._client.fetch_fixtures_by_date(match.sport.value, date_str)
+        if not fixtures:
+            return None
+
+        from bet_agent.tools.backfill_engine import _match_fixture_to_db
+        api_match = _match_fixture_to_db(match, fixtures, match.sport.value)
+        if not api_match:
+            return None
+
+        # Extract scores
+        goals = api_match.get("goals", {})
+        if isinstance(goals, dict) and goals.get("home") is not None:
+            home_score = goals["home"]
+            away_score = goals.get("away", 0)
+        else:
+            scores = api_match.get("scores", {})
+            if isinstance(scores, dict):
+                hs = scores.get("home")
+                home_score = hs.get("total", 0) if isinstance(hs, dict) else (hs or 0)
+                aws = scores.get("away")
+                away_score = aws.get("total", 0) if isinstance(aws, dict) else (aws or 0)
+            else:
+                return None
+
+        # Check if finished
+        status = api_match.get("fixture", {}).get("status", {})
+        short_status = status.get("short", "") if isinstance(status, dict) else ""
+        is_finished = short_status in ("FT", "AET", "PEN", "AOT")
+
+        # Store fixture ID for provenance
+        fix_data = api_match.get("fixture", api_match)
+        if isinstance(fix_data, dict) and fix_data.get("id"):
+            stats = dict(match.live_stats) if match.live_stats else {}
+            stats["api_sports_fixture_id"] = fix_data["id"]
+            data_sources = stats.get("data_sources", [])
+            if "api_sports" not in data_sources:
+                data_sources.append("api_sports")
+            stats["data_sources"] = data_sources
+            match.live_stats = stats
+
+        return MatchResult(
+            home_team=match.home_team,
+            away_team=match.away_team,
+            home_score=home_score,
+            away_score=away_score,
+            is_finished=is_finished,
+        )
+
+
+class ChainedResultsBackend:
+    """Try multiple backends in order, return first successful result."""
+
+    def __init__(self, backends: list):
+        self._backends = backends
+
+    def fetch_result(self, match: Match) -> MatchResult | None:
+        for backend in self._backends:
+            try:
+                result = backend.fetch_result(match)
+                if result is not None:
+                    return result
+            except Exception as exc:
+                logger.warning(
+                    "Backend %s failed for %s vs %s: %s",
+                    type(backend).__name__, match.home_team, match.away_team, exc,
+                )
+        return None
+
+
 def _get_default_backend() -> ResultsBackend:
-    """Return TheOddsAPIResultsBackend if API key is set, else ManualResultsBackend."""
+    """Return a chained backend: TheOddsAPI → API-Sports → Manual.
+
+    Priority:
+      1. TheOddsAPIResultsBackend (if THE_ODDS_API_KEY set)
+      2. APISportsResultsBackend (if API_SPORTS_KEY set)
+      3. ManualResultsBackend (no-op fallback)
+    """
+    backends = []
+
     api_key = os.environ.get("THE_ODDS_API_KEY", "")
     if api_key:
-        backend = TheOddsAPIResultsBackend(api_key=api_key)
-        logger.info("Using TheOddsAPIResultsBackend for results ingestion")
-        return backend
-    logger.warning(
-        "THE_ODDS_API_KEY not set — using ManualResultsBackend (no-op). "
-        "Set THE_ODDS_API_KEY to enable automatic results ingestion."
-    )
-    return ManualResultsBackend()
+        backends.append(TheOddsAPIResultsBackend(api_key=api_key))
+        logger.info("Results backend: TheOddsAPI (primary)")
+
+    api_sports_backend = APISportsResultsBackend()
+    if api_sports_backend.is_available:
+        backends.append(api_sports_backend)
+        logger.info("Results backend: API-Sports (fallback)")
+
+    if not backends:
+        logger.warning(
+            "No API keys set — using ManualResultsBackend (no-op). "
+            "Set THE_ODDS_API_KEY or API_SPORTS_KEY for automatic results."
+        )
+        return ManualResultsBackend()
+
+    return ChainedResultsBackend(backends)
 
 
 # ── Core logic ───────────────────────────────────────────────────────

@@ -126,6 +126,9 @@ class Match(Base):
     away_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     live_stats: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
+    # Provenance — which data source populated this match
+    source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, server_default=func.now(), nullable=False

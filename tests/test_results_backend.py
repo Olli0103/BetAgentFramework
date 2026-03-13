@@ -450,12 +450,18 @@ class TestDynamicDiscovery:
 
 
 class TestDefaultBackend:
-    @patch.dict("os.environ", {"THE_ODDS_API_KEY": "test-key-123"})
+    @patch.dict("os.environ", {"THE_ODDS_API_KEY": "test-key-123"}, clear=False)
     def test_uses_odds_api_when_key_set(self):
+        from bet_agent.tools.results_fetcher import ChainedResultsBackend
         backend = _get_default_backend()
-        assert isinstance(backend, TheOddsAPIResultsBackend)
+        # Now returns ChainedResultsBackend with TheOddsAPI as primary
+        assert isinstance(backend, ChainedResultsBackend)
+        assert any(
+            isinstance(b, TheOddsAPIResultsBackend)
+            for b in backend._backends
+        )
 
-    @patch.dict("os.environ", {"THE_ODDS_API_KEY": ""})
+    @patch.dict("os.environ", {"THE_ODDS_API_KEY": "", "API_SPORTS_KEY": ""}, clear=False)
     def test_falls_back_to_manual_when_no_key(self):
         backend = _get_default_backend()
         assert isinstance(backend, ManualResultsBackend)
