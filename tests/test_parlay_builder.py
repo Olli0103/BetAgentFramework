@@ -288,7 +288,7 @@ class TestBuildParlay:
         _make_prediction(db_session, m2, ev=0.08, best_odds=2.0)
         _make_prediction(db_session, m3, ev=0.05, best_odds=1.9)
 
-        ticket = build_parlay(db_session, sport_filter="tennis", max_legs=2)
+        ticket = build_parlay(db_session, sport_filter="tennis", num_legs=2)
 
         if ticket is not None:
             # Should only include tennis legs
