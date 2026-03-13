@@ -386,10 +386,8 @@ with tab_cmd:
             # ── KPI bar ──────────────────────────────────────────
             n_matches = len(matches)
             n_predictions = len(predictions)
-            n_pending = sum(1 for p in predictions if p.status == PredictionStatus.PENDING)
             n_approved = sum(1 for p in predictions if p.status == PredictionStatus.APPROVED)
             n_vetoed = sum(1 for p in predictions if p.status == PredictionStatus.VETOED)
-            n_placed = sum(1 for p in predictions if p.status == PredictionStatus.PLACED)
 
             settled_bets = []
             if match_ids:
@@ -413,25 +411,32 @@ with tab_cmd:
                 if p.status == PredictionStatus.APPROVED and p.best_odds is not None
             )
 
-            # Pending PlacedBets (from pipeline bridge)
+            # Execution-layer counts from placed_bets (the real pipeline state)
             n_pending_bets = 0
+            n_placed_bets = 0
             if match_ids:
                 n_pending_bets = sess.execute(
                     select(func.count(PlacedBet.id)).where(
                         PlacedBet.match_id.in_(match_ids),
-                        PlacedBet.status == BetStatus.PENDING,
+                        PlacedBet.status.in_([BetStatus.PENDING, BetStatus.PUSHED_TO_HUMAN]),
+                    )
+                ).scalar() or 0
+                n_placed_bets = sess.execute(
+                    select(func.count(PlacedBet.id)).where(
+                        PlacedBet.match_id.in_(match_ids),
+                        PlacedBet.status == BetStatus.PLACED,
                     )
                 ).scalar() or 0
 
             k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
             k1.metric("Matches", n_matches)
             k2.metric("Predictions", n_predictions)
-            k3.metric("Pending ML", n_pending)
-            k4.metric("Approved", n_approved, delta=f"+{n_approved}" if n_approved else None)
-            k5.metric("+EV/Odds", f"{n_positive_ev}/{n_has_odds}",
+            k3.metric("Approved", n_approved, delta=f"+{n_approved}" if n_approved else None)
+            k4.metric("+EV/Odds", f"{n_positive_ev}/{n_has_odds}",
                       help="Positive EV / Has shopped odds")
-            k6.metric("Vetoed", n_vetoed)
-            k7.metric("Awaiting", n_pending_bets, help="PlacedBet(PENDING) via bridge")
+            k5.metric("Pending", n_pending_bets, help="PlacedBet PENDING + PUSHED_TO_HUMAN")
+            k6.metric("Placed", n_placed_bets, help="PlacedBet PLACED (confirmed)")
+            k7.metric("Vetoed", n_vetoed)
             k8.metric("Settled", n_settled, delta=f"{settled_pnl:+.2f}\u20ac" if settled_bets else None)
 
             st.divider()
