@@ -2,6 +2,7 @@
 
 Orchestrates backfilling of missing scores, stats, and features from
 multiple data sources with priority ordering:
+  0. Fixture seeding from TheOddsAPI (creates missing Match rows)
   1. API-Sports (structured stats, highest fidelity)
   2. TheOddsAPI (scores, already integrated)
   3. Cloudflare scraping (fallback for advanced metrics)
@@ -13,9 +14,11 @@ All names pass through IroncladAliasResolver before DB writes.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
+import requests
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -29,6 +32,20 @@ from bet_agent.tools.coverage_engine import scan_gaps, GapReport
 
 logger = logging.getLogger(__name__)
 
+# ── Constants ────────────────────────────────────────────────────────────
+
+_ODDS_SEED_MAX_KEYS_DEFAULT = 80
+
+# TheOddsAPI sport key prefix → internal Sport enum
+_ODDS_PREFIX_TO_SPORT: dict[str, Sport] = {
+    "soccer_": Sport.FOOTBALL,
+    "basketball_": Sport.BASKETBALL,
+    "americanfootball_": Sport.AMERICAN_FOOTBALL,
+    "icehockey_": Sport.ICE_HOCKEY,
+    "tennis_": Sport.TENNIS,
+    "darts_": Sport.DARTS,
+}
+
 
 # ── Data structures ─────────────────────────────────────────────────────
 
@@ -37,6 +54,7 @@ logger = logging.getLogger(__name__)
 class BackfillResult:
     """Summary of a backfill run."""
     target_date: str
+    matches_seeded: int = 0
     scores_filled: int = 0
     stats_filled: int = 0
     features_filled: int = 0
@@ -48,6 +66,7 @@ class BackfillResult:
     def to_dict(self) -> dict:
         return {
             "target_date": self.target_date,
+            "matches_seeded": self.matches_seeded,
             "scores_filled": self.scores_filled,
             "stats_filled": self.stats_filled,
             "features_filled": self.features_filled,
@@ -118,6 +137,179 @@ def _update_feature_coverage(match: Match, sport_value: str) -> None:
     match.live_stats = stats
 
 
+# ── Fixture seeding from TheOddsAPI ──────────────────────────────────────
+
+
+def _odds_sport_from_key(sport_key: str) -> Sport | None:
+    """Map an OddsAPI sport key (e.g. 'soccer_germany_bundesliga') to Sport enum."""
+    for prefix, sport in _ODDS_PREFIX_TO_SPORT.items():
+        if sport_key.startswith(prefix):
+            return sport
+    return None
+
+
+def _odds_league_from_key(sport_key: str) -> str:
+    """Extract a league name from an OddsAPI sport key.
+
+    e.g. 'soccer_germany_bundesliga' → 'Germany Bundesliga'
+         'tennis_atp_french_open'    → 'Atp French Open'
+    """
+    for prefix in _ODDS_PREFIX_TO_SPORT:
+        if sport_key.startswith(prefix):
+            remainder = sport_key[len(prefix):]
+            return remainder.replace("_", " ").title()
+    return sport_key.replace("_", " ").title()
+
+
+def _seed_matches_from_odds_api(
+    session: Session,
+    target_date: date,
+    sports: list[str] | None,
+    result: BackfillResult,
+) -> None:
+    """Seed missing Match rows for *target_date* from TheOddsAPI.
+
+    Fetches upcoming / recent events from /v4/sports/{key}/odds and
+    upserts any that fall on *target_date* (UTC day).  Idempotent via
+    the ``uq_match_identity`` unique constraint.
+
+    Controlled by ``BETAGENT_ODDS_SEED_MAX_KEYS`` env-var (default 80).
+    """
+    api_key = os.environ.get("THE_ODDS_API_KEY", "")
+    if not api_key:
+        logger.debug("OddsAPI seeding skipped — THE_ODDS_API_KEY not set")
+        return
+
+    max_keys = int(os.environ.get(
+        "BETAGENT_ODDS_SEED_MAX_KEYS", str(_ODDS_SEED_MAX_KEYS_DEFAULT),
+    ))
+    sport_filter = set(sports) if sports else None
+
+    # 1. Discover active sport keys
+    try:
+        resp = requests.get(
+            "https://api.the-odds-api.com/v4/sports",
+            params={"apiKey": api_key},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        all_keys = [
+            s["key"] for s in resp.json()
+            if not s.get("has_outrights")
+        ]
+        result.odds_api_calls += 1
+    except requests.RequestException as exc:
+        result.errors.append(f"OddsAPI sport discovery failed: {exc}")
+        return
+
+    # Filter to supported sports and apply sport_filter
+    relevant_keys: list[str] = []
+    for sk in all_keys:
+        sport = _odds_sport_from_key(sk)
+        if sport is None:
+            continue
+        if sport_filter and sport.value not in sport_filter:
+            continue
+        relevant_keys.append(sk)
+
+    relevant_keys = relevant_keys[:max_keys]
+    logger.info(
+        "OddsAPI seeding: %d sport keys for %s (max_keys=%d)",
+        len(relevant_keys), target_date, max_keys,
+    )
+
+    # 2. Fetch events per sport key and upsert matches on target_date
+    day_start = datetime.combine(target_date, datetime.min.time(), tzinfo=timezone.utc)
+    day_end = day_start + timedelta(days=1)
+
+    seeded = 0
+    for sk in relevant_keys:
+        try:
+            resp = requests.get(
+                f"https://api.the-odds-api.com/v4/sports/{sk}/events",
+                params={"apiKey": api_key, "dateFormat": "iso"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            events = resp.json()
+            result.odds_api_calls += 1
+        except requests.RequestException as exc:
+            result.errors.append(f"OddsAPI events {sk}: {exc}")
+            continue
+
+        sport = _odds_sport_from_key(sk)
+        league = _odds_league_from_key(sk)
+
+        for ev in events:
+            home = ev.get("home_team", "")
+            away = ev.get("away_team", "")
+            commence = ev.get("commence_time", "")
+            if not home or not away or not commence:
+                continue
+
+            try:
+                scheduled_at = datetime.fromisoformat(
+                    commence.replace("Z", "+00:00"),
+                )
+            except (ValueError, AttributeError):
+                continue
+
+            # Only keep events on target_date (UTC day)
+            if not (day_start <= scheduled_at < day_end):
+                continue
+
+            # Check for existing match (idempotent)
+            existing = session.execute(
+                select(Match).where(
+                    Match.sport == sport,
+                    Match.league == league,
+                    Match.home_team == home,
+                    Match.away_team == away,
+                    Match.scheduled_at == scheduled_at,
+                )
+            ).scalar_one_or_none()
+
+            if existing:
+                # Bind OddsAPI event ID for future direct lookups
+                stats = dict(existing.live_stats) if existing.live_stats else {}
+                if "odds_event_id" not in stats:
+                    stats["odds_event_id"] = ev.get("id", "")
+                    stats["odds_sport_key"] = sk
+                    sources = stats.get("data_sources", [])
+                    if "the_odds_api" not in sources:
+                        sources.append("the_odds_api")
+                    stats["data_sources"] = sources
+                    existing.live_stats = stats
+                continue
+
+            # Insert new Match row
+            match = Match(
+                sport=sport,
+                league=league,
+                home_team=home,
+                away_team=away,
+                scheduled_at=scheduled_at,
+                match_state=MatchState.NOT_STARTED,
+                is_live=False,
+                source="the_odds_api",
+                live_stats={
+                    "odds_event_id": ev.get("id", ""),
+                    "odds_sport_key": sk,
+                    "data_sources": ["the_odds_api"],
+                },
+            )
+            session.add(match)
+            seeded += 1
+
+    session.flush()
+    result.matches_seeded = seeded
+
+    logger.info(
+        "OddsAPI seeding for %s: %d new matches from %d sport keys (%d API calls)",
+        target_date, seeded, len(relevant_keys), result.odds_api_calls,
+    )
+
+
 # ── Core backfill functions ──────────────────────────────────────────────
 
 
@@ -126,9 +318,12 @@ def backfill_day(
     target_date: date,
     sports: list[str] | None = None,
 ) -> BackfillResult:
-    """Backfill all missing data for a specific day.
+    """Seed fixtures and backfill missing data for a specific day.
 
-    Source priority: API-Sports → TheOddsAPI → (Cloudflare in future).
+    Flow:
+      1. Seed missing Match rows from TheOddsAPI
+      2. Scan for data gaps in existing Match rows
+      3. Fill gaps: API-Sports → TheOddsAPI → (Cloudflare in future)
 
     Args:
         session: SQLAlchemy session (caller manages transaction).
@@ -140,28 +335,31 @@ def backfill_day(
     """
     result = BackfillResult(target_date=target_date.isoformat())
 
-    # 1. Scan gaps for this day
+    # 1. Seed missing fixtures from TheOddsAPI
+    _seed_matches_from_odds_api(session, target_date, sports, result)
+
+    # 2. Scan gaps for this day (now includes freshly seeded matches)
     gap_report = scan_gaps(session, target_date=target_date, sports=sports, lookback_days=0)
 
-    if gap_report.total_gaps == 0:
+    if gap_report.total_gaps == 0 and result.matches_seeded == 0:
         logger.info("No gaps found for %s — nothing to backfill", target_date)
         return result
 
     logger.info(
-        "Backfill %s: %d gaps to fill (scores=%d, stats=%d, features=%d, stale=%d)",
-        target_date, gap_report.total_gaps,
+        "Backfill %s: %d seeded, %d gaps to fill (scores=%d, stats=%d, features=%d, stale=%d)",
+        target_date, result.matches_seeded, gap_report.total_gaps,
         len(gap_report.missing_scores), len(gap_report.missing_stats),
         len(gap_report.missing_features), len(gap_report.stale_matches),
     )
 
-    # 2. Try API-Sports for missing scores and stats
+    # 3. Try API-Sports for missing scores and stats
     client = _get_api_sports_client()
     if client.is_available:
         _backfill_from_api_sports(session, gap_report, client, result)
     else:
         logger.info("API-Sports not available (no key) — skipping")
 
-    # 3. Try TheOddsAPI for remaining missing scores
+    # 4. Try TheOddsAPI for remaining missing scores
     odds_backend = _get_odds_api_backend()
     if odds_backend:
         _backfill_scores_from_odds_api(session, gap_report, odds_backend, result)
@@ -171,8 +369,8 @@ def backfill_day(
     session.flush()
 
     logger.info(
-        "Backfill %s complete: %d filled (scores=%d, stats=%d, features=%d)",
-        target_date, result.total_filled,
+        "Backfill %s complete: %d seeded, %d filled (scores=%d, stats=%d, features=%d)",
+        target_date, result.matches_seeded, result.total_filled,
         result.scores_filled, result.stats_filled, result.features_filled,
     )
 
