@@ -1,18 +1,25 @@
 """Moonshot Architect — Parlay Builder & Correlation Analyzer.
 
-Builds smart +EV parlays (Kombiwetten) from approved single picks.
-Analyzes statistical correlation between legs to avoid naive independence
-assumptions, and enforces the 1.00 EUR hard cap on every parlay ticket.
+Builds high-confidence "Lotto" parlays (Kombiwetten) from approved single
+picks. The Moonshot selects legs with the **highest model probability**
+(not highest EV) and combines them into parlays with asymmetric upside.
+
+Philosophy:
+  The Moonshot is a Lotto ticket — we don't need +EV. We want the
+  combinations our model is *most confident* about, giving us the best
+  shot at landing a high-odds accumulator. Stake is always 1.00 EUR.
 
 Golden Rules:
   1. Moonshot Rule — Every parlay is hard-capped at 1.00 EUR
-  2. No LLM Math — All EV/probability calculations in deterministic Python
-  3. +EV Required — Never build a parlay just for high odds
+  2. No LLM Math — All probability calculations in deterministic Python
+  3. Highest Confidence — Sort legs by model_prob, not by EV
+  4. Correlation Awareness — Penalize correlated legs to get realistic
+     combined probabilities
 
 Correlation handling:
   - Same-match legs (e.g. "Team A ML" + "Over 2.5" in same game) are
     positively correlated — we apply a correlation penalty
-  - Cross-match legs are assumed independent (correlation ≈ 0)
+  - Cross-match legs are assumed independent (correlation ~ 0)
   - Same-sport/same-league legs get a small correlation bump for
     shared environmental factors (weather, referee pools)
 """
@@ -41,11 +48,13 @@ from bet_agent.db.models import (
 logger = logging.getLogger(__name__)
 
 
-# ── Constants ────────────────────────────────────────────────────────────
+# -- Constants ----------------------------------------------------------------
 
 MOONSHOT_HARD_CAP_EUR = 1.00
 MIN_LEGS = 2
 MAX_LEGS = 6
+MIN_COMBINED_ODDS = 3.0  # minimum combined odds to qualify as "Moonshot"
+MIN_LEG_PROB = 0.30  # ignore predictions below 30% confidence
 
 # Correlation penalties (reduce combined probability)
 # Same match, correlated markets (e.g. ML + O/U):
@@ -56,7 +65,7 @@ _SAME_LEAGUE_CORRELATION = 0.03
 _CROSS_SPORT_CORRELATION = 0.0
 
 
-# ── Data structures ─────────────────────────────────────────────────────
+# -- Data structures ----------------------------------------------------------
 
 
 @dataclass
@@ -132,7 +141,7 @@ class ParlayTicket:
     def format_message(self) -> str:
         """Format as a human-readable Telegram message."""
         lines = [
-            f"🎰 MOONSHOT PARLAY ({self.num_legs} legs)",
+            f"MOONSHOT PARLAY ({self.num_legs} legs)",
             f"Combined Odds: {self.combined_odds:.2f}",
             f"Adj. Probability: {self.adjusted_combined_prob:.1%}",
             f"EV: {self.combined_ev:+.4f}",
@@ -142,19 +151,20 @@ class ParlayTicket:
         for i, leg in enumerate(self.legs, 1):
             lines.append(
                 f"  Leg {i}: {leg.match_description} — "
-                f"{leg.selection} @{leg.best_odds:.2f} ({leg.best_sportsbook})"
+                f"{leg.selection} @{leg.best_odds:.2f} "
+                f"(prob {leg.model_prob:.0%}, {leg.best_sportsbook})"
             )
         if self.correlations:
             corr_notes = [c for c in self.correlations if c.correlation_factor > 0]
             if corr_notes:
                 lines.append("")
-                lines.append("⚠️ Correlations:")
+                lines.append("Correlations:")
                 for c in corr_notes:
                     lines.append(f"  {c.reason} ({c.correlation_factor:.0%})")
         return "\n".join(lines)
 
 
-# ── Core functions ───────────────────────────────────────────────────────
+# -- Core functions -----------------------------------------------------------
 
 
 def check_leg_correlation(
@@ -165,9 +175,9 @@ def check_leg_correlation(
     """Assess statistical dependence between two parlay legs.
 
     Correlation sources:
-      1. Same match → strong positive correlation (especially ML + O/U)
-      2. Same league, same day → weak correlation (shared environment)
-      3. Different sports → independent
+      1. Same match -> strong positive correlation (especially ML + O/U)
+      2. Same league, same day -> weak correlation (shared environment)
+      3. Different sports -> independent
 
     Args:
         session: SQLAlchemy session.
@@ -231,7 +241,7 @@ def calculate_parlay_ev(
 
     The naive approach multiplies individual probabilities, but correlated
     legs make the true joint probability lower than the product.
-    We apply a correlation penalty: adjusted_prob = naive_prob × (1 - avg_correlation).
+    We apply a correlation penalty: adjusted_prob = naive_prob * (1 - avg_correlation).
 
     Args:
         legs: List of parlay legs with model_prob and best_odds.
@@ -261,10 +271,10 @@ def calculate_parlay_ev(
         avg_corr = 0.0
 
     # Adjusted probability: penalize for correlations
-    # Higher correlation → lower true joint probability
+    # Higher correlation -> lower true joint probability
     adjusted_prob = naive_prob * (1.0 - avg_corr)
 
-    # EV = (probability × payout) - stake, normalized to stake=1
+    # EV = (probability * payout) - stake, normalized to stake=1
     combined_ev = (adjusted_prob * combined_odds) - 1.0
 
     return combined_odds, adjusted_prob, combined_ev
@@ -299,82 +309,63 @@ def validate_parlay_stake(
     return stake_eur, errors
 
 
-def build_parlay(
+def _fetch_todays_candidates(
     session: Session,
-    prediction_ids: list[uuid.UUID] | None = None,
     sport_filter: str | None = None,
-    max_legs: int = MAX_LEGS,
-    min_ev: float = 0.0,
-    stake_eur: float = MOONSHOT_HARD_CAP_EUR,
-) -> ParlayTicket | None:
-    """Build a parlay from approved predictions.
+    target_date: date | None = None,
+) -> list[Prediction]:
+    """Fetch today's approved predictions sorted by model confidence.
 
-    Can either take explicit prediction IDs, or auto-select the best
-    approved picks for a given sport.
+    Selects predictions with:
+      - status = APPROVED
+      - model_prob >= MIN_LEG_PROB (30%)
+      - best_odds populated (line-shopped)
+      - match scheduled today (or target_date)
+
+    Sorted by model_prob DESC — highest confidence first.
 
     Args:
         session: SQLAlchemy session.
-        prediction_ids: Explicit picks. If None, auto-select from approved.
-        sport_filter: Sport name to filter (e.g. "tennis").
-        max_legs: Maximum number of legs (default 6).
-        min_ev: Minimum combined EV threshold (default 0.0).
-        stake_eur: Stake (hard-capped at MOONSHOT_HARD_CAP_EUR).
+        sport_filter: Optional sport name to filter (e.g. "tennis", "basketball").
+        target_date: Date to query. Defaults to today (UTC).
 
     Returns:
-        ParlayTicket if successful, None if no valid parlay can be built.
+        List of Prediction objects sorted by model_prob descending.
     """
-    # Validate and cap stake
-    stake_eur, stake_errors = validate_parlay_stake(stake_eur)
+    if target_date is None:
+        target_date = datetime.now(timezone.utc).date()
 
-    # Get predictions
-    if prediction_ids:
-        predictions = list(
-            session.execute(
-                select(Prediction).where(
-                    Prediction.id.in_(prediction_ids),
-                    Prediction.status == PredictionStatus.APPROVED,
-                )
-            ).scalars().all()
+    day_start = datetime.combine(target_date, time.min, tzinfo=timezone.utc)
+    day_end = datetime.combine(target_date, time.max, tzinfo=timezone.utc)
+
+    query = (
+        select(Prediction)
+        .join(Match, Match.id == Prediction.match_id)
+        .where(
+            Prediction.status == PredictionStatus.APPROVED,
+            Prediction.model_prob >= MIN_LEG_PROB,
+            Prediction.best_odds.is_not(None),
+            Match.scheduled_at >= day_start,
+            Match.scheduled_at <= day_end,
         )
-    else:
-        # Auto-select: best approved predictions by EV
-        query = (
-            select(Prediction)
-            .join(Match, Match.id == Prediction.match_id)
-            .where(
-                Prediction.status == PredictionStatus.APPROVED,
-                Prediction.ev > 0,
-            )
-            .order_by(Prediction.ev.desc())
-        )
-        if sport_filter:
-            try:
-                sport_enum = Sport(sport_filter)
-                query = query.where(Match.sport == sport_enum)
-            except ValueError:
-                logger.warning("Unknown sport filter: %s", sport_filter)
+        .order_by(Prediction.model_prob.desc())
+    )
 
-        # Filter to today's matches
-        today_start = datetime.combine(date.today(), time.min, tzinfo=timezone.utc)
-        today_end = datetime.combine(date.today(), time.max, tzinfo=timezone.utc)
-        query = query.where(
-            Match.scheduled_at >= today_start,
-            Match.scheduled_at <= today_end,
-        )
+    if sport_filter:
+        try:
+            sport_enum = Sport(sport_filter.lower())
+            query = query.where(Match.sport == sport_enum)
+        except ValueError:
+            logger.warning("Unknown sport filter: %s", sport_filter)
 
-        predictions = list(session.execute(query).scalars().all())
+    return list(session.execute(query).scalars().all())
 
-    if len(predictions) < MIN_LEGS:
-        logger.info(
-            "Not enough approved predictions for parlay: %d < %d minimum",
-            len(predictions), MIN_LEGS,
-        )
-        return None
 
-    # Limit to max_legs (take highest EV)
-    predictions = sorted(predictions, key=lambda p: float(p.ev), reverse=True)[:max_legs]
-
-    # Build legs
+def _predictions_to_legs(
+    session: Session,
+    predictions: list[Prediction],
+) -> list[ParlayLeg]:
+    """Convert Prediction objects into ParlayLeg dataclasses."""
     legs: list[ParlayLeg] = []
     for pred in predictions:
         match = session.get(Match, pred.match_id)
@@ -395,14 +386,25 @@ def build_parlay(
             best_sportsbook=pred.best_sportsbook or "unknown",
             ev=float(pred.ev),
         ))
+    return legs
 
+
+def _build_ticket(
+    session: Session,
+    predictions: list[Prediction],
+    legs: list[ParlayLeg],
+    stake_eur: float,
+) -> ParlayTicket | None:
+    """Assemble a ParlayTicket from legs with correlation analysis."""
     if len(legs) < MIN_LEGS:
-        logger.info("Not enough valid legs: %d < %d", len(legs), MIN_LEGS)
         return None
+
+    # Validate and cap stake
+    stake_eur, stake_errors = validate_parlay_stake(stake_eur)
 
     # Check all pairwise correlations
     correlations: list[LegCorrelation] = []
-    for pred_a, pred_b in combinations(predictions, 2):
+    for pred_a, pred_b in combinations(predictions[:len(legs)], 2):
         corr = check_leg_correlation(session, pred_a, pred_b)
         correlations.append(corr)
 
@@ -412,16 +414,13 @@ def build_parlay(
     for leg in legs:
         naive_prob *= leg.model_prob
 
-    is_positive = combined_ev >= min_ev
+    is_positive = combined_ev > 0
 
-    # Build validation errors
+    # Build validation warnings
     errors = list(stake_errors)
-    if not is_positive:
-        errors.append(f"Combined EV {combined_ev:.4f} is below threshold {min_ev}")
     if len(legs) > MAX_LEGS:
         errors.append(f"Too many legs: {len(legs)} > {MAX_LEGS}")
 
-    # Warn about same-match correlations
     same_match_corrs = [c for c in correlations if c.same_match]
     if same_match_corrs:
         errors.append(
@@ -451,21 +450,182 @@ def build_parlay(
     return ticket
 
 
+# -- Public API ---------------------------------------------------------------
+
+
+def build_parlay(
+    session: Session,
+    prediction_ids: list[uuid.UUID] | None = None,
+    sport_filter: str | None = None,
+    num_legs: int = 3,
+    target_date: date | None = None,
+    stake_eur: float = MOONSHOT_HARD_CAP_EUR,
+) -> ParlayTicket | None:
+    """Build a parlay from approved predictions.
+
+    Selection strategy: picks with the **highest model probability** are
+    chosen first (Lotto philosophy — we want the most confident legs).
+    No +EV filter is applied; combined EV is computed for information
+    but does not gate the parlay.
+
+    Can either take explicit prediction IDs, or auto-select the best
+    approved picks for a given sport/date.
+
+    Args:
+        session: SQLAlchemy session.
+        prediction_ids: Explicit picks. If None, auto-select from approved.
+        sport_filter: Sport name to filter (e.g. "tennis", "basketball").
+        num_legs: Desired number of legs (default 3, range 2-6).
+        target_date: Date for auto-selection. Defaults to today (UTC).
+        stake_eur: Stake (hard-capped at MOONSHOT_HARD_CAP_EUR).
+
+    Returns:
+        ParlayTicket if successful, None if not enough valid legs.
+    """
+    num_legs = max(MIN_LEGS, min(num_legs, MAX_LEGS))
+
+    if prediction_ids:
+        predictions = list(
+            session.execute(
+                select(Prediction).where(
+                    Prediction.id.in_(prediction_ids),
+                    Prediction.status == PredictionStatus.APPROVED,
+                )
+            ).scalars().all()
+        )
+        # Sort by model confidence (highest first)
+        predictions = sorted(
+            predictions,
+            key=lambda p: float(p.model_prob),
+            reverse=True,
+        )[:num_legs]
+    else:
+        # Auto-select: highest confidence approved predictions
+        candidates = _fetch_todays_candidates(
+            session, sport_filter=sport_filter, target_date=target_date,
+        )
+        # Deduplicate: max one leg per match (pick highest prob market)
+        seen_matches: set[uuid.UUID] = set()
+        predictions = []
+        for pred in candidates:
+            if pred.match_id not in seen_matches:
+                predictions.append(pred)
+                seen_matches.add(pred.match_id)
+            if len(predictions) >= num_legs:
+                break
+
+    if len(predictions) < MIN_LEGS:
+        logger.info(
+            "Not enough approved predictions for parlay: %d < %d minimum",
+            len(predictions), MIN_LEGS,
+        )
+        return None
+
+    legs = _predictions_to_legs(session, predictions)
+    return _build_ticket(session, predictions, legs, stake_eur)
+
+
+def get_best_combos_today(
+    session: Session,
+    sport_filter: str | None = None,
+    num_legs: int = 3,
+    top_n: int = 3,
+    target_date: date | None = None,
+) -> list[ParlayTicket]:
+    """Get the best parlay combinations for today.
+
+    Builds multiple parlays by sliding a window over today's approved
+    predictions (sorted by model probability). Returns up to ``top_n``
+    distinct parlays, each with ``num_legs`` legs, ensuring no two
+    parlays share the exact same set of legs.
+
+    Use cases:
+      - "Was sind die besten Kombis heute?"
+      - "Zeig mir die Top 3 Kombis"
+
+    Args:
+        session: SQLAlchemy session.
+        sport_filter: Optional sport name (e.g. "tennis").
+        num_legs: Legs per combo (default 3, range 2-6).
+        top_n: Maximum number of combos to return (default 3).
+        target_date: Date to query. Defaults to today (UTC).
+
+    Returns:
+        List of ParlayTickets sorted by adjusted_combined_prob descending.
+    """
+    num_legs = max(MIN_LEGS, min(num_legs, MAX_LEGS))
+
+    candidates = _fetch_todays_candidates(
+        session, sport_filter=sport_filter, target_date=target_date,
+    )
+
+    if len(candidates) < MIN_LEGS:
+        logger.info(
+            "Not enough candidates for combos: %d < %d minimum",
+            len(candidates), MIN_LEGS,
+        )
+        return []
+
+    # Deduplicate: max one prediction per match (highest prob wins)
+    seen_matches: set[uuid.UUID] = set()
+    unique_preds: list[Prediction] = []
+    for pred in candidates:
+        if pred.match_id not in seen_matches:
+            unique_preds.append(pred)
+            seen_matches.add(pred.match_id)
+
+    if len(unique_preds) < MIN_LEGS:
+        return []
+
+    # Generate combos: use itertools.combinations on the top candidates
+    # Limit candidate pool to avoid combinatorial explosion
+    pool_size = min(len(unique_preds), max(num_legs + 6, 12))
+    pool = unique_preds[:pool_size]
+
+    tickets: list[ParlayTicket] = []
+
+    for combo in combinations(pool, min(num_legs, len(pool))):
+        combo_list = list(combo)
+        legs = _predictions_to_legs(session, combo_list)
+
+        if len(legs) < MIN_LEGS:
+            continue
+
+        ticket = _build_ticket(
+            session, combo_list, legs, MOONSHOT_HARD_CAP_EUR,
+        )
+        if ticket is None:
+            continue
+
+        # Skip combos with trivially low combined odds (not "Moonshot" enough)
+        if ticket.combined_odds < MIN_COMBINED_ODDS:
+            continue
+
+        tickets.append(ticket)
+
+    # Sort by adjusted combined probability (highest confidence first)
+    tickets.sort(key=lambda t: t.adjusted_combined_prob, reverse=True)
+
+    return tickets[:top_n]
+
+
 def build_best_parlay(
     session: Session,
     sport_filter: str | None = None,
     num_legs: int = 3,
+    target_date: date | None = None,
 ) -> ParlayTicket | None:
-    """Convenience: build the best N-leg parlay for a sport.
+    """Convenience: build the single best N-leg parlay for a sport.
 
-    Auto-selects the highest-EV approved predictions and builds
-    the optimal parlay. Used by the Telegram concierge for
-    "Baue mir eine 3er Kombi für Tennis" requests.
+    Auto-selects the highest-confidence approved predictions and builds
+    the optimal parlay. Used by the Telegram concierge for requests like
+    "Baue mir eine 3er Kombi fuer Tennis".
 
     Args:
         session: SQLAlchemy session.
-        sport_filter: Sport name (e.g. "tennis").
-        num_legs: Desired number of legs.
+        sport_filter: Sport name (e.g. "tennis", "basketball").
+        num_legs: Desired number of legs (default 3).
+        target_date: Date to query. Defaults to today (UTC).
 
     Returns:
         ParlayTicket if successful, None otherwise.
@@ -474,6 +634,7 @@ def build_best_parlay(
         session,
         prediction_ids=None,
         sport_filter=sport_filter,
-        max_legs=num_legs,
+        num_legs=num_legs,
+        target_date=target_date,
         stake_eur=MOONSHOT_HARD_CAP_EUR,
     )

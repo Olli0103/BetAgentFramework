@@ -357,11 +357,15 @@ agents:
     llm_tier: tier1_heavy_reasoning
     soul_file: agents/moonshot/SOUL.md
     description: >
-      Builds smart +EV parlays (Kombiwetten) from surviving single
-      picks. Analyzes correlation between legs, avoids naive
-      independence assumptions. Hard-capped at 1.00 EUR per ticket.
+      Builds high-confidence "Lotto" parlays (Kombiwetten) from approved
+      single picks. Selects legs by highest model probability (not EV),
+      analyzes correlation between legs, and enforces the 1.00 EUR hard
+      cap. Supports natural-language requests like "Baue mir eine 3er
+      Kombi fuer Tennis" or "Was sind die besten Kombis heute?"
     tools:
       - build_parlay
+      - get_best_combos_today
+      - build_best_parlay
       - check_leg_correlation
       - calculate_parlay_ev
       - validate_parlay_stake
@@ -370,7 +374,9 @@ agents:
       max_stake_eur: 1.00
       min_legs: 2
       max_legs: 6
-      require_positive_ev: true
+      min_combined_odds: 3.0
+      min_leg_prob: 0.30
+      require_positive_ev: false  # Lotto character — no +EV gate
     schedule: null  # Triggered after single picks are approved
 
   # ── 9. AUDITOR (Feedback Loop) ──────────────────────────────────────
