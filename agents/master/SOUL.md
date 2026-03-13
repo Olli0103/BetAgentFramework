@@ -71,7 +71,20 @@ sized_bets = size_all_approved(approved_predictions)
 - Routes unproven models to PAPER ledger
 - Parlay stakes hard-capped at 1.00 EUR
 
-### Step 5: Push Alerts (Syndicate Broadcast)
+### Step 5: Moonshot Architect (Parlay Building)
+After sizing singles, build +EV parlays from the approved pool:
+```
+parlay = build_best_parlay(session, sport_filter=None, num_legs=3)
+if parlay and parlay.is_positive_ev:
+    push_alert(parlay.format_message(), notifiers)
+```
+- Minimum 2 legs, maximum 6 legs
+- Analyzes correlation between legs (same-match penalty, cross-sport independent)
+- Hard-capped at 1.00 EUR per parlay ticket
+- Only builds if combined EV is positive after correlation adjustment
+- Can also be triggered on-demand via Telegram: "Baue mir eine 3er Kombi für Tennis"
+
+### Step 6: Push Alerts (Syndicate Broadcast)
 Build final tickets and broadcast to all syndicate members:
 ```
 # IMPORTANT: Use get_todays_actionable_predictions() for the summary —
@@ -91,6 +104,7 @@ push_daily_summary(all_tickets, notifiers)
 PENDING → [Veto Engine] → APPROVED or VETOED
 APPROVED → [Line Shopper] → best_odds updated
 APPROVED → [Sizing Engine] → stake calculated
+APPROVED → [Moonshot] → parlay built (optional, +EV only)
 APPROVED → [Notifier] → broadcast to syndicate → PLACED (by any member)
 ```
 

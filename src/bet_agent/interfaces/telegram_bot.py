@@ -356,8 +356,17 @@ class MasterAgentBridge:
         Pre-loads relevant DB context (today's matches, odds, predictions,
         portfolio summary) and injects it into the system prompt so the LLM
         can answer data-driven questions.
+
+        Special intercepts (executed directly, no LLM needed):
+          - Parlay/Kombi requests → build_best_parlay()
         """
         logger.info("NL query from %s: %s", user_name, message)
+
+        # Intercept: parlay/kombi requests are tool calls, not LLM queries
+        parlay_response = self._try_parlay_request(message)
+        if parlay_response:
+            return parlay_response
+
         try:
             context = self._build_context(message)
             system = self._SYSTEM_PROMPT + "\n" + context
@@ -373,6 +382,76 @@ class MasterAgentBridge:
                 "[Master Agent] I'm temporarily unable to process your query — "
                 "the LLM backend is unreachable. Please try again shortly."
             )
+
+    def _try_parlay_request(self, message: str) -> str | None:
+        """Detect and execute parlay/Kombi requests directly.
+
+        Matches patterns like:
+          - "Baue mir eine 3er Kombi für Tennis"
+          - "Build a 3-leg parlay for NBA"
+          - "Kombi Tennis 3 Legs"
+          - "parlay football"
+        """
+        import re
+        msg = message.lower()
+
+        # Detect parlay intent
+        parlay_keywords = ["kombi", "parlay", "kombiwette", "moonshot", "akku"]
+        if not any(kw in msg for kw in parlay_keywords):
+            return None
+
+        # Detect number of legs
+        num_legs = 3  # default
+        leg_match = re.search(r"(\d+)\s*(?:er|[-\s]?leg|[-\s]?fach)", msg)
+        if leg_match:
+            num_legs = int(leg_match.group(1))
+        else:
+            digit_match = re.search(r"(\d+)", msg)
+            if digit_match:
+                val = int(digit_match.group(1))
+                if 2 <= val <= 6:
+                    num_legs = val
+
+        # Detect sport filter
+        sport_filter = self._detect_sport(msg)
+
+        logger.info(
+            "Parlay request detected: %d legs, sport=%s",
+            num_legs, sport_filter or "all",
+        )
+
+        try:
+            from bet_agent.db.session import get_session
+            from bet_agent.tools.parlay_builder import build_best_parlay
+
+            with get_session() as sess:
+                ticket = build_best_parlay(sess, sport_filter=sport_filter, num_legs=num_legs)
+
+            if ticket is None:
+                sport_hint = f" for {sport_filter}" if sport_filter else ""
+                return (
+                    f"[Moonshot Architect] Kann aktuell keine {num_legs}er Kombi"
+                    f"{sport_hint} bauen — nicht genug approved +EV Picks "
+                    f"für heute vorhanden.\n\n"
+                    f"Voraussetzungen:\n"
+                    f"• Mindestens {num_legs} APPROVED Predictions mit positivem EV\n"
+                    f"• Matches müssen heute scheduled sein\n\n"
+                    f"Tipp: /status zeigt den aktuellen Pipeline-Stand."
+                )
+
+            if not ticket.is_positive_ev:
+                return (
+                    f"[Moonshot Architect] {num_legs}er Kombi gebaut, aber "
+                    f"EV ist negativ ({ticket.combined_ev:+.4f}). "
+                    f"Kein +EV Parlay möglich mit den aktuellen Picks.\n\n"
+                    f"{ticket.format_message()}"
+                )
+
+            return ticket.format_message()
+
+        except Exception as exc:
+            logger.exception("Parlay builder error")
+            return f"[Moonshot Architect] Fehler beim Parlay-Bau: {exc}"
 
     def _build_context(self, message: str) -> str:
         """Query the DB for data relevant to the user's question."""
