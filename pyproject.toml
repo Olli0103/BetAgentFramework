@@ -42,6 +42,7 @@ betagent-gap-scan = "bet_agent.tools.data_janitor_runner:cli_gap_scan"
 betagent-backfill = "bet_agent.tools.data_janitor_runner:cli_backfill_day"
 betagent-reconcile = "bet_agent.tools.data_janitor_runner:cli_reconcile_open_results"
 betagent-coverage = "bet_agent.tools.data_janitor_runner:cli_coverage_report"
+betagent-seed = "bet_agent.tools.data_janitor_runner:cli_seed_fixtures"
 
 [tool.setuptools.packages.find]
 where = ["src"]

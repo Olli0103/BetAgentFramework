@@ -461,12 +461,16 @@ class TestDefaultBackend:
             for b in backend._backends
         )
 
-    @patch.dict("os.environ", {"THE_ODDS_API_KEY": "", "API_SPORTS_KEY": ""}, clear=False)
+    @patch.dict(
+        "os.environ",
+        {"THE_ODDS_API_KEY": "", "API_SPORTS_KEY": "", "SOFASCORE_ENABLED": "0"},
+        clear=False,
+    )
     def test_falls_back_to_manual_when_no_key(self):
         backend = _get_default_backend()
         assert isinstance(backend, ManualResultsBackend)
 
-    @patch.dict("os.environ", {}, clear=True)
+    @patch.dict("os.environ", {"SOFASCORE_ENABLED": "0"}, clear=True)
     def test_falls_back_to_manual_when_env_missing(self):
         backend = _get_default_backend()
         assert isinstance(backend, ManualResultsBackend)

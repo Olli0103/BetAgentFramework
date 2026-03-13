@@ -34,6 +34,11 @@ from bet_agent.tools.coverage_engine import (
     coverage_report,
     scan_gaps,
 )
+from bet_agent.tools.fixture_seeder import (
+    SeedResult,
+    seed_fixtures_for_window,
+    seed_today_window,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,23 +67,28 @@ def _get_session():
 
 
 def run_intraday_scan(session) -> dict:
-    """30-minute scan: detect gaps in recent matches, trigger targeted backfill.
+    """30-minute scan: seed fixtures, detect gaps, trigger targeted backfill.
 
-    Called by the scheduler every 30 minutes. Scans today's matches for
-    missing data and attempts to fill gaps from API sources.
+    Called by the scheduler every 30 minutes. First seeds any missing
+    fixtures for the operational window, then scans for data gaps and
+    attempts to fill them from API sources.
 
     Returns:
-        Summary dict with gap scan and backfill results.
+        Summary dict with seeding, gap scan, and backfill results.
     """
     logger.info("=== Intra-day scan starting ===")
 
     today = date.today()
 
-    # Scan for gaps in today's matches
+    # 0. Seed missing fixtures for today's operational window
+    seed_result = seed_today_window(session)
+
+    # 1. Scan for gaps in today's matches
     gap_report = scan_gaps(session, target_date=today, lookback_days=1)
 
     result = {
         "job": "intraday_scan",
+        "seeding": seed_result.to_dict(),
         "gaps": gap_report.to_dict(),
         "backfill": None,
     }
@@ -91,7 +101,8 @@ def run_intraday_scan(session) -> dict:
     session.commit()
 
     logger.info(
-        "=== Intra-day scan complete: %d gaps found, %s filled ===",
+        "=== Intra-day scan complete: %d seeded, %d gaps found, %s filled ===",
+        seed_result.fixtures_inserted,
         gap_report.total_gaps,
         result["backfill"]["total_filled"] if result["backfill"] else 0,
     )
@@ -100,17 +111,21 @@ def run_intraday_scan(session) -> dict:
 
 
 def run_nightly_backfill(session) -> dict:
-    """Nightly backfill: yesterday + all open gaps up to 7 days.
+    """Nightly backfill: seed fixtures, backfill yesterday + open gaps.
 
     Called at 03:30 UTC, runs before the Auditor's morning audit at 05:00 UTC.
-    Ensures maximum data coverage before settlement and metrics evaluation.
+    Seeds fixtures for the upcoming window first, then ensures maximum data
+    coverage before settlement and metrics evaluation.
 
     Returns:
-        Summary dict with backfill and coverage results.
+        Summary dict with seeding, backfill, and coverage results.
     """
     logger.info("=== Nightly backfill starting ===")
 
     yesterday = date.today() - timedelta(days=1)
+
+    # 0. Seed fixtures for today's operational window (upcoming matches)
+    seed_result = seed_today_window(session)
 
     # 1. Backfill yesterday specifically
     yesterday_result = backfill_day(session, yesterday)
@@ -125,13 +140,15 @@ def run_nightly_backfill(session) -> dict:
 
     result = {
         "job": "nightly_backfill",
+        "seeding": seed_result.to_dict(),
         "yesterday_backfill": yesterday_result.to_dict(),
         "open_gaps_backfill": open_result.to_dict(),
         "coverage": report.to_dict(),
     }
 
     logger.info(
-        "=== Nightly backfill complete: yesterday=%d, open_gaps=%d filled ===",
+        "=== Nightly backfill complete: %d seeded, yesterday=%d, open_gaps=%d filled ===",
+        seed_result.fixtures_inserted,
         yesterday_result.total_filled, open_result.total_filled,
     )
 
@@ -271,6 +288,37 @@ def cli_reconcile_open_results():
     session = _get_session()
     try:
         result = reconcile_open_results(session)
+        session.commit()
+        print(json.dumps(result.to_dict(), indent=2))
+    finally:
+        session.close()
+
+
+def cli_seed_fixtures():
+    """CLI: Seed fixtures for the operational window."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    parser = argparse.ArgumentParser(description="Seed fixtures for operational window")
+    parser.add_argument("--sports", type=str, nargs="*", help="Sports to seed")
+    parser.add_argument(
+        "--start", type=str, default=None,
+        help="Window start (ISO datetime). Defaults to today 07:00 UTC.",
+    )
+    parser.add_argument(
+        "--end", type=str, default=None,
+        help="Window end (ISO datetime). Defaults to tomorrow 07:00 UTC.",
+    )
+    args = parser.parse_args()
+
+    session = _get_session()
+    try:
+        if args.start and args.end:
+            from datetime import datetime, timezone
+            start = datetime.fromisoformat(args.start)
+            end = datetime.fromisoformat(args.end)
+            result = seed_fixtures_for_window(session, start, end, sports=args.sports)
+        else:
+            result = seed_today_window(session, sports=args.sports)
         session.commit()
         print(json.dumps(result.to_dict(), indent=2))
     finally:
