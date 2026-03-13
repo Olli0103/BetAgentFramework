@@ -497,6 +497,31 @@ def reconcile_open_results(session: Session) -> ReconcileResult:
                     _update_provenance(match, "api_sports")
                     result.matches_resolved += 1
 
+    # Finally try Sofascore for remaining tennis matches
+    remaining_tennis = [
+        m for m in unresolved
+        if m.home_score is None and m.sport == Sport.TENNIS
+    ]
+    if remaining_tennis:
+        from bet_agent.tools.flashscore_backend import FlashscoreResultsBackend
+        flashscore = FlashscoreResultsBackend()
+        if flashscore.is_available:
+            result.sources_used.append("sofascore")
+            for match in remaining_tennis:
+                try:
+                    match_result = flashscore.fetch_result(match)
+                    if match_result and match_result.is_finished:
+                        match.home_score = match_result.home_score
+                        match.away_score = match_result.away_score
+                        match.match_state = MatchState.FINISHED
+                        match.is_live = False
+                        _update_provenance(match, "sofascore")
+                        result.matches_resolved += 1
+                except Exception as exc:
+                    logger.warning(
+                        "Sofascore reconcile error for %s: %s", match.id, exc,
+                    )
+
     result.still_unresolved = result.matches_checked - result.matches_resolved
     session.flush()
 

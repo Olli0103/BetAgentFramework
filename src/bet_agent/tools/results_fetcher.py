@@ -692,12 +692,13 @@ class ChainedResultsBackend:
 
 
 def _get_default_backend() -> ResultsBackend:
-    """Return a chained backend: TheOddsAPI → API-Sports → Manual.
+    """Return a chained backend: TheOddsAPI → API-Sports → Sofascore → Manual.
 
     Priority:
       1. TheOddsAPIResultsBackend (if THE_ODDS_API_KEY set)
       2. APISportsResultsBackend (if API_SPORTS_KEY set)
-      3. ManualResultsBackend (no-op fallback)
+      3. FlashscoreResultsBackend (tennis-only, Sofascore API)
+      4. ManualResultsBackend (no-op fallback)
     """
     backends = []
 
@@ -710,6 +711,13 @@ def _get_default_backend() -> ResultsBackend:
     if api_sports_backend.is_available:
         backends.append(api_sports_backend)
         logger.info("Results backend: API-Sports (fallback)")
+
+    # Tennis-specific fallback via Sofascore (no API key needed)
+    from bet_agent.tools.flashscore_backend import FlashscoreResultsBackend
+    flashscore_backend = FlashscoreResultsBackend()
+    if flashscore_backend.is_available:
+        backends.append(flashscore_backend)
+        logger.info("Results backend: Sofascore/Flashscore (tennis fallback)")
 
     if not backends:
         logger.warning(
