@@ -396,7 +396,7 @@ class MasterAgentBridge:
         msg = message.lower()
 
         # Detect parlay intent
-        parlay_keywords = ["kombi", "parlay", "kombiwette", "moonshot", "akku"]
+        parlay_keywords = ["kombi", "kombo", "parlay", "kombiwette", "moonshot", "akku"]
         if not any(kw in msg for kw in parlay_keywords):
             return None
 
@@ -409,7 +409,7 @@ class MasterAgentBridge:
             digit_match = re.search(r"(\d+)", msg)
             if digit_match:
                 val = int(digit_match.group(1))
-                if 2 <= val <= 6:
+                if 2 <= val <= 30:
                     num_legs = val
 
         # Detect sport filter

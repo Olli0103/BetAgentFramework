@@ -260,14 +260,16 @@ class TestBuildParlay:
         ticket = build_parlay(db_session, prediction_ids=[p.id])
         assert ticket is None  # need at least 2 legs
 
-    def test_only_approved_picks(self, db_session):
+    def test_eligible_statuses_accepted(self, db_session):
+        """APPROVED + VETOED are both eligible for moonshot parlays."""
         m1 = _make_match(db_session, home="A", away="B")
         m2 = _make_match(db_session, home="C", away="D")
         p1 = _make_prediction(db_session, m1, status=PredictionStatus.APPROVED)
         p2 = _make_prediction(db_session, m2, status=PredictionStatus.VETOED)
 
         ticket = build_parlay(db_session, prediction_ids=[p1.id, p2.id])
-        assert ticket is None  # only 1 approved
+        assert ticket is not None  # both eligible
+        assert ticket.num_legs == 2
 
     def test_auto_select_by_sport(self, db_session):
         m1 = _make_match(

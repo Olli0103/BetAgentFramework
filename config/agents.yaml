@@ -357,11 +357,11 @@ agents:
     llm_tier: tier1_heavy_reasoning
     soul_file: agents/moonshot/SOUL.md
     description: >
-      Builds high-confidence "Lotto" parlays (Kombiwetten) from approved
-      single picks. Selects legs by highest model probability (not EV),
-      analyzes correlation between legs, and enforces the 1.00 EUR hard
-      cap. Supports natural-language requests like "Baue mir eine 3er
-      Kombi fuer Tennis" or "Was sind die besten Kombis heute?"
+      Builds high-confidence "Lotto" parlays (Kombiwetten) from eligible
+      predictions (pending/approved/placed/vetoed). Selects legs by highest
+      model probability (not EV), analyzes correlation between legs, and
+      enforces the 1.00 EUR hard cap. Auto-fallback to fewer legs if
+      requested count unavailable. Supports up to 30 legs.
     tools:
       - build_parlay
       - get_best_combos_today
@@ -373,10 +373,12 @@ agents:
     constraints:
       max_stake_eur: 1.00
       min_legs: 2
-      max_legs: 6
+      max_legs: 30
       min_combined_odds: 3.0
       min_leg_prob: 0.30
       require_positive_ev: false  # Lotto character — no +EV gate
+      require_best_odds: false    # Falls back to 1/implied_prob
+      eligible_statuses: [pending, approved, placed, vetoed]
     schedule: null  # Triggered after single picks are approved
 
   # ── 9. AUDITOR (Feedback Loop) ──────────────────────────────────────

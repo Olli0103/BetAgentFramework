@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 MOONSHOT_HARD_CAP_EUR = 1.00
 MIN_LEGS = 2
-MAX_LEGS = 6
+MAX_LEGS = 30
 MIN_COMBINED_ODDS = 3.0  # minimum combined odds to qualify as "Moonshot"
 MIN_LEG_PROB = 0.30  # ignore predictions below 30% confidence
 
@@ -309,11 +309,12 @@ def validate_parlay_stake(
     return stake_eur, errors
 
 
-# Eligible statuses for moonshot candidate pool (aggressive: not just APPROVED)
+# Eligible statuses for moonshot candidate pool (aggressive: all non-settled)
 _ELIGIBLE_STATUSES = [
     PredictionStatus.PENDING,
     PredictionStatus.APPROVED,
     PredictionStatus.PLACED,
+    PredictionStatus.VETOED,
 ]
 
 
@@ -352,7 +353,6 @@ def _fetch_todays_candidates(
         .where(
             Prediction.status.in_(_ELIGIBLE_STATUSES),
             Prediction.model_prob >= MIN_LEG_PROB,
-            Prediction.best_odds.is_not(None),
             Match.scheduled_at >= day_start,
             Match.scheduled_at <= day_end,
         )
