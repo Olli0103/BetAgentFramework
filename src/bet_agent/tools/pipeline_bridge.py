@@ -144,26 +144,43 @@ def ensure_pending_bets_from_approved(
                 skipped_existing += 1
             continue
 
+        stake_dec = Decimal(str(round(stake, 2)))
+
+        # PAPER bets skip human confirmation — go straight to PLACED
+        initial_status = BetStatus.PENDING
+        if ledger_type == LedgerType.PAPER:
+            initial_status = BetStatus.PLACED
+
         bet = PlacedBet(
             ledger_type=ledger_type,
             match_id=pred.match_id,
             market_type=pred.market_type,
             selection=pred.selection,
             odds_at_placement=pred.best_odds,
-            stake_eur=Decimal(str(round(stake, 2))),
+            stake_eur=stake_dec,
             model_prob=pred.model_prob,
             ev_at_placement=pred.ev,
-            status=BetStatus.PENDING,
+            status=initial_status,
             is_live_bet=False,
         )
         session.add(bet)
         created += 1
 
+        # Deduct stake for auto-placed PAPER bets
+        if initial_status == BetStatus.PLACED:
+            from bet_agent.tools.sizing_engine import deduct_stake_on_placement
+            deduct_stake_on_placement(session, stake_dec, ledger_type)
+
         logger.info(
-            "Created PENDING bet: %s %s @%.2f (%.2f EUR, %s)",
+            "Created %s bet: %s %s @%.2f (%.2f EUR, %s)",
+            initial_status.value.upper(),
             pred.market_type.value, pred.selection,
             float(pred.best_odds), stake, ledger_type.value,
         )
+
+    # Auto-place any lingering PAPER+PENDING bets (catch stragglers from
+    # earlier runs before this fix was deployed)
+    auto_placed = _auto_place_paper_pending(session)
 
     session.flush()
 
@@ -173,6 +190,39 @@ def ensure_pending_bets_from_approved(
         "updated_existing": updated_existing,
         "skipped_existing": skipped_existing,
         "skipped_no_odds": skipped_no_odds,
+        "auto_placed_paper": auto_placed,
     }
     logger.info("Pipeline bridge: %s", result)
     return result
+
+
+def _auto_place_paper_pending(session: Session) -> int:
+    """Transition all PAPER+PENDING bets to PLACED with stake deduction.
+
+    PAPER bets don't need human confirmation at a sportsbook — they're
+    simulated.  This catches any stragglers from before auto-placement
+    was added to the bridge.
+    """
+    from bet_agent.tools.sizing_engine import deduct_stake_on_placement
+
+    stragglers = list(
+        session.execute(
+            select(PlacedBet).where(
+                PlacedBet.ledger_type == LedgerType.PAPER,
+                PlacedBet.status == BetStatus.PENDING,
+            )
+        ).scalars().all()
+    )
+
+    for bet in stragglers:
+        bet.status = BetStatus.PLACED
+        deduct_stake_on_placement(session, bet.stake_eur, LedgerType.PAPER)
+        logger.info(
+            "Auto-placed PAPER straggler: %s @%.2f (%.2f EUR)",
+            bet.selection, float(bet.odds_at_placement), float(bet.stake_eur),
+        )
+
+    if stragglers:
+        logger.info("Auto-placed %d PAPER straggler(s)", len(stragglers))
+
+    return len(stragglers)

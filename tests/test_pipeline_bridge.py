@@ -222,6 +222,73 @@ class TestPipelineBridge:
 
         bet = db_session.execute(select(PlacedBet)).scalar_one()
         assert bet.ledger_type == LedgerType.PAPER
+        # PAPER bets are auto-placed (no human confirmation needed)
+        assert bet.status == BetStatus.PLACED
+
+    def test_paper_auto_placed_with_stake_deduction(self, db_session):
+        """PAPER bets are auto-placed and stake is deducted from PAPER ledger."""
+        from bet_agent.tools.pipeline_bridge import ensure_pending_bets_from_approved
+
+        _add_bankroll(db_session, ledger=LedgerType.REAL)
+        paper_ledger = _add_bankroll(db_session, ledger=LedgerType.PAPER, balance=Decimal("10000.00"))
+        match = _add_match(db_session)
+        _add_prediction(
+            db_session, match,
+            model_prob="0.40", implied_prob="0.10",
+            ev="3.00", best_odds="10.00",
+        )
+
+        ensure_pending_bets_from_approved(db_session)
+
+        bet = db_session.execute(select(PlacedBet)).scalar_one()
+        assert bet.status == BetStatus.PLACED
+
+        # Ledger balance should have decreased
+        db_session.refresh(paper_ledger)
+        assert paper_ledger.balance < Decimal("10000.00")
+
+    def test_real_stays_pending(self, db_session):
+        """REAL bets stay PENDING (need human confirmation)."""
+        from bet_agent.tools.pipeline_bridge import ensure_pending_bets_from_approved
+
+        _add_bankroll(db_session)
+        match = _add_match(db_session)
+        _add_prediction(db_session, match)
+
+        ensure_pending_bets_from_approved(db_session)
+
+        bet = db_session.execute(select(PlacedBet)).scalar_one()
+        assert bet.ledger_type == LedgerType.REAL
+        assert bet.status == BetStatus.PENDING
+
+    def test_auto_place_paper_stragglers(self, db_session):
+        """Existing PAPER+PENDING stragglers are auto-placed on bridge run."""
+        from bet_agent.tools.pipeline_bridge import ensure_pending_bets_from_approved
+
+        _add_bankroll(db_session, ledger=LedgerType.PAPER, balance=Decimal("10000.00"))
+        match = _add_match(db_session)
+
+        # Simulate a straggler from before the fix
+        straggler = PlacedBet(
+            ledger_type=LedgerType.PAPER,
+            match_id=match.id,
+            market_type=MarketType.MATCH_WINNER,
+            selection="away",
+            odds_at_placement=Decimal("3.00"),
+            stake_eur=Decimal("50.00"),
+            model_prob=Decimal("0.40"),
+            ev_at_placement=Decimal("0.20"),
+            status=BetStatus.PENDING,
+            is_live_bet=False,
+        )
+        db_session.add(straggler)
+        db_session.flush()
+
+        result = ensure_pending_bets_from_approved(db_session)
+        assert result["auto_placed_paper"] == 1
+
+        db_session.refresh(straggler)
+        assert straggler.status == BetStatus.PLACED
 
 
 # ── Edge Plausibility Readiness Check Tests ─────────────────────────
