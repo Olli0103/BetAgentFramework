@@ -909,9 +909,26 @@ with tab_agents:
                 "detail": f"{alias_count} aliases, {canonical_count} canonical",
             }
 
+            eligible_picks = sess.execute(
+                select(func.count(Prediction.id)).where(
+                    Prediction.status.in_([
+                        PredictionStatus.PENDING,
+                        PredictionStatus.APPROVED,
+                        PredictionStatus.PLACED,
+                        PredictionStatus.VETOED,
+                    ]),
+                    Prediction.model_prob >= 0.30,
+                    Prediction.match_id.in_(
+                        select(Match.id).where(
+                            Match.scheduled_at >= w_start,
+                            Match.scheduled_at < w_end,
+                        )
+                    ),
+                )
+            ).scalar() or 0
             agent_activity["moonshot"] = {
-                "status": "idle",
-                "detail": "Waiting for approved singles",
+                "status": "active" if eligible_picks >= 2 else "idle",
+                "detail": f"{eligible_picks} eligible picks" if eligible_picks else "No eligible picks today",
             }
 
         # Render agent cards in 3x3 grid

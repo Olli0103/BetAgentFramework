@@ -432,11 +432,11 @@ class MasterAgentBridge:
                 return (
                     f"[Moonshot Architect] Kann aktuell keine {num_legs}er Kombi"
                     f"{sport_hint} bauen — nicht genug eligible Picks "
-                    f"für heute vorhanden.\n\n"
+                    f"im heutigen Fenster.\n\n"
                     f"Voraussetzungen:\n"
-                    f"• Mindestens 2 Predictions (PENDING/APPROVED/PLACED)\n"
-                    f"• best_odds muss vorhanden sein\n"
-                    f"• Matches müssen heute scheduled sein\n\n"
+                    f"• Mind. 2 Predictions (PENDING/APPROVED/PLACED/VETOED)\n"
+                    f"• model_prob >= 30%\n"
+                    f"• Matches im operativen Fenster (07:00–07:00 UTC)\n\n"
                     f"Tipp: /status zeigt den aktuellen Pipeline-Stand."
                 )
 
@@ -767,17 +767,16 @@ async def cmd_pending(update, context) -> None:
             return
 
         await update.message.reply_text(
-            f"\U0001f4cb **{len(pending)} bet(s) waiting for placement:**",
-            parse_mode="Markdown",
+            f"\U0001f4cb {len(pending)} bet(s) waiting for placement:",
         )
 
         for bet in pending:
             short_id = bet["bet_id"][:8]
             text = (
-                f"\u26bd **{bet['match']}**\n"
-                f"Selection: `{bet['selection']}` ({bet['market']})\n"
+                f"\u26bd {bet['match']}\n"
+                f"Selection: {bet['selection']} ({bet['market']})\n"
                 f"Odds: {bet['odds']:.2f} | Stake: {bet['stake_eur']:.2f} EUR\n"
-                f"Ledger: {bet['ledger']} | ID: `{short_id}...`"
+                f"Ledger: {bet['ledger']} | ID: {short_id}..."
             )
 
             keyboard = InlineKeyboardMarkup([
@@ -794,7 +793,7 @@ async def cmd_pending(update, context) -> None:
             ])
 
             await update.message.reply_text(
-                text, reply_markup=keyboard, parse_mode="Markdown",
+                text, reply_markup=keyboard,
             )
 
     except Exception as e:

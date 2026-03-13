@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from itertools import combinations
 
@@ -323,29 +323,21 @@ def _fetch_todays_candidates(
     sport_filter: str | None = None,
     target_date: date | None = None,
 ) -> list[Prediction]:
-    """Fetch today's eligible predictions sorted by model confidence.
+    """Fetch eligible predictions in the operational window, sorted by confidence.
+
+    Uses the 07:00→06:59 UTC operational window so late-night matches are
+    included in the same logical day.
 
     Selects predictions with:
-      - status in (PENDING, APPROVED, PLACED)
+      - status in (PENDING, APPROVED, PLACED, VETOED)
       - model_prob >= MIN_LEG_PROB (30%)
-      - best_odds populated (line-shopped)
-      - match scheduled today (or target_date)
+      - match in the operational window (07:00 UTC → +24h)
 
     Sorted by model_prob DESC — highest confidence first.
-
-    Args:
-        session: SQLAlchemy session.
-        sport_filter: Optional sport name to filter (e.g. "tennis", "basketball").
-        target_date: Date to query. Defaults to today (UTC).
-
-    Returns:
-        List of Prediction objects sorted by model_prob descending.
     """
-    if target_date is None:
-        target_date = datetime.now(timezone.utc).date()
+    from bet_agent.tools.prediction_runner import _operational_window_bounds
 
-    day_start = datetime.combine(target_date, time.min, tzinfo=timezone.utc)
-    day_end = datetime.combine(target_date, time.max, tzinfo=timezone.utc)
+    win_start, win_end = _operational_window_bounds(target_date)
 
     query = (
         select(Prediction)
@@ -353,8 +345,8 @@ def _fetch_todays_candidates(
         .where(
             Prediction.status.in_(_ELIGIBLE_STATUSES),
             Prediction.model_prob >= MIN_LEG_PROB,
-            Match.scheduled_at >= day_start,
-            Match.scheduled_at <= day_end,
+            Match.scheduled_at >= win_start,
+            Match.scheduled_at < win_end,
         )
         .order_by(Prediction.model_prob.desc())
     )
